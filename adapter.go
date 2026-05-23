@@ -22,6 +22,7 @@ type AdapterConfig struct {
 	ProviderURL     string
 	Model           string
 	ReasoningEffort string
+	APIKey          string
 	Debug           *DebugRecorder
 	HTTPClient      *http.Client
 	Logger          *zap.Logger
@@ -31,6 +32,7 @@ type Adapter struct {
 	chatURL         string
 	model           string
 	reasoningEffort string
+	apiKey          string
 	debug           *DebugRecorder
 	client          *http.Client
 	logger          *zap.Logger
@@ -62,6 +64,7 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 		chatURL:         chatURL,
 		model:           cfg.Model,
 		reasoningEffort: cfg.ReasoningEffort,
+		apiKey:          strings.TrimSpace(cfg.APIKey),
 		debug:           cfg.Debug,
 		client:          client,
 		logger:          logger,
@@ -289,6 +292,9 @@ func (a *Adapter) postChat(inbound *http.Request, chatReq map[string]any) (*http
 		return nil, err
 	}
 	copyForwardHeaders(req.Header, inbound.Header)
+	if a.apiKey != "" {
+		req.Header.Set("Authorization", authorizationHeader(a.apiKey))
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if chatReq["stream"] == true {
 		req.Header.Set("Accept", "text/event-stream")
@@ -296,6 +302,14 @@ func (a *Adapter) postChat(inbound *http.Request, chatReq map[string]any) (*http
 		req.Header.Set("Accept", "application/json")
 	}
 	return a.client.Do(req)
+}
+
+func authorizationHeader(apiKey string) string {
+	apiKey = strings.TrimSpace(apiKey)
+	if strings.Contains(apiKey, " ") {
+		return apiKey
+	}
+	return "Bearer " + apiKey
 }
 
 func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]any, *translationContext, error) {

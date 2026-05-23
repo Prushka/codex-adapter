@@ -22,6 +22,8 @@ func main() {
 	providerURL := flag.String("provider-url", "", "OpenAI-compatible upstream provider base URL or /v1 URL")
 	model := flag.String("model", "", "upstream chat_completions model to force into every request")
 	reasoningEffort := flag.String("reasoning-effort", "medium", "reasoning_effort value to force into every upstream request")
+	apiKey := flag.String("api-key", "", "upstream provider API key; overrides any Authorization header sent by Codex")
+	apiKeyEnv := flag.String("api-key-env", "", "environment variable containing the upstream provider API key")
 	debug := flag.Bool("debug", false, "save all translated requests and responses as ordered JSON files")
 	debugDir := flag.String("debug-dir", "debug", "directory for debug JSON files")
 	timeout := flag.Duration("timeout", 10*time.Minute, "upstream request timeout")
@@ -35,6 +37,17 @@ func main() {
 	}
 	if *reasoningEffort == "" {
 		exitWithError(logger, "missing required flag", zap.String("flag", "-reasoning-effort"))
+	}
+	if *apiKey != "" && *apiKeyEnv != "" {
+		exitWithError(logger, "only one API key source may be set", zap.String("flags", "-api-key,-api-key-env"))
+	}
+	upstreamAPIKey := *apiKey
+	if *apiKeyEnv != "" {
+		value, ok := os.LookupEnv(*apiKeyEnv)
+		if !ok || value == "" {
+			exitWithError(logger, "API key environment variable is unset or empty", zap.String("env", *apiKeyEnv))
+		}
+		upstreamAPIKey = value
 	}
 
 	var recorder *DebugRecorder
@@ -50,6 +63,7 @@ func main() {
 		ProviderURL:     *providerURL,
 		Model:           *model,
 		ReasoningEffort: *reasoningEffort,
+		APIKey:          upstreamAPIKey,
 		Debug:           recorder,
 		HTTPClient:      &http.Client{Timeout: *timeout},
 		Logger:          logger,

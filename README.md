@@ -11,7 +11,8 @@ go run . \
   -listen 127.0.0.1:8080 \
   -provider-url http://localhost:1234/v1 \
   -model your-chat-model \
-  -reasoning-effort medium
+  -reasoning-effort medium \
+  -api-key-env UPSTREAM_API_KEY
 ```
 
 Then point Codex at `http://127.0.0.1:8080/v1` as its provider base URL.
@@ -22,8 +23,13 @@ Options:
 - `-provider-url`: upstream OpenAI-compatible provider base URL, `/v1` URL, or direct `/chat/completions` URL.
 - `-model`: upstream Chat Completions model forced into every request.
 - `-reasoning-effort`: `reasoning_effort` forced into every upstream request.
+- `-api-key-env`: environment variable containing the upstream provider API key. When set, the adapter overwrites Codex's inbound `Authorization` header before forwarding upstream.
+- `-api-key`: upstream provider API key supplied directly on the command line. Prefer `-api-key-env` for shell history/process-list hygiene. Mutually exclusive with `-api-key-env`.
 - `-debug`: writes ordered JSON debug files for inbound requests, upstream requests/responses, and outbound Responses events.
 - `-debug-dir`: debug output directory, default `debug`.
+- `-timeout`: upstream request timeout, default `10m`.
+
+If neither `-api-key-env` nor `-api-key` is set, the adapter forwards the `Authorization` header that Codex sends to it. This keeps existing Codex `env_key` provider configs working. If an adapter-owned API key is configured, it always takes precedence over Codex's inbound key and is sent upstream as `Authorization: Bearer <key>`. Values that already include an authorization scheme, for example `Bearer sk-...`, are sent as-is.
 
 ## Translation Notes
 

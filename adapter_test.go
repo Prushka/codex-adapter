@@ -65,6 +65,61 @@ func TestBuildChatRequestForcesModelReasoningAndMessages(t *testing.T) {
 	}
 }
 
+func TestPostChatForwardsInboundAuthorizationByDefault(t *testing.T) {
+	authCh := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authCh <- r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	inbound := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	inbound.Header.Set("Authorization", "Bearer codex-key")
+	resp, err := adapter.postChat(inbound, map[string]any{"stream": false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if got := <-authCh; got != "Bearer codex-key" {
+		t.Fatalf("authorization = %q", got)
+	}
+}
+
+func TestPostChatConfiguredAPIKeyOverridesInboundAuthorization(t *testing.T) {
+	authCh := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authCh <- r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer upstream.Close()
+
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:     upstream.URL,
+		Model:           "forced-model",
+		ReasoningEffort: "low",
+		APIKey:          "upstream-key",
+		HTTPClient:      http.DefaultClient,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbound := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	inbound.Header.Set("Authorization", "Bearer codex-key")
+	resp, err := adapter.postChat(inbound, map[string]any{"stream": false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if got := <-authCh; got != "Bearer upstream-key" {
+		t.Fatalf("authorization = %q", got)
+	}
+}
+
 func TestStreamingFunctionCallToResponsesFunctionCall(t *testing.T) {
 	var upstreamReq map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
