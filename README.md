@@ -40,6 +40,7 @@ If neither `-api-key-env` nor `-api-key` is set, the adapter forwards the `Autho
 - Responses custom/freeform tools such as `apply_patch` are exposed upstream as a function taking one required string property, `input`, and reconstructed as `custom_tool_call`.
 - `tool_search` is exposed as a synthetic chat function and reconstructed as a client-executed `tool_search_call`.
 - `web_search` and `image_generation` are exposed as synthetic functions because Chat Completions has no standard equivalent for Responses hosted tools. The adapter reconstructs the corresponding Responses items if the upstream model calls them.
+- Gemini/OpenAI compatibility metadata such as `tool_calls[].extra_content.google.thought_signature` is preserved on Responses tool-call items and cached by `call_id` so follow-up tool-result requests can send it back upstream.
 - Streaming chat chunks are accumulated and emitted as Responses SSE events ending with `response.completed`, which Codex requires.
 
 The implementation follows the OpenAI API reference for Responses create, Chat Completions create, and Chat Completions streaming.

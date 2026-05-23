@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -21,6 +22,7 @@ import (
 const (
 	maxUpstreamErrorBodyLogBytes = 16 << 10
 	maxUpstreamErrorMessageBytes = 4 << 10
+	maxToolExtraContentEntries   = 4096
 )
 
 type AdapterConfig struct {
@@ -41,6 +43,9 @@ type Adapter struct {
 	debug           *DebugRecorder
 	client          *http.Client
 	logger          *zap.Logger
+	extraMu         sync.Mutex
+	extraByCallID   map[string]any
+	extraOrder      []string
 }
 
 func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
@@ -73,6 +78,7 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 		debug:           cfg.Debug,
 		client:          client,
 		logger:          logger,
+		extraByCallID:   map[string]any{},
 	}, nil
 }
 
@@ -210,6 +216,7 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "response_translation_error", err.Error()))
 		return
 	}
+	a.rememberToolExtraContent(gen)
 	emitGenerationAsResponses(gen, sse, respID)
 }
 
@@ -280,6 +287,7 @@ func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadGateway, "response_translation_error", err.Error())
 		return
 	}
+	a.rememberToolExtraContent(gen)
 	out := map[string]any{"output": gen.outputItems()}
 	a.debug.SaveJSON("outbound compact response", out)
 	w.Header().Set("Content-Type", "application/json")
@@ -316,8 +324,52 @@ func authorizationHeader(apiKey string) string {
 	return "Bearer " + apiKey
 }
 
+func (a *Adapter) rememberToolExtraContent(gen *chatGeneration) {
+	if gen == nil {
+		return
+	}
+	indexes := make([]int, 0, len(gen.tools))
+	for index := range gen.tools {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	for _, index := range indexes {
+		call := gen.tools[index]
+		if call == nil || call.ID == "" || call.ExtraContent == nil {
+			continue
+		}
+		a.rememberExtraContent(call.ID, call.ExtraContent)
+	}
+}
+
+func (a *Adapter) rememberExtraContent(callID string, extra any) {
+	if callID == "" || extra == nil {
+		return
+	}
+	a.extraMu.Lock()
+	defer a.extraMu.Unlock()
+	if _, exists := a.extraByCallID[callID]; !exists {
+		a.extraOrder = append(a.extraOrder, callID)
+	}
+	a.extraByCallID[callID] = cloneJSONValue(extra)
+	for len(a.extraOrder) > maxToolExtraContentEntries {
+		oldest := a.extraOrder[0]
+		a.extraOrder = a.extraOrder[1:]
+		delete(a.extraByCallID, oldest)
+	}
+}
+
+func (a *Adapter) extraContentForCallID(callID string) any {
+	if callID == "" {
+		return nil
+	}
+	a.extraMu.Lock()
+	defer a.extraMu.Unlock()
+	return cloneJSONValue(a.extraByCallID[callID])
+}
+
 func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]any, *translationContext, error) {
-	builder := newRequestBuilder()
+	builder := newRequestBuilder(a.extraContentForCallID)
 	tools := builder.translateTools(req["tools"])
 	messages := builder.translateInput(req)
 	if len(messages) == 0 {
@@ -597,9 +649,10 @@ func isEventStream(contentType string) bool {
 }
 
 type requestBuilder struct {
-	usedNames map[string]int
-	byChat    map[string]toolMapping
-	byKey     map[string]toolMapping
+	usedNames          map[string]int
+	byChat             map[string]toolMapping
+	byKey              map[string]toolMapping
+	lookupExtraContent func(callID string) any
 }
 
 type translationContext struct {
@@ -613,11 +666,12 @@ type toolMapping struct {
 	Namespace string
 }
 
-func newRequestBuilder() *requestBuilder {
+func newRequestBuilder(lookupExtraContent func(callID string) any) *requestBuilder {
 	return &requestBuilder{
-		usedNames: map[string]int{},
-		byChat:    map[string]toolMapping{},
-		byKey:     map[string]toolMapping{},
+		usedNames:          map[string]int{},
+		byChat:             map[string]toolMapping{},
+		byKey:              map[string]toolMapping{},
+		lookupExtraContent: lookupExtraContent,
 	}
 }
 
@@ -846,14 +900,17 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 	case "function_call":
 		name := stringField(item, "name")
 		namespace := stringField(item, "namespace")
-		return []map[string]any{assistantToolCallMessage(stringField(item, "call_id"), b.chatNameFor("function", namespace, name), stringField(item, "arguments"))}
+		callID := stringField(item, "call_id")
+		return []map[string]any{assistantToolCallMessage(callID, b.chatNameFor("function", namespace, name), stringField(item, "arguments"), b.extraContentForItem(item, callID))}
 	case "custom_tool_call":
 		name := stringField(item, "name")
 		args, _ := json.Marshal(map[string]string{"input": stringField(item, "input")})
-		return []map[string]any{assistantToolCallMessage(stringField(item, "call_id"), b.chatNameFor("custom", "", name), string(args))}
+		callID := stringField(item, "call_id")
+		return []map[string]any{assistantToolCallMessage(callID, b.chatNameFor("custom", "", name), string(args), b.extraContentForItem(item, callID))}
 	case "tool_search_call":
+		callID := optionalCallID(item)
 		args := compactJSONString(item["arguments"])
-		return []map[string]any{assistantToolCallMessage(optionalCallID(item), b.chatNameFor("tool_search", "", "tool_search"), args)}
+		return []map[string]any{assistantToolCallMessage(callID, b.chatNameFor("tool_search", "", "tool_search"), args, b.extraContentForItem(item, callID))}
 	case "function_call_output", "custom_tool_call_output":
 		callID := stringField(item, "call_id")
 		if callID == "" {
@@ -879,26 +936,38 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 	}
 }
 
-func assistantToolCallMessage(callID, name, arguments string) map[string]any {
+func (b *requestBuilder) extraContentForItem(item map[string]any, callID string) any {
+	if extra := item["extra_content"]; extra != nil {
+		return cloneJSONValue(extra)
+	}
+	if b.lookupExtraContent == nil {
+		return nil
+	}
+	return b.lookupExtraContent(callID)
+}
+
+func assistantToolCallMessage(callID, name, arguments string, extraContent any) map[string]any {
 	if callID == "" {
 		callID = newID("call")
 	}
 	if arguments == "" {
 		arguments = "{}"
 	}
-	return map[string]any{
-		"role":    "assistant",
-		"content": nil,
-		"tool_calls": []any{
-			map[string]any{
-				"id":   callID,
-				"type": "function",
-				"function": map[string]any{
-					"name":      name,
-					"arguments": arguments,
-				},
-			},
+	toolCall := map[string]any{
+		"id":   callID,
+		"type": "function",
+		"function": map[string]any{
+			"name":      name,
+			"arguments": arguments,
 		},
+	}
+	if extraContent != nil {
+		toolCall["extra_content"] = cloneJSONValue(extraContent)
+	}
+	return map[string]any{
+		"role":       "assistant",
+		"content":    nil,
+		"tool_calls": []any{toolCall},
 	}
 }
 
@@ -1140,6 +1209,7 @@ func (a *Adapter) translateChatStream(body io.Reader, ctx *translationContext, s
 	if err := process(); err != nil {
 		return err
 	}
+	a.rememberToolExtraContent(gen)
 	emitGenerationAsResponses(gen, sse, respID)
 	return nil
 }
@@ -1214,6 +1284,7 @@ type chatToolCall struct {
 	ID                 string
 	Type               string
 	Name               string
+	ExtraContent       any
 	Arguments          strings.Builder
 	Mapping            toolMapping
 	announced          bool
@@ -1295,6 +1366,9 @@ func (g *chatGeneration) applyToolCallDeltas(delta map[string]any, sse *response
 			}
 			if s := stringField(call, "type"); s != "" {
 				acc.Type = s
+			}
+			if extra := call["extra_content"]; extra != nil {
+				acc.ExtraContent = cloneJSONValue(extra)
 			}
 			fragment := ""
 			if fn, ok := call["function"].(map[string]any); ok {
@@ -1505,6 +1579,9 @@ func (g *chatGeneration) announceFunctionTool(call *chatToolCall, sse *responseS
 	if mapping.Namespace != "" {
 		item["namespace"] = mapping.Namespace
 	}
+	if call.ExtraContent != nil {
+		item["extra_content"] = cloneJSONValue(call.ExtraContent)
+	}
 	_ = sse.Event("response.output_item.added", map[string]any{
 		"response_id":  respID,
 		"output_index": call.outputIndex,
@@ -1535,17 +1612,21 @@ func (g *chatGeneration) announceCustomTool(call *chatToolCall, sse *responseSSE
 	if call.outputIndex < 0 {
 		call.outputIndex = g.allocateOutputIndex()
 	}
+	item := map[string]any{
+		"id":      call.ItemID,
+		"type":    "custom_tool_call",
+		"call_id": call.ID,
+		"name":    displayName,
+		"input":   "",
+		"status":  "in_progress",
+	}
+	if call.ExtraContent != nil {
+		item["extra_content"] = cloneJSONValue(call.ExtraContent)
+	}
 	_ = sse.Event("response.output_item.added", map[string]any{
 		"response_id":  respID,
 		"output_index": call.outputIndex,
-		"item": map[string]any{
-			"id":      call.ItemID,
-			"type":    "custom_tool_call",
-			"call_id": call.ID,
-			"name":    displayName,
-			"input":   "",
-			"status":  "in_progress",
-		},
+		"item":         item,
 	})
 	call.announced = true
 }
@@ -1635,6 +1716,9 @@ func generationFromChatResponse(raw []byte, ctx *translationContext) (*chatGener
 			acc.Type = stringField(call, "type")
 			if acc.Type == "" {
 				acc.Type = "function"
+			}
+			if extra := call["extra_content"]; extra != nil {
+				acc.ExtraContent = cloneJSONValue(extra)
 			}
 			if fn, ok := call["function"].(map[string]any); ok {
 				acc.Name = stringField(fn, "name")
@@ -1762,28 +1846,34 @@ func (g *chatGeneration) toolCallItem(call *chatToolCall) map[string]any {
 		if displayName == "" {
 			displayName = name
 		}
-		return map[string]any{
+		item := map[string]any{
 			"id":      itemID,
 			"type":    "custom_tool_call",
 			"call_id": callID,
 			"name":    displayName,
 			"input":   customInputFromArguments(args),
 		}
+		addExtraContent(item, call.ExtraContent)
+		return item
 	case "tool_search":
-		return map[string]any{
+		item := map[string]any{
 			"id":        newID("ts"),
 			"type":      "tool_search_call",
 			"call_id":   callID,
 			"execution": "client",
 			"arguments": jsonValueOrObject(args),
 		}
+		addExtraContent(item, call.ExtraContent)
+		return item
 	case "web_search":
-		return map[string]any{
+		item := map[string]any{
 			"id":     newID("ws"),
 			"type":   "web_search_call",
 			"status": "completed",
 			"action": webSearchActionFromArguments(args),
 		}
+		addExtraContent(item, call.ExtraContent)
+		return item
 	case "image_generation":
 		action := jsonObject(args)
 		result := firstString(action, "result", "b64_json", "image")
@@ -1791,13 +1881,15 @@ func (g *chatGeneration) toolCallItem(call *chatToolCall) map[string]any {
 		if result == "" {
 			status = "failed"
 		}
-		return map[string]any{
+		item := map[string]any{
 			"id":             newID("ig"),
 			"type":           "image_generation_call",
 			"status":         status,
 			"revised_prompt": firstString(action, "revised_prompt", "prompt"),
 			"result":         result,
 		}
+		addExtraContent(item, call.ExtraContent)
+		return item
 	default:
 		if itemID == "" {
 			itemID = newID("fc")
@@ -1816,7 +1908,14 @@ func (g *chatGeneration) toolCallItem(call *chatToolCall) map[string]any {
 		if mapping.Namespace != "" {
 			item["namespace"] = mapping.Namespace
 		}
+		addExtraContent(item, call.ExtraContent)
 		return item
+	}
+}
+
+func addExtraContent(item map[string]any, extra any) {
+	if extra != nil {
+		item["extra_content"] = cloneJSONValue(extra)
 	}
 }
 
@@ -2014,6 +2113,21 @@ func jsonObject(raw string) map[string]any {
 		return map[string]any{}
 	}
 	return value
+}
+
+func cloneJSONValue(value any) any {
+	if value == nil {
+		return nil
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return value
+	}
+	var out any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return value
+	}
+	return out
 }
 
 func argsOrEmptyObject(args string) string {

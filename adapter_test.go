@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"go.uber.org/zap"
@@ -219,6 +220,96 @@ func TestStreamingFunctionCallToResponsesFunctionCall(t *testing.T) {
 		t.Fatalf("function delta = %v", events[deltaIndex]["delta"])
 	}
 	assertCompleted(t, events)
+}
+
+func TestGeminiExtraContentRoundTripsThroughAdapterCache(t *testing.T) {
+	var requestCount atomic.Int32
+	extraContent := map[string]any{
+		"google": map[string]any{
+			"thought_signature": "sig-123",
+		},
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requestCount.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+				"choices": []any{
+					map[string]any{
+						"delta": map[string]any{
+							"tool_calls": []any{
+								map[string]any{
+									"index":         0,
+									"id":            "call-gemini",
+									"type":          "function",
+									"extra_content": extraContent,
+									"function": map[string]any{
+										"name":      "exec_command",
+										"arguments": "{\"cmd\":\"pwd\"}",
+									},
+								},
+							},
+						},
+					},
+				},
+			}) + "\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			got := firstAssistantToolCallExtraContent(t, req)
+			gotGoogle := got["google"].(map[string]any)
+			if gotGoogle["thought_signature"] != "sig-123" {
+				t.Fatalf("thought_signature = %#v", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []any{
+					map[string]any{
+						"message": map[string]any{"content": "done"},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected upstream request")
+		}
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":       "function",
+			"name":       "exec_command",
+			"parameters": objectSchema(),
+		},
+	})
+
+	events := callResponses(t, adapter, body)
+	item := firstDoneItem(t, events, "function_call")
+	emittedExtra := item["extra_content"].(map[string]any)
+	if emittedExtra["google"].(map[string]any)["thought_signature"] != "sig-123" {
+		t.Fatalf("emitted extra_content = %#v", emittedExtra)
+	}
+
+	// Existing Codex builds drop unknown ResponseItem fields. The adapter cache
+	// still needs to restore Gemini's extra_content on the follow-up chat request.
+	delete(item, "extra_content")
+	body["input"] = []any{
+		item,
+		map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call-gemini",
+			"output":  "ok",
+		},
+	}
+	_ = callResponses(t, adapter, body)
+	if requestCount.Load() != 2 {
+		t.Fatalf("upstream request count = %d", requestCount.Load())
+	}
 }
 
 func TestStreamingTextAndReasoningAddBeforeDeltaAndDone(t *testing.T) {
@@ -765,6 +856,35 @@ func firstResponseEvent(t *testing.T, events []map[string]any, typ string) map[s
 		}
 	}
 	t.Fatalf("missing response event type %s in %#v", typ, events)
+	return nil
+}
+
+func firstAssistantToolCallExtraContent(t *testing.T, req map[string]any) map[string]any {
+	t.Helper()
+	messages, ok := req["messages"].([]any)
+	if !ok {
+		t.Fatalf("messages missing in %#v", req)
+	}
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok || message["role"] != "assistant" {
+			continue
+		}
+		calls, ok := message["tool_calls"].([]any)
+		if !ok || len(calls) == 0 {
+			continue
+		}
+		call, ok := calls[0].(map[string]any)
+		if !ok {
+			continue
+		}
+		extra, ok := call["extra_content"].(map[string]any)
+		if !ok {
+			t.Fatalf("extra_content missing on tool call: %#v", call)
+		}
+		return extra
+	}
+	t.Fatalf("assistant tool call missing in %#v", req)
 	return nil
 }
 
