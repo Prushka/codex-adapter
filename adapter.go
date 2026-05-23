@@ -750,22 +750,17 @@ func (b *requestBuilder) functionTool(namespace string, tool map[string]any, kin
 func (b *requestBuilder) customTool(tool map[string]any) map[string]any {
 	name := stringField(tool, "name")
 	chatName := b.register("custom", "", name)
-	description := strings.TrimSpace(stringField(tool, "description"))
-	if description != "" {
-		description += "\n\n"
-	}
-	description += "This is a Responses custom/freeform tool. Call it with a JSON object containing exactly one string field named input. The input value must be the complete freeform tool payload."
 	return map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        chatName,
-			"description": description,
+			"description": customToolDescription(tool),
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"input": map[string]any{
 						"type":        "string",
-						"description": "Complete freeform input for the custom tool.",
+						"description": customToolInputDescription(),
 					},
 				},
 				"required":             []any{"input"},
@@ -774,6 +769,53 @@ func (b *requestBuilder) customTool(tool map[string]any) map[string]any {
 			"strict": true,
 		},
 	}
+}
+
+func customToolDescription(tool map[string]any) string {
+	sections := make([]string, 0, 3)
+	if description := stringField(tool, "description"); strings.TrimSpace(description) != "" {
+		sections = append(sections, description)
+	}
+	if formatDescription := customToolFormatDescription(tool["format"]); formatDescription != "" {
+		sections = append(sections, formatDescription)
+	}
+	sections = append(sections, "Call it with a JSON object containing exactly one string field named input. The input value must be the complete freeform tool payload.")
+	return strings.Join(sections, "\n\n")
+}
+
+func customToolFormatDescription(format any) string {
+	formatMap, ok := format.(map[string]any)
+	if !ok || len(formatMap) == 0 {
+		if format == nil {
+			return ""
+		}
+		return "Responses custom tool format:\n" + compactJSONString(format)
+	}
+
+	sections := make([]string, 0, 4)
+	sections = append(sections, "Responses custom tool format:")
+	if formatType := stringField(formatMap, "type"); strings.TrimSpace(formatType) != "" {
+		sections = append(sections, "type: "+formatType)
+	}
+	if syntax := stringField(formatMap, "syntax"); strings.TrimSpace(syntax) != "" {
+		sections = append(sections, "syntax: "+syntax)
+	}
+	if definition := stringField(formatMap, "definition"); strings.TrimSpace(definition) != "" {
+		sections = append(sections, "definition:\n"+indentText(definition, "  "))
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+func customToolInputDescription() string {
+	return "Complete freeform input for the custom tool. The upstream description preserves the original Responses instructions and format grammar."
+}
+
+func indentText(text, prefix string) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (b *requestBuilder) hostedFunctionTool(name, kind, description string, parameters any) map[string]any {

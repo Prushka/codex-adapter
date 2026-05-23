@@ -404,6 +404,8 @@ func TestNamespaceToolCallRoundTripsNamespace(t *testing.T) {
 
 func TestCustomApplyPatchToolCallRoundTripsAsCustomToolCall(t *testing.T) {
 	patch := "*** Begin Patch\n*** Add File: note.txt\n+hi\n*** End Patch\n"
+	const applyPatchDescription = "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON."
+	const applyPatchGrammar = "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\n\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line+\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF change_move? change?\n\nfilename: /(.+)/\nadd_line: \"+\" /(.*)/ LF -> line\n\nchange_move: \"*** Move to: \" filename LF\nchange: (change_context | change_line)+ eof_line?\nchange_context: (\"@@\" | \"@@ \" /(.+)/) LF\nchange_line: (\"+\" | \"-\" | \" \") /(.*)/ LF\neof_line: \"*** End of File\" LF\n\n%import common.LF"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -413,6 +415,39 @@ func TestCustomApplyPatchToolCallRoundTripsAsCustomToolCall(t *testing.T) {
 		fn := tools[0].(map[string]any)["function"].(map[string]any)
 		if fn["name"] != "apply_patch" {
 			t.Fatalf("custom function name = %v", fn["name"])
+		}
+		if fn["strict"] != true {
+			t.Fatalf("custom function strict = %#v", fn["strict"])
+		}
+		description, _ := fn["description"].(string)
+		for _, want := range []string{
+			"Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+			"Responses custom tool format:",
+			"type: grammar",
+			"syntax: lark",
+			"start: begin_patch hunk+ end_patch",
+			"*** Add File: ",
+			"*** End Patch",
+			"*** End of File",
+			"Call it with a JSON object containing exactly one string field named input.",
+		} {
+			if !strings.Contains(description, want) {
+				t.Fatalf("custom function description missing %q:\n%s", want, description)
+			}
+		}
+		parameters := fn["parameters"].(map[string]any)
+		if parameters["additionalProperties"] != false {
+			t.Fatalf("custom function parameters.additionalProperties = %#v", parameters["additionalProperties"])
+		}
+		if got := parameters["required"].([]any); len(got) != 1 || got[0] != "input" {
+			t.Fatalf("custom function parameters.required = %#v", got)
+		}
+		input := parameters["properties"].(map[string]any)["input"].(map[string]any)
+		if input["type"] != "string" {
+			t.Fatalf("custom function input type = %#v", input["type"])
+		}
+		if got := input["description"].(string); !strings.Contains(got, "freeform input for the custom tool") {
+			t.Fatalf("custom function input description = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -441,11 +476,11 @@ func TestCustomApplyPatchToolCallRoundTripsAsCustomToolCall(t *testing.T) {
 		map[string]any{
 			"type":        "custom",
 			"name":        "apply_patch",
-			"description": "Apply a patch.",
+			"description": applyPatchDescription,
 			"format": map[string]any{
 				"type":       "grammar",
 				"syntax":     "lark",
-				"definition": "start: /.+/",
+				"definition": applyPatchGrammar,
 			},
 		},
 	})

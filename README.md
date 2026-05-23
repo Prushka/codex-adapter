@@ -61,7 +61,7 @@ If neither `-api-key-env` nor `-api-key` is set, the adapter forwards the `Autho
 - Responses `input` items become chat `messages`, including prior function/custom tool calls and tool outputs.
 - Responses function tools become Chat Completions `function` tools.
 - Responses namespace tools are flattened with Codex's code-mode naming rule and reconstructed with `namespace` on the way back.
-- Responses custom/freeform tools such as `apply_patch` are exposed upstream as a function taking one required string property, `input`, and reconstructed as `custom_tool_call`.
+- Responses custom/freeform tools such as `apply_patch` are exposed upstream as a function taking one required string property, `input`. The adapter preserves the original Responses description and freeform grammar in the upstream function description, and reconstructs the result as `custom_tool_call`.
 - `tool_search` is exposed as a synthetic chat function and reconstructed as a client-executed `tool_search_call`.
 - `web_search` and `image_generation` are exposed as synthetic functions because Chat Completions has no standard equivalent for Responses hosted tools. The adapter reconstructs the corresponding Responses items if the upstream model calls them.
 - `web_search` falls back to a local search-and-fetch follow-up when the upstream provider stops at a chat-completions tool call, so Codex still receives a completed Responses turn.
