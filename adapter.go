@@ -381,6 +381,9 @@ func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]
 	builder := newRequestBuilder(a.extraContentForCallID)
 	tools := builder.translateTools(req["tools"])
 	messages := builder.translateInput(req)
+	if len(builder.extraTools) > 0 {
+		tools = append(tools, builder.extraTools...)
+	}
 	if len(messages) == 0 {
 		messages = append(messages, map[string]any{"role": "user", "content": ""})
 	}
@@ -661,6 +664,8 @@ type requestBuilder struct {
 	usedNames          map[string]int
 	byChat             map[string]toolMapping
 	byKey              map[string]toolMapping
+	extraTools         []any
+	renderedCallIDs    map[string]bool
 	lookupExtraContent func(callID string) any
 }
 
@@ -680,6 +685,7 @@ func newRequestBuilder(lookupExtraContent func(callID string) any) *requestBuild
 		usedNames:          map[string]int{},
 		byChat:             map[string]toolMapping{},
 		byKey:              map[string]toolMapping{},
+		renderedCallIDs:    map[string]bool{},
 		lookupExtraContent: lookupExtraContent,
 	}
 }
@@ -842,16 +848,27 @@ func (b *requestBuilder) register(kind, namespace, name string) string {
 	return chatName
 }
 
-func (b *requestBuilder) chatNameFor(kind, namespace, name string) string {
+func (b *requestBuilder) knownChatNameFor(kind, namespace, name string) (string, bool) {
 	if mapping, ok := b.byKey[toolKey(kind, namespace, name)]; ok {
-		return mapping.ChatName
+		return mapping.ChatName, true
 	}
 	if kind != "function" {
 		if mapping, ok := b.byKey[toolKey("function", namespace, name)]; ok {
-			return mapping.ChatName
+			return mapping.ChatName, true
 		}
 	}
-	return safeToolName(flatToolName(namespace, name))
+	return "", false
+}
+
+func (b *requestBuilder) hasRegisteredTool(kind, namespace, name string) bool {
+	if _, ok := b.byKey[toolKey(kind, namespace, name)]; ok {
+		return true
+	}
+	if kind != "function" {
+		_, ok := b.byKey[toolKey("function", namespace, name)]
+		return ok
+	}
+	return false
 }
 
 func (b *requestBuilder) uniqueChatName(original string) string {
@@ -952,19 +969,37 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 		name := stringField(item, "name")
 		namespace := stringField(item, "namespace")
 		callID := stringField(item, "call_id")
-		return []map[string]any{assistantToolCallMessage(callID, b.chatNameFor("function", namespace, name), stringField(item, "arguments"), b.extraContentForItem(item, callID))}
+		chatName, ok := b.knownChatNameFor("function", namespace, name)
+		if !ok {
+			return []map[string]any{markerMessage(item)}
+		}
+		b.renderedCallIDs[callID] = true
+		return []map[string]any{assistantToolCallMessage(callID, chatName, stringField(item, "arguments"), b.extraContentForItem(item, callID))}
 	case "custom_tool_call":
 		name := stringField(item, "name")
 		args, _ := json.Marshal(map[string]string{"input": stringField(item, "input")})
 		callID := stringField(item, "call_id")
-		return []map[string]any{assistantToolCallMessage(callID, b.chatNameFor("custom", "", name), string(args), b.extraContentForItem(item, callID))}
+		chatName, ok := b.knownChatNameFor("custom", "", name)
+		if !ok {
+			return []map[string]any{markerMessage(item)}
+		}
+		b.renderedCallIDs[callID] = true
+		return []map[string]any{assistantToolCallMessage(callID, chatName, string(args), b.extraContentForItem(item, callID))}
 	case "tool_search_call":
 		callID := optionalCallID(item)
 		args := compactJSONString(item["arguments"])
-		return []map[string]any{assistantToolCallMessage(callID, b.chatNameFor("tool_search", "", "tool_search"), args, b.extraContentForItem(item, callID))}
+		chatName, ok := b.knownChatNameFor("tool_search", "", "tool_search")
+		if !ok {
+			return []map[string]any{markerMessage(item)}
+		}
+		b.renderedCallIDs[callID] = true
+		return []map[string]any{assistantToolCallMessage(callID, chatName, args, b.extraContentForItem(item, callID))}
 	case "function_call_output", "custom_tool_call_output":
 		callID := stringField(item, "call_id")
 		if callID == "" {
+			return []map[string]any{markerMessage(item)}
+		}
+		if !b.renderedCallIDs[callID] {
 			return []map[string]any{markerMessage(item)}
 		}
 		return []map[string]any{{
@@ -974,7 +1009,11 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 		}}
 	case "tool_search_output":
 		callID := optionalCallID(item)
+		b.registerToolSearchOutputTools(item["tools"])
 		if callID == "" {
+			return []map[string]any{markerMessage(item)}
+		}
+		if !b.renderedCallIDs[callID] {
 			return []map[string]any{markerMessage(item)}
 		}
 		return []map[string]any{{
@@ -984,6 +1023,58 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 		}}
 	default:
 		return []map[string]any{markerMessage(item)}
+	}
+}
+
+func (b *requestBuilder) registerToolSearchOutputTools(value any) {
+	items, ok := value.([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range items {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		b.registerDiscoveredTool("", tool)
+	}
+}
+
+func (b *requestBuilder) registerDiscoveredTool(namespace string, tool map[string]any) {
+	toolType := stringField(tool, "type")
+	if toolType == "" && tool["tools"] != nil {
+		toolType = "namespace"
+	}
+	if toolType == "" && stringField(tool, "name") != "" {
+		toolType = "function"
+	}
+
+	switch toolType {
+	case "function":
+		name := stringField(tool, "name")
+		if name == "" || b.hasRegisteredTool("function", namespace, name) {
+			return
+		}
+		b.extraTools = append(b.extraTools, b.functionTool(namespace, tool, "function"))
+	case "custom":
+		name := stringField(tool, "name")
+		if namespace != "" || name == "" || b.hasRegisteredTool("custom", "", name) {
+			return
+		}
+		b.extraTools = append(b.extraTools, b.customTool(tool))
+	case "namespace":
+		childNamespace := stringField(tool, "name")
+		if childNamespace == "" {
+			childNamespace = namespace
+		}
+		children, _ := tool["tools"].([]any)
+		for _, rawChild := range children {
+			child, ok := rawChild.(map[string]any)
+			if !ok {
+				continue
+			}
+			b.registerDiscoveredTool(childNamespace, child)
+		}
 	}
 }
 

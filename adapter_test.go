@@ -676,6 +676,178 @@ func TestToolSearchCallRoundTripsAsClientToolSearch(t *testing.T) {
 	}
 }
 
+func TestToolSearchOutputRegistersDiscoveredNamespaceToolsForChatFollowUp(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		tools := req["tools"].([]any)
+		var names []string
+		for _, raw := range tools {
+			tool := raw.(map[string]any)
+			fn := tool["function"].(map[string]any)
+			names = append(names, fn["name"].(string))
+		}
+		if !stringSliceContains(names, "tool_search") {
+			t.Fatalf("missing tool_search in %v", names)
+		}
+		if !stringSliceContains(names, "multi_agent_v1_spawn_agent") {
+			t.Fatalf("missing discovered namespace child in %v", names)
+		}
+		messages := req["messages"].([]any)
+		toolMsg := messages[len(messages)-2].(map[string]any)
+		if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "search-1" {
+			t.Fatalf("bad tool_search_output chat message: %#v", toolMsg)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"id":   "call-spawn",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "multi_agent_v1_spawn_agent",
+									"arguments": "{\"message\":\"Explore the repo\",\"fork_context\":true}",
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":        "tool_search",
+			"execution":   "client",
+			"description": "Search tools.",
+			"parameters":  objectSchema(),
+		},
+	})
+	body["input"] = []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": "Find spawn agent tooling."}},
+		},
+		map[string]any{
+			"type":      "tool_search_call",
+			"call_id":   "search-1",
+			"execution": "client",
+			"arguments": map[string]any{"query": "spawn agent", "limit": 5},
+		},
+		map[string]any{
+			"type":      "tool_search_output",
+			"call_id":   "search-1",
+			"execution": "client",
+			"status":    "completed",
+			"tools": []any{
+				map[string]any{
+					"type":        "namespace",
+					"name":        "multi_agent_v1",
+					"description": "Tools for spawning and managing sub-agents.",
+					"tools": []any{
+						map[string]any{
+							"type":          "function",
+							"name":          "spawn_agent",
+							"description":   "Spawn a sub-agent for a well-scoped task.",
+							"defer_loading": true,
+							"parameters": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"message":      map[string]any{"type": "string"},
+									"fork_context": map[string]any{"type": "boolean"},
+								},
+								"required":             []any{"message"},
+								"additionalProperties": false,
+							},
+						},
+					},
+				},
+			},
+		},
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": "Spawn one agent."}},
+		},
+	}
+
+	events := callResponses(t, adapter, body)
+	item := firstDoneItem(t, events, "function_call")
+	if item["namespace"] != "multi_agent_v1" || item["name"] != "spawn_agent" {
+		t.Fatalf("bad discovered namespace call: %#v", item)
+	}
+	if item["call_id"] != "call-spawn" {
+		t.Fatalf("call_id = %v", item["call_id"])
+	}
+}
+
+func TestUnknownHistoricalToolCallIsNotForwardedAsChatToolCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		messages := req["messages"].([]any)
+		for _, raw := range messages {
+			msg := raw.(map[string]any)
+			if _, ok := msg["tool_calls"]; ok {
+				t.Fatalf("unknown historical call was forwarded as chat tool call: %#v", msg)
+			}
+			if msg["role"] == "tool" {
+				t.Fatalf("unknown historical output was forwarded as chat tool output: %#v", msg)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{"content": "recovered"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools(nil)
+	body["input"] = []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": "Spawn agents."}},
+		},
+		map[string]any{
+			"type":      "function_call",
+			"call_id":   "bad-wrapper",
+			"name":      "multi_agent_v1",
+			"arguments": "{\"spawn_agent\":{\"message\":\"one\"}}{\"spawn_agent\":{\"message\":\"two\"}}",
+		},
+		map[string]any{
+			"type":    "function_call_output",
+			"call_id": "bad-wrapper",
+			"output":  "unsupported call: multi_agent_v1",
+		},
+	}
+
+	events := callResponses(t, adapter, body)
+	message := firstDoneItem(t, events, "message")
+	content := message["content"].([]any)
+	if got := content[0].(map[string]any)["text"].(string); got != "recovered" {
+		t.Fatalf("final message = %q", got)
+	}
+}
+
 func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1333,6 +1505,15 @@ func assertCompleted(t *testing.T, events []map[string]any) {
 		}
 	}
 	t.Fatalf("missing response.completed in %#v", events)
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func mustJSON(value any) string {
