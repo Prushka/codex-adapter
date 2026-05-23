@@ -965,6 +965,14 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 			"role":    role,
 			"content": chatContentFromResponsesContent(item["content"], role),
 		}}
+	case "reasoning":
+		if content := reasoningItemContent(item); content != "" {
+			return []map[string]any{{
+				"role":    "assistant",
+				"content": content,
+			}}
+		}
+		return nil
 	case "function_call":
 		name := stringField(item, "name")
 		namespace := stringField(item, "namespace")
@@ -1028,6 +1036,20 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 	default:
 		return []map[string]any{markerMessage(item)}
 	}
+}
+
+func reasoningItemContent(item map[string]any) string {
+	if content := chatContentFromResponsesContent(item["summary"], "assistant"); content != nil {
+		if text, ok := content.(string); ok && strings.TrimSpace(text) != "" {
+			return text
+		}
+	}
+	if content := chatContentFromResponsesContent(item["content"], "assistant"); content != nil {
+		if text, ok := content.(string); ok && strings.TrimSpace(text) != "" {
+			return text
+		}
+	}
+	return ""
 }
 
 func (b *requestBuilder) registerToolSearchOutputTools(value any) {
@@ -1154,7 +1176,7 @@ func chatContentFromResponsesContent(value any, role string) any {
 			continue
 		}
 		switch stringField(item, "type") {
-		case "input_text", "output_text", "text":
+		case "input_text", "output_text", "text", "reasoning_text", "summary_text":
 			s := stringField(item, "text")
 			text.WriteString(s)
 			parts = append(parts, map[string]any{"type": "text", "text": s})

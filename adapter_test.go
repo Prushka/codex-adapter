@@ -70,6 +70,49 @@ func TestBuildChatRequestForcesModelReasoningAndMessages(t *testing.T) {
 	}
 }
 
+func TestBuildChatRequestFlattensReasoningItems(t *testing.T) {
+	adapter := testAdapter(t, "http://example.test/v1", nil)
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "reasoning",
+				"summary": []any{},
+				"content": []any{
+					map[string]any{"type": "reasoning_text", "text": "hidden detail"},
+				},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 1 {
+		t.Fatalf("messages length = %d", len(messages))
+	}
+	if messages[0]["role"] != "assistant" {
+		t.Fatalf("role = %v", messages[0]["role"])
+	}
+	if got := messages[0]["content"]; got != "hidden detail" {
+		t.Fatalf("content = %v", got)
+	}
+	if got, ok := messages[0]["content"].(string); !ok || strings.HasPrefix(got, "[Responses API item]") {
+		t.Fatalf("reasoning content still marked: %#v", messages[0]["content"])
+	}
+}
+
+func TestChatContentFromResponsesContentFlattensReasoningTextTypes(t *testing.T) {
+	got := chatContentFromResponsesContent([]any{
+		map[string]any{"type": "reasoning_text", "text": "thinking"},
+		map[string]any{"type": "summary_text", "text": " summary"},
+	}, "assistant")
+	if got != "thinking summary" {
+		t.Fatalf("content = %#v", got)
+	}
+}
+
 func TestPostChatForwardsInboundAuthorizationByDefault(t *testing.T) {
 	authCh := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
