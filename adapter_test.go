@@ -791,6 +791,143 @@ func TestToolSearchOutputRegistersDiscoveredNamespaceToolsForChatFollowUp(t *tes
 	}
 }
 
+func TestStreamingDiscoveredToolCallsWithoutIndexesStaySeparate(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		tools := req["tools"].([]any)
+		var names []string
+		for _, raw := range tools {
+			tool := raw.(map[string]any)
+			fn := tool["function"].(map[string]any)
+			names = append(names, fn["name"].(string))
+		}
+		if !stringSliceContains(names, "multi_agent_v1_spawn_agent") {
+			t.Fatalf("missing discovered spawn tool in %v", names)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, call := range []struct {
+			id      string
+			message string
+		}{
+			{id: "call-spawn-a", message: "Explore adapter.go."},
+			{id: "call-spawn-b", message: "Explore sse.go."},
+			{id: "call-spawn-c", message: "Explore README.md."},
+		} {
+			_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+				"choices": []any{
+					map[string]any{
+						"delta": map[string]any{
+							"tool_calls": []any{
+								map[string]any{
+									"id":   call.id,
+									"type": "function",
+									"function": map[string]any{
+										"name": "multi_agent_v1_spawn_agent",
+										"arguments": mustJSON(map[string]any{
+											"agent_type": "explorer",
+											"message":    call.message,
+										}),
+									},
+								},
+							},
+						},
+					},
+				},
+			}) + "\n\n"))
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":        "tool_search",
+			"execution":   "client",
+			"description": "Search tools.",
+			"parameters":  objectSchema(),
+		},
+	})
+	body["input"] = []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": "Find spawn agent tooling."}},
+		},
+		map[string]any{
+			"type":      "tool_search_call",
+			"call_id":   "search-1",
+			"execution": "client",
+			"arguments": map[string]any{"query": "spawn agent", "limit": 5},
+		},
+		map[string]any{
+			"type":      "tool_search_output",
+			"call_id":   "search-1",
+			"execution": "client",
+			"status":    "completed",
+			"tools": []any{
+				map[string]any{
+					"type":        "namespace",
+					"name":        "multi_agent_v1",
+					"description": "Tools for spawning and managing sub-agents.",
+					"tools": []any{
+						map[string]any{
+							"type":        "function",
+							"name":        "spawn_agent",
+							"description": "Spawn a sub-agent for a well-scoped task.",
+							"parameters": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"message":    map[string]any{"type": "string"},
+									"agent_type": map[string]any{"type": "string"},
+								},
+								"additionalProperties": false,
+							},
+						},
+					},
+				},
+			},
+		},
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": "Spawn 3 agents."}},
+		},
+	}
+
+	events := callResponses(t, adapter, body)
+	var calls []map[string]any
+	for _, event := range events {
+		if event["type"] != "response.output_item.done" {
+			continue
+		}
+		item := event["item"].(map[string]any)
+		if item["type"] == "function_call" {
+			calls = append(calls, item)
+		}
+	}
+	if len(calls) != 3 {
+		t.Fatalf("function calls = %#v", calls)
+	}
+	for i, call := range calls {
+		if call["namespace"] != "multi_agent_v1" || call["name"] != "spawn_agent" {
+			t.Fatalf("bad discovered call %d: %#v", i, call)
+		}
+		args := jsonObject(call["arguments"].(string))
+		if args["message"] == "" {
+			t.Fatalf("call %d missing message args: %#v", i, call)
+		}
+	}
+	if calls[0]["call_id"] != "call-spawn-a" || calls[1]["call_id"] != "call-spawn-b" || calls[2]["call_id"] != "call-spawn-c" {
+		t.Fatalf("call ids = %#v", calls)
+	}
+}
+
 func TestUnknownHistoricalToolCallIsNotForwardedAsChatToolCall(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]any
@@ -837,6 +974,69 @@ func TestUnknownHistoricalToolCallIsNotForwardedAsChatToolCall(t *testing.T) {
 			"type":    "function_call_output",
 			"call_id": "bad-wrapper",
 			"output":  "unsupported call: multi_agent_v1",
+		},
+	}
+
+	events := callResponses(t, adapter, body)
+	message := firstDoneItem(t, events, "message")
+	content := message["content"].([]any)
+	if got := content[0].(map[string]any)["text"].(string); got != "recovered" {
+		t.Fatalf("final message = %q", got)
+	}
+}
+
+func TestMalformedHistoricalToolCallIsNotForwardedAsChatToolCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		messages := req["messages"].([]any)
+		for _, raw := range messages {
+			msg := raw.(map[string]any)
+			if _, ok := msg["tool_calls"]; ok {
+				t.Fatalf("malformed historical call was forwarded as chat tool call: %#v", msg)
+			}
+			if msg["role"] == "tool" {
+				t.Fatalf("malformed historical output was forwarded as chat tool output: %#v", msg)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{"content": "recovered"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":       "function",
+			"name":       "known_tool",
+			"parameters": objectSchema(),
+		},
+	})
+	body["input"] = []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": "Run tools."}},
+		},
+		map[string]any{
+			"type":      "function_call",
+			"call_id":   "bad-known",
+			"name":      "known_tool",
+			"arguments": "{\"a\":1}{\"a\":2}",
+		},
+		map[string]any{
+			"type":    "function_call_output",
+			"call_id": "bad-known",
+			"output":  "failed to parse function arguments: trailing characters",
 		},
 	}
 

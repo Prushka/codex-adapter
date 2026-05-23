@@ -969,12 +969,16 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 		name := stringField(item, "name")
 		namespace := stringField(item, "namespace")
 		callID := stringField(item, "call_id")
+		args := stringField(item, "arguments")
 		chatName, ok := b.knownChatNameFor("function", namespace, name)
 		if !ok {
 			return []map[string]any{markerMessage(item)}
 		}
+		if !validFunctionCallArguments(args) {
+			return []map[string]any{markerMessage(item)}
+		}
 		b.renderedCallIDs[callID] = true
-		return []map[string]any{assistantToolCallMessage(callID, chatName, stringField(item, "arguments"), b.extraContentForItem(item, callID))}
+		return []map[string]any{assistantToolCallMessage(callID, chatName, args, b.extraContentForItem(item, callID))}
 	case "custom_tool_call":
 		name := stringField(item, "name")
 		args, _ := json.Marshal(map[string]string{"input": stringField(item, "input")})
@@ -1522,8 +1526,7 @@ func (g *chatGeneration) applyToolCallDeltas(delta map[string]any, sse *response
 			if !ok {
 				continue
 			}
-			index := intField(call, "index", position)
-			acc := g.tool(index)
+			acc := g.toolForDelta(call, position)
 			if s := stringField(call, "id"); s != "" {
 				acc.ID = s
 			}
@@ -1625,6 +1628,65 @@ func (g *chatGeneration) tool(index int) *chatToolCall {
 	call := &chatToolCall{Index: index, Type: "function", outputIndex: -1}
 	g.tools[index] = call
 	return call
+}
+
+func (g *chatGeneration) toolForDelta(call map[string]any, position int) *chatToolCall {
+	if index, ok := intFieldOK(call, "index"); ok {
+		return g.tool(index)
+	}
+
+	id := stringField(call, "id")
+	if id != "" {
+		if existing := g.toolByID(id); existing != nil {
+			return existing
+		}
+	}
+
+	fallback := position
+	if existing := g.tools[fallback]; existing != nil && existing.started() {
+		name, _ := toolDeltaNameAndType(call)
+		switch {
+		case id != "" && existing.ID != "" && existing.ID != id:
+			return g.tool(g.nextToolIndex())
+		case name != "" && existing.Name != "" && existing.Name != name:
+			return g.tool(g.nextToolIndex())
+		}
+	}
+	return g.tool(fallback)
+}
+
+func (g *chatGeneration) toolByID(id string) *chatToolCall {
+	for _, call := range g.tools {
+		if call != nil && call.ID == id {
+			return call
+		}
+	}
+	return nil
+}
+
+func (g *chatGeneration) nextToolIndex() int {
+	next := 0
+	for index := range g.tools {
+		if index >= next {
+			next = index + 1
+		}
+	}
+	return next
+}
+
+func (c *chatToolCall) started() bool {
+	return c != nil && (c.ID != "" || c.Name != "" || c.Arguments.Len() > 0 || c.announced)
+}
+
+func toolDeltaNameAndType(call map[string]any) (string, string) {
+	callType := stringField(call, "type")
+	if fn, ok := call["function"].(map[string]any); ok {
+		return stringField(fn, "name"), callType
+	}
+	if custom, ok := call["custom"].(map[string]any); ok {
+		return stringField(custom, "name"), "custom"
+	}
+	return "", callType
 }
 
 func (g *chatGeneration) ensureMessageActive(sse *responseSSEWriter, respID string) {
@@ -2303,6 +2365,17 @@ func argsOrEmptyObject(args string) string {
 	return args
 }
 
+func validFunctionCallArguments(args string) bool {
+	if strings.TrimSpace(args) == "" {
+		return true
+	}
+	var value map[string]any
+	if err := json.Unmarshal([]byte(args), &value); err != nil {
+		return false
+	}
+	return value != nil
+}
+
 func stringField(m map[string]any, key string) string {
 	if m == nil {
 		return ""
@@ -2353,16 +2426,23 @@ func textFromAny(value any) string {
 }
 
 func intField(m map[string]any, key string, fallback int) int {
+	if value, ok := intFieldOK(m, key); ok {
+		return value
+	}
+	return fallback
+}
+
+func intFieldOK(m map[string]any, key string) (int, bool) {
 	if m == nil {
-		return fallback
+		return 0, false
 	}
 	switch v := m[key].(type) {
 	case float64:
-		return int(v)
+		return int(v), true
 	case int:
-		return v
+		return v, true
 	default:
-		return fallback
+		return 0, false
 	}
 }
 
