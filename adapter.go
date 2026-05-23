@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 type AdapterConfig struct {
@@ -22,6 +24,7 @@ type AdapterConfig struct {
 	ReasoningEffort string
 	Debug           *DebugRecorder
 	HTTPClient      *http.Client
+	Logger          *zap.Logger
 }
 
 type Adapter struct {
@@ -30,6 +33,7 @@ type Adapter struct {
 	reasoningEffort string
 	debug           *DebugRecorder
 	client          *http.Client
+	logger          *zap.Logger
 }
 
 func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
@@ -50,12 +54,17 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &Adapter{
 		chatURL:         chatURL,
 		model:           cfg.Model,
 		reasoningEffort: cfg.ReasoningEffort,
 		debug:           cfg.Debug,
 		client:          client,
+		logger:          logger,
 	}, nil
 }
 
@@ -108,8 +117,9 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readRequestBody(r)
+	body, err := a.readRequestBody(r)
 	if err != nil {
+		a.logger.Warn("failed to read responses request", zap.String("path", r.URL.Path), zap.Error(err))
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -130,12 +140,14 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	var responsesReq map[string]any
 	if err := json.Unmarshal(body, &responsesReq); err != nil {
+		a.logger.Warn("invalid responses request json", zap.String("response_id", respID), zap.Error(err))
 		_ = sse.Event("response.failed", failedResponse(respID, "invalid_request_error", "invalid_json", err.Error()))
 		return
 	}
 
 	chatReq, ctx, err := a.buildChatRequest(responsesReq, true)
 	if err != nil {
+		a.logger.Warn("failed to translate responses request", zap.String("response_id", respID), zap.Error(err))
 		_ = sse.Event("response.failed", failedResponse(respID, "invalid_request_error", "translation_error", err.Error()))
 		return
 	}
@@ -143,20 +155,36 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	upstream, err := a.postChat(r, chatReq)
 	if err != nil {
+		a.logger.Error("failed to send upstream chat request",
+			zap.String("response_id", respID),
+			zap.String("upstream_url", a.chatURL),
+			zap.Error(err),
+		)
 		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "upstream_request_error", err.Error()))
 		return
 	}
-	defer upstream.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			a.logger.Warn("failed to close response body", zap.String("response_id", respID), zap.Error(err))
+		}
+	}(upstream.Body)
 
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(upstream.Body, 4<<20))
 		a.debug.SaveRawJSON("upstream chat error", raw)
+		a.logger.Warn("upstream chat request failed",
+			zap.String("response_id", respID),
+			zap.String("upstream_url", a.chatURL),
+			zap.Int("status", upstream.StatusCode),
+		)
 		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "upstream_http_error", upstreamErrorMessage(upstream.StatusCode, raw)))
 		return
 	}
 
 	if isEventStream(upstream.Header.Get("Content-Type")) {
 		if err := a.translateChatStream(upstream.Body, ctx, sse, respID); err != nil {
+			a.logger.Error("failed to translate upstream chat stream", zap.String("response_id", respID), zap.Error(err))
 			_ = sse.Event("response.failed", failedResponse(respID, "server_error", "stream_translation_error", err.Error()))
 		}
 		return
@@ -164,12 +192,14 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	raw, err := io.ReadAll(upstream.Body)
 	if err != nil {
+		a.logger.Error("failed to read upstream chat response", zap.String("response_id", respID), zap.Error(err))
 		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "upstream_read_error", err.Error()))
 		return
 	}
 	a.debug.SaveRawJSON("upstream chat response", raw)
 	gen, err := generationFromChatResponse(raw, ctx)
 	if err != nil {
+		a.logger.Error("failed to translate upstream chat response", zap.String("response_id", respID), zap.Error(err))
 		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "response_translation_error", err.Error()))
 		return
 	}
@@ -182,8 +212,9 @@ func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := readRequestBody(r)
+	body, err := a.readRequestBody(r)
 	if err != nil {
+		a.logger.Warn("failed to read compact request", zap.String("path", r.URL.Path), zap.Error(err))
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -191,11 +222,13 @@ func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
 
 	var responsesReq map[string]any
 	if err := json.Unmarshal(body, &responsesReq); err != nil {
+		a.logger.Warn("invalid compact request json", zap.Error(err))
 		writeJSONError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
 	chatReq, ctx, err := a.buildChatRequest(responsesReq, false)
 	if err != nil {
+		a.logger.Warn("failed to translate compact request", zap.Error(err))
 		writeJSONError(w, http.StatusBadRequest, "translation_error", err.Error())
 		return
 	}
@@ -203,14 +236,32 @@ func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
 
 	upstream, err := a.postChat(r, chatReq)
 	if err != nil {
+		a.logger.Error("failed to send upstream compact chat request",
+			zap.String("upstream_url", a.chatURL),
+			zap.Error(err),
+		)
 		writeJSONError(w, http.StatusBadGateway, "upstream_request_error", err.Error())
 		return
 	}
-	defer upstream.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			a.logger.Warn("failed to close response body", zap.Error(err))
+		}
+	}(upstream.Body)
 
-	raw, _ := io.ReadAll(upstream.Body)
+	raw, err := io.ReadAll(upstream.Body)
+	if err != nil {
+		a.logger.Error("failed to read upstream compact chat response", zap.Error(err))
+		writeJSONError(w, http.StatusBadGateway, "upstream_read_error", err.Error())
+		return
+	}
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		a.debug.SaveRawJSON("upstream compact chat error", raw)
+		a.logger.Warn("upstream compact chat request failed",
+			zap.String("upstream_url", a.chatURL),
+			zap.Int("status", upstream.StatusCode),
+		)
 		writeJSONError(w, http.StatusBadGateway, "upstream_http_error", upstreamErrorMessage(upstream.StatusCode, raw))
 		return
 	}
@@ -218,6 +269,7 @@ func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
 
 	gen, err := generationFromChatResponse(raw, ctx)
 	if err != nil {
+		a.logger.Error("failed to translate upstream compact chat response", zap.Error(err))
 		writeJSONError(w, http.StatusBadGateway, "response_translation_error", err.Error())
 		return
 	}
@@ -293,11 +345,16 @@ func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]
 	return chatReq, builder.context(), nil
 }
 
-func readRequestBody(r *http.Request) ([]byte, error) {
+func (a *Adapter) readRequestBody(r *http.Request) ([]byte, error) {
 	if enc := r.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 		return nil, fmt.Errorf("unsupported content-encoding %q", enc)
 	}
-	defer r.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			a.logger.Warn("failed to close response body", zap.Error(err))
+		}
+	}(r.Body)
 	return io.ReadAll(io.LimitReader(r.Body, 128<<20))
 }
 
