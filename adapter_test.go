@@ -105,7 +105,47 @@ func TestStreamingFunctionCallToResponsesFunctionCall(t *testing.T) {
 	if item["arguments"] != "{\"command\":\"pwd\"}" {
 		t.Fatalf("arguments = %v", item["arguments"])
 	}
+	addedIndex := firstEventIndex(t, events, "response.output_item.added", "function_call")
+	deltaIndex := firstEventIndex(t, events, "response.function_call_arguments.delta", "")
+	doneIndex := firstEventIndex(t, events, "response.output_item.done", "function_call")
+	if !(addedIndex < deltaIndex && deltaIndex < doneIndex) {
+		t.Fatalf("bad function call event order: added=%d delta=%d done=%d", addedIndex, deltaIndex, doneIndex)
+	}
+	if events[deltaIndex]["delta"] != "{\"command\":\"pwd\"}" {
+		t.Fatalf("function delta = %v", events[deltaIndex]["delta"])
+	}
 	assertCompleted(t, events)
+}
+
+func TestStreamingTextAndReasoningAddBeforeDeltaAndDone(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	events := callResponses(t, adapter, responsesRequestWithTools(nil))
+
+	reasoningAdded := firstEventIndex(t, events, "response.output_item.added", "reasoning")
+	reasoningDelta := firstEventIndex(t, events, "response.reasoning_text.delta", "")
+	reasoningDone := firstEventIndex(t, events, "response.output_item.done", "reasoning")
+	if !(reasoningAdded < reasoningDelta && reasoningDelta < reasoningDone) {
+		t.Fatalf("bad reasoning event order: added=%d delta=%d done=%d", reasoningAdded, reasoningDelta, reasoningDone)
+	}
+
+	messageAdded := firstEventIndex(t, events, "response.output_item.added", "message")
+	textDelta := firstEventIndex(t, events, "response.output_text.delta", "")
+	messageDone := firstEventIndex(t, events, "response.output_item.done", "message")
+	if !(messageAdded < textDelta && textDelta < messageDone) {
+		t.Fatalf("bad message event order: added=%d delta=%d done=%d", messageAdded, textDelta, messageDone)
+	}
+	if events[reasoningDelta]["delta"] != "thinking" || events[textDelta]["delta"] != "answer" {
+		t.Fatalf("bad deltas: %#v %#v", events[reasoningDelta], events[textDelta])
+	}
 }
 
 func TestNamespaceToolCallRoundTripsNamespace(t *testing.T) {
@@ -218,6 +258,144 @@ func TestCustomApplyPatchToolCallRoundTripsAsCustomToolCall(t *testing.T) {
 	if item["name"] != "apply_patch" || item["input"] != patch {
 		t.Fatalf("bad custom item: %#v", item)
 	}
+}
+
+func TestStreamingApplyPatchCustomToolEmitsInputDeltas(t *testing.T) {
+	patch1 := "*** Begin Patch\n*** Add File: live.txt\n+live"
+	patch2 := " line\n*** End Patch\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"delta": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": 0,
+								"id":    "patch-call",
+								"type":  "function",
+								"function": map[string]any{
+									"name":      "apply_patch",
+									"arguments": `{"input":"` + strings.ReplaceAll(patch1, "\n", `\n`),
+								},
+							},
+						},
+					},
+				},
+			},
+		}) + "\n\n"))
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"delta": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": 0,
+								"function": map[string]any{
+									"arguments": strings.ReplaceAll(patch2, "\n", `\n`) + `"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}) + "\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":        "custom",
+			"name":        "apply_patch",
+			"description": "Apply a patch.",
+		},
+	})
+
+	events := callResponses(t, adapter, body)
+	addedIndex := firstEventIndex(t, events, "response.output_item.added", "custom_tool_call")
+	firstDelta := firstEventIndex(t, events, "response.custom_tool_call_input.delta", "")
+	doneIndex := firstEventIndex(t, events, "response.output_item.done", "custom_tool_call")
+	if !(addedIndex < firstDelta && firstDelta < doneIndex) {
+		t.Fatalf("bad custom tool event order: added=%d delta=%d done=%d", addedIndex, firstDelta, doneIndex)
+	}
+
+	var streamed strings.Builder
+	for _, event := range events {
+		if event["type"] == "response.custom_tool_call_input.delta" {
+			streamed.WriteString(event["delta"].(string))
+		}
+	}
+	item := firstDoneItem(t, events, "custom_tool_call")
+	if streamed.String() != patch1+patch2 || item["input"] != patch1+patch2 {
+		t.Fatalf("bad streamed patch: streamed=%q item=%#v", streamed.String(), item)
+	}
+}
+
+func TestStreamingInterleavedToolCallsDoneAfterAllArgumentDeltas(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-a\",\"type\":\"function\",\"function\":{\"name\":\"first_tool\",\"arguments\":\"{\\\"a\\\":\"}},{\"index\":1,\"id\":\"call-b\",\"type\":\"function\",\"function\":{\"name\":\"second_tool\",\"arguments\":\"{\\\"b\\\":\"}}]}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}},{\"index\":1,\"function\":{\"arguments\":\"2}\"}}]}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{"type": "function", "name": "first_tool", "parameters": objectSchema()},
+		map[string]any{"type": "function", "name": "second_tool", "parameters": objectSchema()},
+	})
+
+	events := callResponses(t, adapter, body)
+	var done []map[string]any
+	for _, event := range events {
+		if event["type"] == "response.output_item.done" {
+			item := event["item"].(map[string]any)
+			if item["type"] == "function_call" {
+				done = append(done, item)
+			}
+		}
+	}
+	if len(done) != 2 {
+		t.Fatalf("done function calls = %#v", done)
+	}
+	if done[0]["arguments"] != "{\"a\":1}" || done[1]["arguments"] != "{\"b\":2}" {
+		t.Fatalf("bad interleaved arguments: %#v", done)
+	}
+}
+
+func TestStreamingLengthFinishReasonEmitsIncomplete(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	events := callResponses(t, adapter, responsesRequestWithTools(nil))
+	for _, event := range events {
+		if event["type"] == "response.completed" {
+			t.Fatalf("unexpected completed event for length finish: %#v", events)
+		}
+	}
+	for _, event := range events {
+		if event["type"] != "response.incomplete" {
+			continue
+		}
+		response := event["response"].(map[string]any)
+		details := response["incomplete_details"].(map[string]any)
+		if details["reason"] != "max_output_tokens" {
+			t.Fatalf("incomplete reason = %v", details["reason"])
+		}
+		return
+	}
+	t.Fatalf("missing response.incomplete in %#v", events)
 }
 
 func TestToolSearchCallRoundTripsAsClientToolSearch(t *testing.T) {
@@ -473,6 +651,24 @@ func firstDoneItem(t *testing.T, events []map[string]any, typ string) map[string
 	}
 	t.Fatalf("missing done item type %s in %#v", typ, events)
 	return nil
+}
+
+func firstEventIndex(t *testing.T, events []map[string]any, eventType, itemType string) int {
+	t.Helper()
+	for i, event := range events {
+		if event["type"] != eventType {
+			continue
+		}
+		if itemType == "" {
+			return i
+		}
+		item, _ := event["item"].(map[string]any)
+		if item["type"] == itemType {
+			return i
+		}
+	}
+	t.Fatalf("missing event type=%s item_type=%s in %#v", eventType, itemType, events)
+	return -1
 }
 
 func assertCompleted(t *testing.T, events []map[string]any) {

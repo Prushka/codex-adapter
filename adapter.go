@@ -273,7 +273,7 @@ func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadGateway, "response_translation_error", err.Error())
 		return
 	}
-	out := map[string]any{"output": gen.responseItems()}
+	out := map[string]any{"output": gen.outputItems()}
 	a.debug.SaveJSON("outbound compact response", out)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
@@ -973,7 +973,7 @@ func (a *Adapter) translateChatStream(body io.Reader, ctx *translationContext, s
 		if errValue, ok := chunk["error"]; ok && errValue != nil {
 			return fmt.Errorf("upstream stream error: %s", compactJSONString(errValue))
 		}
-		return gen.applyStreamChunk(chunk, sse)
+		return gen.applyStreamChunk(chunk, sse, respID)
 	}
 
 	for scanner.Scan() {
@@ -1001,27 +1001,104 @@ func (a *Adapter) translateChatStream(body io.Reader, ctx *translationContext, s
 	return nil
 }
 
+type responseItemState struct {
+	item any
+	done bool
+}
+
+type streamedAssistantItem struct {
+	id          string
+	outputIndex int
+	announced   bool
+	done        bool
+	text        strings.Builder
+}
+
+func (i *streamedAssistantItem) responseItem() map[string]any {
+	id := i.id
+	if id == "" {
+		id = newID("msg")
+	}
+	return map[string]any{
+		"id":   id,
+		"type": "message",
+		"role": "assistant",
+		"content": []any{
+			map[string]any{"type": "output_text", "text": i.text.String()},
+		},
+	}
+}
+
+type streamedReasoningItem struct {
+	id          string
+	outputIndex int
+	announced   bool
+	done        bool
+	text        strings.Builder
+}
+
+func (i *streamedReasoningItem) responseItem() map[string]any {
+	id := i.id
+	if id == "" {
+		id = newID("rs")
+	}
+	return map[string]any{
+		"id":                id,
+		"type":              "reasoning",
+		"summary":           []any{},
+		"encrypted_content": nil,
+		"content": []any{
+			map[string]any{"type": "reasoning_text", "text": i.text.String()},
+		},
+	}
+}
+
 type chatGeneration struct {
-	ctx       *translationContext
-	text      strings.Builder
-	reasoning strings.Builder
-	tools     map[int]*chatToolCall
-	usage     map[string]any
+	ctx             *translationContext
+	message         *streamedAssistantItem
+	reasoning       *streamedReasoningItem
+	tools           map[int]*chatToolCall
+	usage           map[string]any
+	finishReason    string
+	activeKind      string
+	activeToolIndex int
+	nextOutputIndex int
 }
 
 type chatToolCall struct {
-	Index     int
-	ID        string
-	Type      string
-	Name      string
-	Arguments strings.Builder
+	Index              int
+	ItemID             string
+	ID                 string
+	Type               string
+	Name               string
+	Arguments          strings.Builder
+	Mapping            toolMapping
+	announced          bool
+	done               bool
+	outputIndex        int
+	customInputEmitted string
+	rawCustomInput     bool
 }
 
 func newChatGeneration(ctx *translationContext) *chatGeneration {
-	return &chatGeneration{ctx: ctx, tools: map[int]*chatToolCall{}}
+	return &chatGeneration{ctx: ctx, tools: map[int]*chatToolCall{}, activeToolIndex: -1}
 }
 
-func (g *chatGeneration) applyStreamChunk(chunk map[string]any, sse *responseSSEWriter) error {
+func (g *chatGeneration) messageState() *streamedAssistantItem {
+	if g.message == nil {
+		g.message = &streamedAssistantItem{id: newID("msg"), outputIndex: -1}
+	}
+	return g.message
+}
+
+func (g *chatGeneration) reasoningState() *streamedReasoningItem {
+	if g.reasoning == nil {
+		g.reasoning = &streamedReasoningItem{id: newID("rs"), outputIndex: -1}
+	}
+	return g.reasoning
+}
+
+func (g *chatGeneration) applyStreamChunk(chunk map[string]any, sse *responseSSEWriter, respID string) error {
 	if usage, ok := chunk["usage"].(map[string]any); ok {
 		g.usage = usage
 	}
@@ -1031,24 +1108,37 @@ func (g *chatGeneration) applyStreamChunk(chunk map[string]any, sse *responseSSE
 		if !ok {
 			continue
 		}
+		if finishReason := stringField(choice, "finish_reason"); finishReason != "" {
+			g.finishReason = finishReason
+		}
 		delta, _ := choice["delta"].(map[string]any)
 		if s := textFromAny(delta["content"]); s != "" {
-			g.text.WriteString(s)
-			_ = sse.Event("response.output_text.delta", map[string]any{"delta": s})
+			g.ensureMessageActive(sse, respID)
+			g.message.text.WriteString(s)
+			_ = sse.Event("response.output_text.delta", map[string]any{
+				"response_id":  respID,
+				"item_id":      g.message.id,
+				"output_index": g.message.outputIndex,
+				"delta":        s,
+			})
 		}
 		if s := firstTextField(delta, "reasoning_content", "reasoning", "reasoning_delta"); s != "" {
-			g.reasoning.WriteString(s)
+			g.ensureReasoningActive(sse, respID)
+			g.reasoning.text.WriteString(s)
 			_ = sse.Event("response.reasoning_text.delta", map[string]any{
+				"response_id":   respID,
+				"item_id":       g.reasoning.id,
+				"output_index":  g.reasoning.outputIndex,
 				"delta":         s,
 				"content_index": 0,
 			})
 		}
-		g.applyToolCallDeltas(delta)
+		g.applyToolCallDeltas(delta, sse, respID)
 	}
 	return nil
 }
 
-func (g *chatGeneration) applyToolCallDeltas(delta map[string]any) {
+func (g *chatGeneration) applyToolCallDeltas(delta map[string]any, sse *responseSSEWriter, respID string) {
 	if calls, ok := delta["tool_calls"].([]any); ok {
 		for position, raw := range calls {
 			call, ok := raw.(map[string]any)
@@ -1063,23 +1153,27 @@ func (g *chatGeneration) applyToolCallDeltas(delta map[string]any) {
 			if s := stringField(call, "type"); s != "" {
 				acc.Type = s
 			}
+			fragment := ""
 			if fn, ok := call["function"].(map[string]any); ok {
 				if s := stringField(fn, "name"); s != "" {
 					acc.Name = s
 				}
-				if s := stringField(fn, "arguments"); s != "" {
-					acc.Arguments.WriteString(s)
-				}
+				fragment = stringField(fn, "arguments")
 			}
 			if custom, ok := call["custom"].(map[string]any); ok {
 				acc.Type = "custom"
+				acc.rawCustomInput = true
 				if s := stringField(custom, "name"); s != "" {
 					acc.Name = s
 				}
 				if s := firstTextField(custom, "input", "arguments"); s != "" {
-					acc.Arguments.WriteString(s)
+					fragment = s
 				}
 			}
+			if fragment != "" {
+				acc.Arguments.WriteString(fragment)
+			}
+			g.emitToolCallDelta(acc, fragment, sse, respID)
 		}
 	}
 	if fn, ok := delta["function_call"].(map[string]any); ok {
@@ -1088,8 +1182,58 @@ func (g *chatGeneration) applyToolCallDeltas(delta map[string]any) {
 		if s := stringField(fn, "name"); s != "" {
 			acc.Name = s
 		}
-		if s := stringField(fn, "arguments"); s != "" {
-			acc.Arguments.WriteString(s)
+		fragment := stringField(fn, "arguments")
+		if fragment != "" {
+			acc.Arguments.WriteString(fragment)
+		}
+		g.emitToolCallDelta(acc, fragment, sse, respID)
+	}
+}
+
+func (g *chatGeneration) emitToolCallDelta(call *chatToolCall, fragment string, sse *responseSSEWriter, respID string) {
+	if call == nil {
+		return
+	}
+	if call.Mapping.Kind == "" && call.Name != "" {
+		call.Mapping = g.mappingForTool(call.Name, call.Type)
+	}
+	if call.Mapping.Kind == "" {
+		return
+	}
+
+	switch call.Mapping.Kind {
+	case "custom":
+		g.ensureToolActive(call.Index, sse, respID)
+		if !call.announced {
+			g.announceCustomTool(call, sse, respID)
+		}
+		decoded := call.Arguments.String()
+		if !call.rawCustomInput {
+			decoded = decodeCustomInputPrefix(decoded)
+		}
+		if delta := strings.TrimPrefix(decoded, call.customInputEmitted); delta != "" {
+			call.customInputEmitted = decoded
+			_ = sse.Event("response.custom_tool_call_input.delta", map[string]any{
+				"response_id":  respID,
+				"item_id":      call.ItemID,
+				"call_id":      call.ID,
+				"output_index": call.outputIndex,
+				"delta":        delta,
+			})
+		}
+	case "function":
+		g.ensureToolActive(call.Index, sse, respID)
+		if !call.announced {
+			g.announceFunctionTool(call, sse, respID)
+		}
+		if fragment != "" {
+			_ = sse.Event("response.function_call_arguments.delta", map[string]any{
+				"response_id":  respID,
+				"item_id":      call.ItemID,
+				"call_id":      call.ID,
+				"output_index": call.outputIndex,
+				"delta":        fragment,
+			})
 		}
 	}
 }
@@ -1098,9 +1242,217 @@ func (g *chatGeneration) tool(index int) *chatToolCall {
 	if existing := g.tools[index]; existing != nil {
 		return existing
 	}
-	call := &chatToolCall{Index: index, Type: "function"}
+	call := &chatToolCall{Index: index, Type: "function", outputIndex: -1}
 	g.tools[index] = call
 	return call
+}
+
+func (g *chatGeneration) ensureMessageActive(sse *responseSSEWriter, respID string) {
+	msg := g.messageState()
+	if msg.done {
+		g.message = &streamedAssistantItem{id: newID("msg"), outputIndex: -1}
+		msg = g.message
+	}
+	if msg.announced {
+		if g.activeKind != "message" {
+			g.finishActiveItem(sse, respID)
+			g.activeKind = "message"
+			g.activeToolIndex = -1
+		}
+		return
+	}
+	g.finishActiveItem(sse, respID)
+	if msg.outputIndex < 0 {
+		msg.outputIndex = g.allocateOutputIndex()
+	}
+	_ = sse.Event("response.output_item.added", map[string]any{
+		"response_id":  respID,
+		"output_index": msg.outputIndex,
+		"item": map[string]any{
+			"id":      msg.id,
+			"type":    "message",
+			"role":    "assistant",
+			"content": []any{},
+		},
+	})
+	msg.announced = true
+	g.activeKind = "message"
+	g.activeToolIndex = -1
+}
+
+func (g *chatGeneration) ensureReasoningActive(sse *responseSSEWriter, respID string) {
+	section := g.reasoningState()
+	if section.done {
+		g.reasoning = &streamedReasoningItem{id: newID("rs"), outputIndex: -1}
+		section = g.reasoning
+	}
+	if section.announced {
+		if g.activeKind != "reasoning" {
+			g.finishActiveItem(sse, respID)
+			g.activeKind = "reasoning"
+			g.activeToolIndex = -1
+		}
+		return
+	}
+	g.finishActiveItem(sse, respID)
+	if section.outputIndex < 0 {
+		section.outputIndex = g.allocateOutputIndex()
+	}
+	_ = sse.Event("response.output_item.added", map[string]any{
+		"response_id":  respID,
+		"output_index": section.outputIndex,
+		"item": map[string]any{
+			"id":      section.id,
+			"type":    "reasoning",
+			"summary": []any{},
+		},
+	})
+	section.announced = true
+	g.activeKind = "reasoning"
+	g.activeToolIndex = -1
+}
+
+func (g *chatGeneration) ensureToolActive(index int, sse *responseSSEWriter, respID string) {
+	call := g.tool(index)
+	if call.announced {
+		if g.activeKind != "tool" {
+			g.finishActiveItem(sse, respID)
+		}
+		g.activeKind = "tool"
+		g.activeToolIndex = index
+		return
+	}
+	if g.activeKind != "tool" {
+		g.finishActiveItem(sse, respID)
+	}
+	g.activeKind = "tool"
+	g.activeToolIndex = index
+}
+
+func (g *chatGeneration) announceFunctionTool(call *chatToolCall, sse *responseSSEWriter, respID string) {
+	if call == nil || call.announced {
+		return
+	}
+	mapping := g.mappingForTool(call.Name, call.Type)
+	call.Mapping = mapping
+	displayName := mapping.Name
+	if displayName == "" {
+		displayName = call.Name
+	}
+	if displayName == "" {
+		displayName = "unknown_tool"
+	}
+	if call.ID == "" {
+		call.ID = newID("call")
+	}
+	if call.ItemID == "" {
+		call.ItemID = newID("fc")
+	}
+	if call.outputIndex < 0 {
+		call.outputIndex = g.allocateOutputIndex()
+	}
+	item := map[string]any{
+		"id":        call.ItemID,
+		"type":      "function_call",
+		"call_id":   call.ID,
+		"name":      displayName,
+		"arguments": "",
+		"status":    "in_progress",
+	}
+	if mapping.Namespace != "" {
+		item["namespace"] = mapping.Namespace
+	}
+	_ = sse.Event("response.output_item.added", map[string]any{
+		"response_id":  respID,
+		"output_index": call.outputIndex,
+		"item":         item,
+	})
+	call.announced = true
+}
+
+func (g *chatGeneration) announceCustomTool(call *chatToolCall, sse *responseSSEWriter, respID string) {
+	if call == nil || call.announced {
+		return
+	}
+	mapping := g.mappingForTool(call.Name, call.Type)
+	call.Mapping = mapping
+	displayName := mapping.Name
+	if displayName == "" {
+		displayName = call.Name
+	}
+	if displayName == "" {
+		displayName = "unknown_tool"
+	}
+	if call.ID == "" {
+		call.ID = newID("call")
+	}
+	if call.ItemID == "" {
+		call.ItemID = newID("ctc")
+	}
+	if call.outputIndex < 0 {
+		call.outputIndex = g.allocateOutputIndex()
+	}
+	_ = sse.Event("response.output_item.added", map[string]any{
+		"response_id":  respID,
+		"output_index": call.outputIndex,
+		"item": map[string]any{
+			"id":      call.ItemID,
+			"type":    "custom_tool_call",
+			"call_id": call.ID,
+			"name":    displayName,
+			"input":   "",
+			"status":  "in_progress",
+		},
+	})
+	call.announced = true
+}
+
+func (g *chatGeneration) mappingForTool(name, callType string) toolMapping {
+	if g.ctx == nil {
+		return inferToolMapping(name, callType)
+	}
+	if mapping, ok := g.ctx.byChat[name]; ok {
+		return mapping
+	}
+	return inferToolMapping(name, callType)
+}
+
+func (g *chatGeneration) allocateOutputIndex() int {
+	index := g.nextOutputIndex
+	g.nextOutputIndex++
+	return index
+}
+
+func (g *chatGeneration) finishActiveItem(sse *responseSSEWriter, respID string) {
+	switch g.activeKind {
+	case "message":
+		if g.message != nil && g.message.announced && !g.message.done {
+			_ = sse.Event("response.output_item.done", map[string]any{
+				"response_id": respID,
+				"item":        g.message.responseItem(),
+			})
+			g.message.done = true
+		}
+	case "reasoning":
+		if g.reasoning != nil && g.reasoning.announced && !g.reasoning.done {
+			_ = sse.Event("response.output_item.done", map[string]any{
+				"response_id": respID,
+				"item":        g.reasoning.responseItem(),
+			})
+			g.reasoning.done = true
+		}
+	case "tool":
+		call := g.tools[g.activeToolIndex]
+		if call != nil && call.announced && !call.done {
+			_ = sse.Event("response.output_item.done", map[string]any{
+				"response_id": respID,
+				"item":        g.toolCallItem(call),
+			})
+			call.done = true
+		}
+	}
+	g.activeKind = ""
+	g.activeToolIndex = -1
 }
 
 func generationFromChatResponse(raw []byte, ctx *translationContext) (*chatGeneration, error) {
@@ -1120,12 +1472,13 @@ func generationFromChatResponse(raw []byte, ctx *translationContext) (*chatGener
 		return gen, nil
 	}
 	choice, _ := choices[0].(map[string]any)
+	gen.finishReason = stringField(choice, "finish_reason")
 	message, _ := choice["message"].(map[string]any)
 	if s := textFromAny(message["content"]); s != "" {
-		gen.text.WriteString(s)
+		gen.messageState().text.WriteString(s)
 	}
 	if s := firstTextField(message, "reasoning_content", "reasoning"); s != "" {
-		gen.reasoning.WriteString(s)
+		gen.reasoningState().text.WriteString(s)
 	}
 	if calls, ok := message["tool_calls"].([]any); ok {
 		for position, raw := range calls {
@@ -1161,8 +1514,31 @@ func generationFromChatResponse(raw []byte, ctx *translationContext) (*chatGener
 }
 
 func emitGenerationAsResponses(gen *chatGeneration, sse *responseSSEWriter, respID string) {
-	for _, item := range gen.responseItems() {
-		_ = sse.Event("response.output_item.done", map[string]any{"item": item})
+	if gen.activeKind == "tool" {
+		gen.activeKind = ""
+		gen.activeToolIndex = -1
+	} else {
+		gen.finishActiveItem(sse, respID)
+	}
+	for _, entry := range gen.responseItems() {
+		if entry.done {
+			continue
+		}
+		_ = sse.Event("response.output_item.done", map[string]any{"item": entry.item})
+	}
+	if reason, ok := incompleteReasonFromFinishReason(gen.finishReason); ok {
+		_ = sse.Event("response.incomplete", map[string]any{
+			"response": map[string]any{
+				"id":     respID,
+				"object": "response",
+				"status": "incomplete",
+				"incomplete_details": map[string]any{
+					"reason": reason,
+				},
+				"usage": responsesUsage(gen.usage),
+			},
+		})
+		return
 	}
 	_ = sse.Event("response.completed", map[string]any{
 		"response": map[string]any{
@@ -1175,25 +1551,18 @@ func emitGenerationAsResponses(gen *chatGeneration, sse *responseSSEWriter, resp
 	})
 }
 
-func (g *chatGeneration) responseItems() []any {
-	var items []any
-	if reasoning := g.reasoning.String(); reasoning != "" {
-		items = append(items, map[string]any{
-			"id":                newID("rs"),
-			"type":              "reasoning",
-			"summary":           []any{},
-			"content":           []any{map[string]any{"type": "reasoning_text", "text": reasoning}},
-			"encrypted_content": nil,
+func (g *chatGeneration) responseItems() []responseItemState {
+	var items []responseItemState
+	if reasoning := g.reasoning; reasoning != nil && reasoning.text.Len() > 0 {
+		items = append(items, responseItemState{
+			item: reasoning.responseItem(),
+			done: reasoning.done,
 		})
 	}
-	if text := g.text.String(); text != "" {
-		items = append(items, map[string]any{
-			"id":   newID("msg"),
-			"type": "message",
-			"role": "assistant",
-			"content": []any{
-				map[string]any{"type": "output_text", "text": text},
-			},
+	if text := g.message; text != nil && text.text.Len() > 0 {
+		items = append(items, responseItemState{
+			item: text.responseItem(),
+			done: text.done,
 		})
 	}
 	indexes := make([]int, 0, len(g.tools))
@@ -1202,9 +1571,22 @@ func (g *chatGeneration) responseItems() []any {
 	}
 	sort.Ints(indexes)
 	for _, index := range indexes {
-		if item := g.toolCallItem(g.tools[index]); item != nil {
-			items = append(items, item)
+		call := g.tools[index]
+		if item := g.toolCallItem(call); item != nil {
+			items = append(items, responseItemState{
+				item: item,
+				done: call.done,
+			})
 		}
+	}
+	return items
+}
+
+func (g *chatGeneration) outputItems() []any {
+	states := g.responseItems()
+	items := make([]any, 0, len(states))
+	for _, state := range states {
+		items = append(items, state.item)
 	}
 	return items
 }
@@ -1221,19 +1603,27 @@ func (g *chatGeneration) toolCallItem(call *chatToolCall) map[string]any {
 	if callID == "" {
 		callID = newID("call")
 	}
+	itemID := call.ItemID
 	args := call.Arguments.String()
-	mapping, ok := g.ctx.byChat[name]
-	if !ok {
-		mapping = inferToolMapping(name, call.Type)
+	mapping := call.Mapping
+	if mapping.Kind == "" {
+		mapping = g.mappingForTool(name, call.Type)
 	}
 
 	switch mapping.Kind {
 	case "custom":
+		if itemID == "" {
+			itemID = newID("ctc")
+		}
+		displayName := mapping.Name
+		if displayName == "" {
+			displayName = name
+		}
 		return map[string]any{
-			"id":      newID("ctc"),
+			"id":      itemID,
 			"type":    "custom_tool_call",
 			"call_id": callID,
-			"name":    mapping.Name,
+			"name":    displayName,
 			"input":   customInputFromArguments(args),
 		}
 	case "tool_search":
@@ -1266,11 +1656,18 @@ func (g *chatGeneration) toolCallItem(call *chatToolCall) map[string]any {
 			"result":         result,
 		}
 	default:
+		if itemID == "" {
+			itemID = newID("fc")
+		}
+		displayName := mapping.Name
+		if displayName == "" {
+			displayName = name
+		}
 		item := map[string]any{
-			"id":        newID("fc"),
+			"id":        itemID,
 			"type":      "function_call",
 			"call_id":   callID,
-			"name":      mapping.Name,
+			"name":      displayName,
 			"arguments": argsOrEmptyObject(args),
 		}
 		if mapping.Namespace != "" {
@@ -1297,6 +1694,17 @@ func inferToolMapping(name, callType string) toolMapping {
 	return toolMapping{Kind: kind, ChatName: name, Name: name}
 }
 
+func incompleteReasonFromFinishReason(reason string) (string, bool) {
+	switch reason {
+	case "length":
+		return "max_output_tokens", true
+	case "content_filter":
+		return "content_filter", true
+	default:
+		return "", false
+	}
+}
+
 func responsesUsage(usage map[string]any) map[string]any {
 	input := int64FromAny(usage["prompt_tokens"])
 	output := int64FromAny(usage["completion_tokens"])
@@ -1319,6 +1727,67 @@ func responsesUsage(usage map[string]any) map[string]any {
 		"output_tokens_details": outputDetails,
 		"total_tokens":          total,
 	}
+}
+
+func decodeCustomInputPrefix(arguments string) string {
+	keyStart := strings.Index(arguments, `"input"`)
+	if keyStart < 0 {
+		return ""
+	}
+	rest := arguments[keyStart+len(`"input"`):]
+	colon := strings.IndexByte(rest, ':')
+	if colon < 0 {
+		return ""
+	}
+	rest = strings.TrimLeft(rest[colon+1:], " \t\r\n")
+	if !strings.HasPrefix(rest, `"`) {
+		return ""
+	}
+	rest = rest[1:]
+	var out strings.Builder
+	escaped := false
+	for i := 0; i < len(rest); i++ {
+		ch := rest[i]
+		if escaped {
+			switch ch {
+			case '"', '\\', '/':
+				out.WriteByte(ch)
+			case 'b':
+				out.WriteByte('\b')
+			case 'f':
+				out.WriteByte('\f')
+			case 'n':
+				out.WriteByte('\n')
+			case 'r':
+				out.WriteByte('\r')
+			case 't':
+				out.WriteByte('\t')
+			case 'u':
+				if i+4 >= len(rest) {
+					return out.String()
+				}
+				codePoint, err := strconv.ParseInt(rest[i+1:i+5], 16, 32)
+				if err != nil {
+					return out.String()
+				}
+				out.WriteRune(rune(codePoint))
+				i += 4
+			default:
+				out.WriteByte(ch)
+			}
+			escaped = false
+			continue
+		}
+		switch ch {
+		case '\\':
+			escaped = true
+		case '"':
+			return out.String()
+		default:
+			out.WriteByte(ch)
+		}
+	}
+	return out.String()
 }
 
 func customInputFromArguments(arguments string) string {
