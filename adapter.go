@@ -923,6 +923,9 @@ func safeToolName(name string) string {
 	if out == "" {
 		out = "tool"
 	}
+	if reservedMCPToolName(out) {
+		out = "tool_" + out
+	}
 	if len(out) > 64 {
 		out = strings.TrimRight(out[:64], "_-")
 		if out == "" {
@@ -930,6 +933,10 @@ func safeToolName(name string) string {
 		}
 	}
 	return out
+}
+
+func reservedMCPToolName(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "mcp__")
 }
 
 func (b *requestBuilder) translateInput(req map[string]any) []map[string]any {

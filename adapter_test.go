@@ -397,7 +397,7 @@ func TestNamespaceToolCallRoundTripsNamespace(t *testing.T) {
 		}
 		tools := req["tools"].([]any)
 		fn := tools[0].(map[string]any)["function"].(map[string]any)
-		if fn["name"] != "mcp__rmcp__echo" {
+		if fn["name"] != "tool_mcp__rmcp__echo" {
 			t.Fatalf("flattened tool name = %v", fn["name"])
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -410,7 +410,7 @@ func TestNamespaceToolCallRoundTripsNamespace(t *testing.T) {
 								"id":   "call-ns",
 								"type": "function",
 								"function": map[string]any{
-									"name":      "mcp__rmcp__echo",
+									"name":      "tool_mcp__rmcp__echo",
 									"arguments": "{\"text\":\"hi\"}",
 								},
 							},
@@ -443,6 +443,56 @@ func TestNamespaceToolCallRoundTripsNamespace(t *testing.T) {
 	item := firstDoneItem(t, events, "function_call")
 	if item["namespace"] != "mcp__rmcp__" || item["name"] != "echo" {
 		t.Fatalf("bad namespace item: %#v", item)
+	}
+}
+
+func TestMCPPrefixedFunctionToolNameAvoidsProviderReservedPrefix(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		tools := req["tools"].([]any)
+		fn := tools[0].(map[string]any)["function"].(map[string]any)
+		if fn["name"] != "tool_mcp__node_repl__js" {
+			t.Fatalf("sanitized tool name = %v", fn["name"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"message": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"id":   "call-js",
+								"type": "function",
+								"function": map[string]any{
+									"name":      "tool_mcp__node_repl__js",
+									"arguments": "{\"code\":\"1+1\"}",
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":        "function",
+			"name":        "mcp__node_repl__js",
+			"description": "Run JavaScript.",
+			"parameters":  objectSchema(),
+		},
+	})
+
+	events := callResponses(t, adapter, body)
+	item := firstDoneItem(t, events, "function_call")
+	if item["name"] != "mcp__node_repl__js" {
+		t.Fatalf("bad function item: %#v", item)
 	}
 }
 
