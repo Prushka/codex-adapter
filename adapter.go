@@ -1,0 +1,1469 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type AdapterConfig struct {
+	ProviderURL     string
+	Model           string
+	ReasoningEffort string
+	Debug           *DebugRecorder
+	HTTPClient      *http.Client
+}
+
+type Adapter struct {
+	chatURL         string
+	model           string
+	reasoningEffort string
+	debug           *DebugRecorder
+	client          *http.Client
+}
+
+func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
+	if cfg.ProviderURL == "" {
+		return nil, errors.New("provider URL is required")
+	}
+	if cfg.Model == "" {
+		return nil, errors.New("model is required")
+	}
+	if cfg.ReasoningEffort == "" {
+		return nil, errors.New("reasoning effort is required")
+	}
+	chatURL, err := normalizeChatCompletionsURL(cfg.ProviderURL)
+	if err != nil {
+		return nil, err
+	}
+	client := cfg.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Minute}
+	}
+	return &Adapter{
+		chatURL:         chatURL,
+		model:           cfg.Model,
+		reasoningEffort: cfg.ReasoningEffort,
+		debug:           cfg.Debug,
+		client:          client,
+	}, nil
+}
+
+func (a *Adapter) ChatCompletionsURL() string {
+	return a.chatURL
+}
+
+func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimRight(r.URL.Path, "/")
+	if path == "" {
+		path = "/"
+	}
+	switch path {
+	case "/healthz":
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	case "/models", "/v1/models":
+		a.handleModels(w, r)
+	case "/responses", "/v1/responses":
+		a.handleResponses(w, r)
+	case "/responses/compact", "/v1/responses/compact":
+		a.handleCompact(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (a *Adapter) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"object": "list",
+		"data": []any{
+			map[string]any{
+				"id":       a.model,
+				"object":   "model",
+				"created":  time.Now().Unix(),
+				"owned_by": "codex-adapter",
+			},
+		},
+	})
+}
+
+func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := readRequestBody(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	a.debug.SaveRawJSON("inbound responses request", body)
+
+	respID := newID("resp")
+	sse := newResponseSSEWriter(w, a.debug)
+	_ = sse.Event("response.created", map[string]any{
+		"response": map[string]any{
+			"id":         respID,
+			"object":     "response",
+			"created_at": time.Now().Unix(),
+			"status":     "in_progress",
+			"model":      a.model,
+			"output":     []any{},
+		},
+	})
+
+	var responsesReq map[string]any
+	if err := json.Unmarshal(body, &responsesReq); err != nil {
+		_ = sse.Event("response.failed", failedResponse(respID, "invalid_request_error", "invalid_json", err.Error()))
+		return
+	}
+
+	chatReq, ctx, err := a.buildChatRequest(responsesReq, true)
+	if err != nil {
+		_ = sse.Event("response.failed", failedResponse(respID, "invalid_request_error", "translation_error", err.Error()))
+		return
+	}
+	a.debug.SaveJSON("upstream chat request", chatReq)
+
+	upstream, err := a.postChat(r, chatReq)
+	if err != nil {
+		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "upstream_request_error", err.Error()))
+		return
+	}
+	defer upstream.Body.Close()
+
+	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(upstream.Body, 4<<20))
+		a.debug.SaveRawJSON("upstream chat error", raw)
+		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "upstream_http_error", upstreamErrorMessage(upstream.StatusCode, raw)))
+		return
+	}
+
+	if isEventStream(upstream.Header.Get("Content-Type")) {
+		if err := a.translateChatStream(upstream.Body, ctx, sse, respID); err != nil {
+			_ = sse.Event("response.failed", failedResponse(respID, "server_error", "stream_translation_error", err.Error()))
+		}
+		return
+	}
+
+	raw, err := io.ReadAll(upstream.Body)
+	if err != nil {
+		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "upstream_read_error", err.Error()))
+		return
+	}
+	a.debug.SaveRawJSON("upstream chat response", raw)
+	gen, err := generationFromChatResponse(raw, ctx)
+	if err != nil {
+		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "response_translation_error", err.Error()))
+		return
+	}
+	emitGenerationAsResponses(gen, sse, respID)
+}
+
+func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := readRequestBody(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	a.debug.SaveRawJSON("inbound compact request", body)
+
+	var responsesReq map[string]any
+	if err := json.Unmarshal(body, &responsesReq); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	chatReq, ctx, err := a.buildChatRequest(responsesReq, false)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "translation_error", err.Error())
+		return
+	}
+	a.debug.SaveJSON("upstream compact chat request", chatReq)
+
+	upstream, err := a.postChat(r, chatReq)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "upstream_request_error", err.Error())
+		return
+	}
+	defer upstream.Body.Close()
+
+	raw, _ := io.ReadAll(upstream.Body)
+	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
+		a.debug.SaveRawJSON("upstream compact chat error", raw)
+		writeJSONError(w, http.StatusBadGateway, "upstream_http_error", upstreamErrorMessage(upstream.StatusCode, raw))
+		return
+	}
+	a.debug.SaveRawJSON("upstream compact chat response", raw)
+
+	gen, err := generationFromChatResponse(raw, ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "response_translation_error", err.Error())
+		return
+	}
+	out := map[string]any{"output": gen.responseItems()}
+	a.debug.SaveJSON("outbound compact response", out)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+func (a *Adapter) postChat(inbound *http.Request, chatReq map[string]any) (*http.Response, error) {
+	data, err := json.Marshal(chatReq)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(inbound.Context(), http.MethodPost, a.chatURL, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	copyForwardHeaders(req.Header, inbound.Header)
+	req.Header.Set("Content-Type", "application/json")
+	if chatReq["stream"] == true {
+		req.Header.Set("Accept", "text/event-stream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
+	return a.client.Do(req)
+}
+
+func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]any, *translationContext, error) {
+	builder := newRequestBuilder()
+	tools := builder.translateTools(req["tools"])
+	messages := builder.translateInput(req)
+	if len(messages) == 0 {
+		messages = append(messages, map[string]any{"role": "user", "content": ""})
+	}
+
+	chatReq := map[string]any{
+		"model":            a.model,
+		"reasoning_effort": a.reasoningEffort,
+		"messages":         messages,
+		"stream":           stream,
+	}
+	if stream {
+		chatReq["stream_options"] = map[string]any{"include_usage": true}
+	}
+	if len(tools) > 0 {
+		chatReq["tools"] = tools
+		if choice, ok := translateToolChoice(req["tool_choice"]); ok {
+			chatReq["tool_choice"] = choice
+		} else {
+			chatReq["tool_choice"] = "auto"
+		}
+	}
+	if v, ok := req["parallel_tool_calls"].(bool); ok {
+		chatReq["parallel_tool_calls"] = v
+	}
+	if v, ok := req["service_tier"].(string); ok && v != "" {
+		chatReq["service_tier"] = v
+	}
+	if v, ok := req["store"].(bool); ok {
+		chatReq["store"] = v
+	}
+	if v, ok := req["prompt_cache_key"].(string); ok && v != "" {
+		chatReq["prompt_cache_key"] = v
+	}
+	if metadata := metadataFromAny(req["client_metadata"]); len(metadata) > 0 {
+		chatReq["metadata"] = metadata
+	}
+	if responseFormat, ok := translateResponseFormat(req["text"]); ok {
+		chatReq["response_format"] = responseFormat
+	}
+
+	return chatReq, builder.context(), nil
+}
+
+func readRequestBody(r *http.Request) ([]byte, error) {
+	if enc := r.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+		return nil, fmt.Errorf("unsupported content-encoding %q", enc)
+	}
+	defer r.Body.Close()
+	return io.ReadAll(io.LimitReader(r.Body, 128<<20))
+}
+
+func writeJSONError(w http.ResponseWriter, status int, code string, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"type":    "server_error",
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+
+func failedResponse(respID, typ, code, message string) map[string]any {
+	return map[string]any{
+		"response": map[string]any{
+			"id":     respID,
+			"object": "response",
+			"status": "failed",
+			"error": map[string]any{
+				"type":    typ,
+				"code":    code,
+				"message": message,
+			},
+		},
+	}
+}
+
+func upstreamErrorMessage(status int, raw []byte) string {
+	msg := strings.TrimSpace(string(raw))
+	if msg == "" {
+		return fmt.Sprintf("upstream returned HTTP %d", status)
+	}
+	return fmt.Sprintf("upstream returned HTTP %d: %s", status, msg)
+}
+
+func normalizeChatCompletionsURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("provider URL must include scheme and host: %s", raw)
+	}
+	path := strings.TrimRight(u.Path, "/")
+	switch {
+	case strings.HasSuffix(path, "/chat/completions"):
+		u.Path = path
+	case path == "":
+		u.Path = "/v1/chat/completions"
+	case strings.HasSuffix(path, "/v1"):
+		u.Path = path + "/chat/completions"
+	default:
+		u.Path = path + "/chat/completions"
+	}
+	return u.String(), nil
+}
+
+func copyForwardHeaders(dst, src http.Header) {
+	hopByHop := map[string]bool{
+		"connection":          true,
+		"keep-alive":          true,
+		"proxy-authenticate":  true,
+		"proxy-authorization": true,
+		"te":                  true,
+		"trailer":             true,
+		"transfer-encoding":   true,
+		"upgrade":             true,
+		"host":                true,
+		"content-length":      true,
+		"content-type":        true,
+		"accept":              true,
+		"accept-encoding":     true,
+		"content-encoding":    true,
+	}
+	for k, values := range src {
+		if hopByHop[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range values {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func isEventStream(contentType string) bool {
+	if contentType == "" {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return strings.Contains(strings.ToLower(contentType), "text/event-stream")
+	}
+	return strings.EqualFold(mt, "text/event-stream")
+}
+
+type requestBuilder struct {
+	usedNames map[string]int
+	byChat    map[string]toolMapping
+	byKey     map[string]toolMapping
+}
+
+type translationContext struct {
+	byChat map[string]toolMapping
+}
+
+type toolMapping struct {
+	Kind      string
+	ChatName  string
+	Name      string
+	Namespace string
+}
+
+func newRequestBuilder() *requestBuilder {
+	return &requestBuilder{
+		usedNames: map[string]int{},
+		byChat:    map[string]toolMapping{},
+		byKey:     map[string]toolMapping{},
+	}
+}
+
+func (b *requestBuilder) context() *translationContext {
+	byChat := make(map[string]toolMapping, len(b.byChat))
+	for k, v := range b.byChat {
+		byChat[k] = v
+	}
+	return &translationContext{byChat: byChat}
+}
+
+func (b *requestBuilder) translateTools(value any) []any {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	var out []any
+	for _, item := range items {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringField(tool, "type") {
+		case "function":
+			out = append(out, b.functionTool("", tool, "function"))
+		case "namespace":
+			namespace := stringField(tool, "name")
+			children, _ := tool["tools"].([]any)
+			for _, child := range children {
+				childTool, ok := child.(map[string]any)
+				if !ok || stringField(childTool, "type") != "function" {
+					continue
+				}
+				out = append(out, b.functionTool(namespace, childTool, "function"))
+			}
+		case "custom":
+			out = append(out, b.customTool(tool))
+		case "tool_search":
+			out = append(out, b.hostedFunctionTool("tool_search", "tool_search", stringField(tool, "description"), schemaOrDefault(tool["parameters"])))
+		case "web_search":
+			out = append(out, b.hostedFunctionTool("web_search", "web_search", "Request a web search action. The chat-completions proxy will translate this into a Responses web_search_call item for Codex.", webSearchSchema()))
+		case "image_generation":
+			out = append(out, b.hostedFunctionTool("image_generation", "image_generation", "Request image generation. If the provider cannot return base64 image data in result, Codex will receive a failed image_generation_call item.", imageGenerationSchema()))
+		default:
+			if stringField(tool, "name") != "" {
+				out = append(out, b.functionTool("", tool, "function"))
+			}
+		}
+	}
+	return out
+}
+
+func (b *requestBuilder) functionTool(namespace string, tool map[string]any, kind string) map[string]any {
+	name := stringField(tool, "name")
+	chatName := b.register(kind, namespace, name)
+	fn := map[string]any{
+		"name":        chatName,
+		"description": stringField(tool, "description"),
+		"parameters":  schemaOrDefault(tool["parameters"]),
+	}
+	if strict, ok := tool["strict"].(bool); ok {
+		fn["strict"] = strict
+	}
+	return map[string]any{"type": "function", "function": fn}
+}
+
+func (b *requestBuilder) customTool(tool map[string]any) map[string]any {
+	name := stringField(tool, "name")
+	chatName := b.register("custom", "", name)
+	description := strings.TrimSpace(stringField(tool, "description"))
+	if description != "" {
+		description += "\n\n"
+	}
+	description += "This is a Responses custom/freeform tool. Call it with a JSON object containing exactly one string field named input. The input value must be the complete freeform tool payload."
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        chatName,
+			"description": description,
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"input": map[string]any{
+						"type":        "string",
+						"description": "Complete freeform input for the custom tool.",
+					},
+				},
+				"required":             []any{"input"},
+				"additionalProperties": false,
+			},
+			"strict": true,
+		},
+	}
+}
+
+func (b *requestBuilder) hostedFunctionTool(name, kind, description string, parameters any) map[string]any {
+	chatName := b.register(kind, "", name)
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        chatName,
+			"description": description,
+			"parameters":  parameters,
+		},
+	}
+}
+
+func (b *requestBuilder) register(kind, namespace, name string) string {
+	if name == "" {
+		name = "unnamed_tool"
+	}
+	flat := flatToolName(namespace, name)
+	chatName := b.uniqueChatName(flat)
+	mapping := toolMapping{Kind: kind, ChatName: chatName, Name: name, Namespace: namespace}
+	b.byChat[chatName] = mapping
+	b.byKey[toolKey(kind, namespace, name)] = mapping
+	return chatName
+}
+
+func (b *requestBuilder) chatNameFor(kind, namespace, name string) string {
+	if mapping, ok := b.byKey[toolKey(kind, namespace, name)]; ok {
+		return mapping.ChatName
+	}
+	if kind != "function" {
+		if mapping, ok := b.byKey[toolKey("function", namespace, name)]; ok {
+			return mapping.ChatName
+		}
+	}
+	return safeToolName(flatToolName(namespace, name))
+}
+
+func (b *requestBuilder) uniqueChatName(original string) string {
+	base := safeToolName(original)
+	count := b.usedNames[base]
+	b.usedNames[base] = count + 1
+	if count == 0 {
+		return base
+	}
+	suffix := "_" + strconv.Itoa(count+1)
+	maxBaseLen := 64 - len(suffix)
+	if maxBaseLen < 1 {
+		maxBaseLen = 1
+	}
+	if len(base) > maxBaseLen {
+		base = strings.TrimRight(base[:maxBaseLen], "_-")
+		if base == "" {
+			base = "tool"
+		}
+	}
+	return base + suffix
+}
+
+func toolKey(kind, namespace, name string) string {
+	return kind + "\x00" + namespace + "\x00" + name
+}
+
+func flatToolName(namespace, name string) string {
+	if namespace == "" {
+		return name
+	}
+	if strings.HasSuffix(namespace, "_") || strings.HasPrefix(name, "_") {
+		return namespace + name
+	}
+	return namespace + "_" + name
+}
+
+func safeToolName(name string) string {
+	if name == "" {
+		return "tool"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := strings.Trim(b.String(), "_-")
+	if out == "" {
+		out = "tool"
+	}
+	if len(out) > 64 {
+		out = strings.TrimRight(out[:64], "_-")
+		if out == "" {
+			out = "tool"
+		}
+	}
+	return out
+}
+
+func (b *requestBuilder) translateInput(req map[string]any) []map[string]any {
+	var messages []map[string]any
+	if instructions, ok := req["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
+		messages = append(messages, map[string]any{"role": "system", "content": instructions})
+	}
+
+	switch input := req["input"].(type) {
+	case string:
+		messages = append(messages, map[string]any{"role": "user", "content": input})
+	case []any:
+		for _, value := range input {
+			item, ok := value.(map[string]any)
+			if !ok {
+				messages = append(messages, markerMessage(value))
+				continue
+			}
+			messages = append(messages, b.itemToMessages(item)...)
+		}
+	case nil:
+	default:
+		messages = append(messages, markerMessage(input))
+	}
+	return messages
+}
+
+func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
+	switch stringField(item, "type") {
+	case "message":
+		role := normalizeRole(stringField(item, "role"))
+		return []map[string]any{{
+			"role":    role,
+			"content": chatContentFromResponsesContent(item["content"], role),
+		}}
+	case "function_call":
+		name := stringField(item, "name")
+		namespace := stringField(item, "namespace")
+		return []map[string]any{assistantToolCallMessage(stringField(item, "call_id"), b.chatNameFor("function", namespace, name), stringField(item, "arguments"))}
+	case "custom_tool_call":
+		name := stringField(item, "name")
+		args, _ := json.Marshal(map[string]string{"input": stringField(item, "input")})
+		return []map[string]any{assistantToolCallMessage(stringField(item, "call_id"), b.chatNameFor("custom", "", name), string(args))}
+	case "tool_search_call":
+		args := compactJSONString(item["arguments"])
+		return []map[string]any{assistantToolCallMessage(optionalCallID(item), b.chatNameFor("tool_search", "", "tool_search"), args)}
+	case "function_call_output", "custom_tool_call_output":
+		callID := stringField(item, "call_id")
+		if callID == "" {
+			return []map[string]any{markerMessage(item)}
+		}
+		return []map[string]any{{
+			"role":         "tool",
+			"tool_call_id": callID,
+			"content":      toolOutputToText(item["output"]),
+		}}
+	case "tool_search_output":
+		callID := optionalCallID(item)
+		if callID == "" {
+			return []map[string]any{markerMessage(item)}
+		}
+		return []map[string]any{{
+			"role":         "tool",
+			"tool_call_id": callID,
+			"content":      compactJSONString(item),
+		}}
+	default:
+		return []map[string]any{markerMessage(item)}
+	}
+}
+
+func assistantToolCallMessage(callID, name, arguments string) map[string]any {
+	if callID == "" {
+		callID = newID("call")
+	}
+	if arguments == "" {
+		arguments = "{}"
+	}
+	return map[string]any{
+		"role":    "assistant",
+		"content": nil,
+		"tool_calls": []any{
+			map[string]any{
+				"id":   callID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      name,
+					"arguments": arguments,
+				},
+			},
+		},
+	}
+}
+
+func markerMessage(value any) map[string]any {
+	return map[string]any{
+		"role":    "assistant",
+		"content": "[Responses API item]\n" + compactJSONString(value),
+	}
+}
+
+func normalizeRole(role string) string {
+	switch role {
+	case "system", "user", "assistant", "tool":
+		return role
+	case "developer":
+		return "system"
+	case "":
+		return "user"
+	default:
+		return "user"
+	}
+}
+
+func chatContentFromResponsesContent(value any, role string) any {
+	items, ok := value.([]any)
+	if !ok {
+		if s, ok := value.(string); ok {
+			return s
+		}
+		return ""
+	}
+	var text strings.Builder
+	var parts []any
+	hasImage := false
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringField(item, "type") {
+		case "input_text", "output_text", "text":
+			s := stringField(item, "text")
+			text.WriteString(s)
+			parts = append(parts, map[string]any{"type": "text", "text": s})
+		case "input_image":
+			imageURL := stringField(item, "image_url")
+			if imageURL == "" {
+				continue
+			}
+			hasImage = true
+			image := map[string]any{"url": imageURL}
+			if detail := stringField(item, "detail"); detail != "" {
+				image["detail"] = strings.ToLower(detail)
+			}
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": image})
+		default:
+			s := compactJSONString(item)
+			text.WriteString(s)
+			parts = append(parts, map[string]any{"type": "text", "text": s})
+		}
+	}
+	if hasImage && role == "user" {
+		return parts
+	}
+	return text.String()
+}
+
+func toolOutputToText(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		var parts []string
+		for _, raw := range v {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch stringField(item, "type") {
+			case "input_text":
+				if s := stringField(item, "text"); strings.TrimSpace(s) != "" {
+					parts = append(parts, s)
+				}
+			case "input_image":
+				if s := stringField(item, "image_url"); s != "" {
+					parts = append(parts, "[image] "+s)
+				}
+			case "encrypted_content":
+				parts = append(parts, "[encrypted_content omitted]")
+			default:
+				parts = append(parts, compactJSONString(item))
+			}
+		}
+		return strings.Join(parts, "\n")
+	case nil:
+		return ""
+	default:
+		return compactJSONString(v)
+	}
+}
+
+func optionalCallID(item map[string]any) string {
+	if s := stringField(item, "call_id"); s != "" {
+		return s
+	}
+	return ""
+}
+
+func schemaOrDefault(value any) any {
+	if value != nil {
+		return value
+	}
+	return map[string]any{
+		"type":                 "object",
+		"properties":           map[string]any{},
+		"additionalProperties": true,
+	}
+}
+
+func webSearchSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action":  map[string]any{"type": "string", "enum": []any{"search", "open_page", "find_in_page"}},
+			"query":   map[string]any{"type": "string"},
+			"queries": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"url":     map[string]any{"type": "string"},
+			"pattern": map[string]any{"type": "string"},
+		},
+		"additionalProperties": true,
+	}
+}
+
+func imageGenerationSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"prompt":         map[string]any{"type": "string"},
+			"revised_prompt": map[string]any{"type": "string"},
+			"result":         map[string]any{"type": "string", "description": "Base64 encoded PNG image data, if available."},
+			"b64_json":       map[string]any{"type": "string", "description": "Base64 encoded image data, if available."},
+		},
+		"required":             []any{"prompt"},
+		"additionalProperties": true,
+	}
+}
+
+func translateToolChoice(value any) (any, bool) {
+	switch v := value.(type) {
+	case string:
+		switch v {
+		case "auto", "none", "required":
+			return v, true
+		case "":
+			return nil, false
+		default:
+			return v, true
+		}
+	case map[string]any:
+		return v, true
+	default:
+		return nil, false
+	}
+}
+
+func translateResponseFormat(value any) (any, bool) {
+	text, ok := value.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	format, ok := text["format"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if stringField(format, "type") != "json_schema" {
+		return nil, false
+	}
+	name := stringField(format, "name")
+	if name == "" {
+		name = "response_format"
+	}
+	jsonSchema := map[string]any{
+		"name":   name,
+		"schema": format["schema"],
+	}
+	if strict, ok := format["strict"].(bool); ok {
+		jsonSchema["strict"] = strict
+	}
+	return map[string]any{
+		"type":        "json_schema",
+		"json_schema": jsonSchema,
+	}, true
+}
+
+func (a *Adapter) translateChatStream(body io.Reader, ctx *translationContext, sse *responseSSEWriter, respID string) error {
+	gen := newChatGeneration(ctx)
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	var dataLines []string
+
+	process := func() error {
+		if len(dataLines) == 0 {
+			return nil
+		}
+		data := strings.Join(dataLines, "\n")
+		dataLines = nil
+		if strings.TrimSpace(data) == "[DONE]" {
+			return nil
+		}
+		a.debug.SaveRawJSON("upstream chat stream chunk", []byte(data))
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return err
+		}
+		if errValue, ok := chunk["error"]; ok && errValue != nil {
+			return fmt.Errorf("upstream stream error: %s", compactJSONString(errValue))
+		}
+		return gen.applyStreamChunk(chunk, sse)
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if err := process(); err != nil {
+				return err
+			}
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	if err := process(); err != nil {
+		return err
+	}
+	emitGenerationAsResponses(gen, sse, respID)
+	return nil
+}
+
+type chatGeneration struct {
+	ctx       *translationContext
+	text      strings.Builder
+	reasoning strings.Builder
+	tools     map[int]*chatToolCall
+	usage     map[string]any
+}
+
+type chatToolCall struct {
+	Index     int
+	ID        string
+	Type      string
+	Name      string
+	Arguments strings.Builder
+}
+
+func newChatGeneration(ctx *translationContext) *chatGeneration {
+	return &chatGeneration{ctx: ctx, tools: map[int]*chatToolCall{}}
+}
+
+func (g *chatGeneration) applyStreamChunk(chunk map[string]any, sse *responseSSEWriter) error {
+	if usage, ok := chunk["usage"].(map[string]any); ok {
+		g.usage = usage
+	}
+	choices, _ := chunk["choices"].([]any)
+	for _, rawChoice := range choices {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		if s := textFromAny(delta["content"]); s != "" {
+			g.text.WriteString(s)
+			_ = sse.Event("response.output_text.delta", map[string]any{"delta": s})
+		}
+		if s := firstTextField(delta, "reasoning_content", "reasoning", "reasoning_delta"); s != "" {
+			g.reasoning.WriteString(s)
+			_ = sse.Event("response.reasoning_text.delta", map[string]any{
+				"delta":         s,
+				"content_index": 0,
+			})
+		}
+		g.applyToolCallDeltas(delta)
+	}
+	return nil
+}
+
+func (g *chatGeneration) applyToolCallDeltas(delta map[string]any) {
+	if calls, ok := delta["tool_calls"].([]any); ok {
+		for position, raw := range calls {
+			call, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			index := intField(call, "index", position)
+			acc := g.tool(index)
+			if s := stringField(call, "id"); s != "" {
+				acc.ID = s
+			}
+			if s := stringField(call, "type"); s != "" {
+				acc.Type = s
+			}
+			if fn, ok := call["function"].(map[string]any); ok {
+				if s := stringField(fn, "name"); s != "" {
+					acc.Name = s
+				}
+				if s := stringField(fn, "arguments"); s != "" {
+					acc.Arguments.WriteString(s)
+				}
+			}
+			if custom, ok := call["custom"].(map[string]any); ok {
+				acc.Type = "custom"
+				if s := stringField(custom, "name"); s != "" {
+					acc.Name = s
+				}
+				if s := firstTextField(custom, "input", "arguments"); s != "" {
+					acc.Arguments.WriteString(s)
+				}
+			}
+		}
+	}
+	if fn, ok := delta["function_call"].(map[string]any); ok {
+		acc := g.tool(0)
+		acc.Type = "function"
+		if s := stringField(fn, "name"); s != "" {
+			acc.Name = s
+		}
+		if s := stringField(fn, "arguments"); s != "" {
+			acc.Arguments.WriteString(s)
+		}
+	}
+}
+
+func (g *chatGeneration) tool(index int) *chatToolCall {
+	if existing := g.tools[index]; existing != nil {
+		return existing
+	}
+	call := &chatToolCall{Index: index, Type: "function"}
+	g.tools[index] = call
+	return call
+}
+
+func generationFromChatResponse(raw []byte, ctx *translationContext) (*chatGeneration, error) {
+	var response map[string]any
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, err
+	}
+	if errValue, ok := response["error"]; ok && errValue != nil {
+		return nil, fmt.Errorf("upstream error: %s", compactJSONString(errValue))
+	}
+	gen := newChatGeneration(ctx)
+	if usage, ok := response["usage"].(map[string]any); ok {
+		gen.usage = usage
+	}
+	choices, _ := response["choices"].([]any)
+	if len(choices) == 0 {
+		return gen, nil
+	}
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	if s := textFromAny(message["content"]); s != "" {
+		gen.text.WriteString(s)
+	}
+	if s := firstTextField(message, "reasoning_content", "reasoning"); s != "" {
+		gen.reasoning.WriteString(s)
+	}
+	if calls, ok := message["tool_calls"].([]any); ok {
+		for position, raw := range calls {
+			call, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			index := intField(call, "index", position)
+			acc := gen.tool(index)
+			acc.ID = stringField(call, "id")
+			acc.Type = stringField(call, "type")
+			if acc.Type == "" {
+				acc.Type = "function"
+			}
+			if fn, ok := call["function"].(map[string]any); ok {
+				acc.Name = stringField(fn, "name")
+				acc.Arguments.WriteString(stringField(fn, "arguments"))
+			}
+			if custom, ok := call["custom"].(map[string]any); ok {
+				acc.Type = "custom"
+				acc.Name = stringField(custom, "name")
+				acc.Arguments.WriteString(firstTextField(custom, "input", "arguments"))
+			}
+		}
+	}
+	if fn, ok := message["function_call"].(map[string]any); ok {
+		acc := gen.tool(0)
+		acc.Type = "function"
+		acc.Name = stringField(fn, "name")
+		acc.Arguments.WriteString(stringField(fn, "arguments"))
+	}
+	return gen, nil
+}
+
+func emitGenerationAsResponses(gen *chatGeneration, sse *responseSSEWriter, respID string) {
+	for _, item := range gen.responseItems() {
+		_ = sse.Event("response.output_item.done", map[string]any{"item": item})
+	}
+	_ = sse.Event("response.completed", map[string]any{
+		"response": map[string]any{
+			"id":       respID,
+			"object":   "response",
+			"status":   "completed",
+			"usage":    responsesUsage(gen.usage),
+			"end_turn": true,
+		},
+	})
+}
+
+func (g *chatGeneration) responseItems() []any {
+	var items []any
+	if reasoning := g.reasoning.String(); reasoning != "" {
+		items = append(items, map[string]any{
+			"id":                newID("rs"),
+			"type":              "reasoning",
+			"summary":           []any{},
+			"content":           []any{map[string]any{"type": "reasoning_text", "text": reasoning}},
+			"encrypted_content": nil,
+		})
+	}
+	if text := g.text.String(); text != "" {
+		items = append(items, map[string]any{
+			"id":   newID("msg"),
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "output_text", "text": text},
+			},
+		})
+	}
+	indexes := make([]int, 0, len(g.tools))
+	for index := range g.tools {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	for _, index := range indexes {
+		if item := g.toolCallItem(g.tools[index]); item != nil {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func (g *chatGeneration) toolCallItem(call *chatToolCall) map[string]any {
+	if call == nil {
+		return nil
+	}
+	name := call.Name
+	if name == "" {
+		name = "unknown_tool"
+	}
+	callID := call.ID
+	if callID == "" {
+		callID = newID("call")
+	}
+	args := call.Arguments.String()
+	mapping, ok := g.ctx.byChat[name]
+	if !ok {
+		mapping = inferToolMapping(name, call.Type)
+	}
+
+	switch mapping.Kind {
+	case "custom":
+		return map[string]any{
+			"id":      newID("ctc"),
+			"type":    "custom_tool_call",
+			"call_id": callID,
+			"name":    mapping.Name,
+			"input":   customInputFromArguments(args),
+		}
+	case "tool_search":
+		return map[string]any{
+			"id":        newID("ts"),
+			"type":      "tool_search_call",
+			"call_id":   callID,
+			"execution": "client",
+			"arguments": jsonValueOrObject(args),
+		}
+	case "web_search":
+		return map[string]any{
+			"id":     newID("ws"),
+			"type":   "web_search_call",
+			"status": "completed",
+			"action": webSearchActionFromArguments(args),
+		}
+	case "image_generation":
+		action := jsonObject(args)
+		result := firstString(action, "result", "b64_json", "image")
+		status := "completed"
+		if result == "" {
+			status = "failed"
+		}
+		return map[string]any{
+			"id":             newID("ig"),
+			"type":           "image_generation_call",
+			"status":         status,
+			"revised_prompt": firstString(action, "revised_prompt", "prompt"),
+			"result":         result,
+		}
+	default:
+		item := map[string]any{
+			"id":        newID("fc"),
+			"type":      "function_call",
+			"call_id":   callID,
+			"name":      mapping.Name,
+			"arguments": argsOrEmptyObject(args),
+		}
+		if mapping.Namespace != "" {
+			item["namespace"] = mapping.Namespace
+		}
+		return item
+	}
+}
+
+func inferToolMapping(name, callType string) toolMapping {
+	kind := "function"
+	switch name {
+	case "tool_search":
+		kind = "tool_search"
+	case "web_search":
+		kind = "web_search"
+	case "image_generation":
+		kind = "image_generation"
+	default:
+		if callType == "custom" {
+			kind = "custom"
+		}
+	}
+	return toolMapping{Kind: kind, ChatName: name, Name: name}
+}
+
+func responsesUsage(usage map[string]any) map[string]any {
+	input := int64FromAny(usage["prompt_tokens"])
+	output := int64FromAny(usage["completion_tokens"])
+	total := int64FromAny(usage["total_tokens"])
+	if total == 0 {
+		total = input + output
+	}
+	reasoningTokens := int64(0)
+	if details, ok := usage["completion_tokens_details"].(map[string]any); ok {
+		reasoningTokens = int64FromAny(details["reasoning_tokens"])
+	}
+	var outputDetails any
+	if reasoningTokens > 0 {
+		outputDetails = map[string]any{"reasoning_tokens": reasoningTokens}
+	}
+	return map[string]any{
+		"input_tokens":          input,
+		"input_tokens_details":  nil,
+		"output_tokens":         output,
+		"output_tokens_details": outputDetails,
+		"total_tokens":          total,
+	}
+}
+
+func customInputFromArguments(arguments string) string {
+	if strings.TrimSpace(arguments) == "" {
+		return ""
+	}
+	var value any
+	if err := json.Unmarshal([]byte(arguments), &value); err != nil {
+		return arguments
+	}
+	switch v := value.(type) {
+	case string:
+		return v
+	case map[string]any:
+		for _, key := range []string{"input", "patch", "content", "text", "command"} {
+			if s, ok := v[key].(string); ok {
+				return s
+			}
+		}
+		if len(v) == 1 {
+			for _, only := range v {
+				if s, ok := only.(string); ok {
+					return s
+				}
+			}
+		}
+		return compactJSONString(v)
+	default:
+		return compactJSONString(v)
+	}
+}
+
+func webSearchActionFromArguments(arguments string) map[string]any {
+	obj := jsonObject(arguments)
+	action := firstString(obj, "action", "type")
+	if action == "" {
+		switch {
+		case firstString(obj, "url") != "" && firstString(obj, "pattern") != "":
+			action = "find_in_page"
+		case firstString(obj, "url") != "":
+			action = "open_page"
+		default:
+			action = "search"
+		}
+	}
+	out := map[string]any{"type": action}
+	switch action {
+	case "open_page":
+		if s := firstString(obj, "url"); s != "" {
+			out["url"] = s
+		}
+	case "find_in_page":
+		if s := firstString(obj, "url"); s != "" {
+			out["url"] = s
+		}
+		if s := firstString(obj, "pattern"); s != "" {
+			out["pattern"] = s
+		}
+	default:
+		if s := firstString(obj, "query"); s != "" {
+			out["query"] = s
+		}
+		if queries, ok := obj["queries"].([]any); ok {
+			out["queries"] = queries
+		}
+	}
+	return out
+}
+
+func jsonValueOrObject(raw string) any {
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err == nil {
+		return value
+	}
+	return map[string]any{"query": raw}
+}
+
+func jsonObject(raw string) map[string]any {
+	var value map[string]any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return map[string]any{}
+	}
+	return value
+}
+
+func argsOrEmptyObject(args string) string {
+	if strings.TrimSpace(args) == "" {
+		return "{}"
+	}
+	return args
+}
+
+func stringField(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	if s, ok := m[key].(string); ok {
+		return s
+	}
+	return ""
+}
+
+func metadataFromAny(value any) map[string]string {
+	m, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for key, raw := range m {
+		switch v := raw.(type) {
+		case string:
+			out[key] = v
+		case fmt.Stringer:
+			out[key] = v.String()
+		case float64:
+			out[key] = strconv.FormatFloat(v, 'f', -1, 64)
+		case bool:
+			out[key] = strconv.FormatBool(v)
+		default:
+			out[key] = compactJSONString(v)
+		}
+	}
+	return out
+}
+
+func firstString(m map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if s, ok := m[key].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func firstTextField(m map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if s := textFromAny(m[key]); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func textFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []any:
+		var b strings.Builder
+		for _, raw := range v {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s := stringField(part, "text"); s != "" {
+				b.WriteString(s)
+			}
+		}
+		return b.String()
+	default:
+		return ""
+	}
+}
+
+func intField(m map[string]any, key string, fallback int) int {
+	if m == nil {
+		return fallback
+	}
+	switch v := m[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	default:
+		return fallback
+	}
+}
+
+func int64FromAny(value any) int64 {
+	switch v := value.(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	default:
+		return 0
+	}
+}
+
+func compactJSONString(value any) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(data)
+}
+
+func newID(prefix string) string {
+	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+}
