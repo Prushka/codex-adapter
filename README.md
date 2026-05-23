@@ -7,7 +7,7 @@ It listens for Codex `/v1/responses` requests, translates them to `/v1/chat/comp
 ## Usage
 
 ```sh
-go run . \
+go run ./cmd/codex-adapter \
   -listen 127.0.0.1:8080 \
   -provider-url http://localhost:1234/v1 \
   -model your-chat-model \
