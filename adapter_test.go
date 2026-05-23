@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -638,31 +639,77 @@ func TestToolSearchCallRoundTripsAsClientToolSearch(t *testing.T) {
 	}
 }
 
-func TestWebSearchCallRoundTripsAsResponsesWebSearchCall(t *testing.T) {
+func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
+	duckHTML := `<!doctype html>
+<html>
+  <body>
+    <div class="result">
+      <a class="result__a" href="/l/?uddg=https%3A%2F%2Ffinance.example.com%2Ftsla">Tesla stock price - Example Finance</a>
+      <div class="result__snippet">TSLA trading near $123.45 with a positive move.</div>
+    </div>
+  </body>
+</html>`
+
+	var upstreamHits atomic.Int32
+	var firstRequest map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"choices": []any{
-				map[string]any{
-					"message": map[string]any{
-						"tool_calls": []any{
-							map[string]any{
-								"id":   "call-web",
-								"type": "function",
-								"function": map[string]any{
-									"name":      "web_search",
-									"arguments": "{\"action\":\"search\",\"query\":\"codex responses api\"}",
-								},
-							},
-						},
-					},
-				},
-			},
-		})
+		hit := upstreamHits.Add(1)
+		switch hit {
+		case 1:
+			if err := json.NewDecoder(r.Body).Decode(&firstRequest); err != nil {
+				t.Fatal(err)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-web\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"action\\\":\\\"search\\\",\\\"query\\\":\\\"Tesla stock price\\\"}\"},\"extra_content\":{\"google\":{\"thought_signature\":\"sig-123\"}}}]}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":5,\"total_tokens\":9}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			messages := req["messages"].([]any)
+			if len(messages) < 3 {
+				t.Fatalf("follow-up messages = %#v", messages)
+			}
+			assistantMsg := messages[len(messages)-2].(map[string]any)
+			calls := assistantMsg["tool_calls"].([]any)
+			extra := calls[0].(map[string]any)["extra_content"].(map[string]any)
+			if got := extra["google"].(map[string]any)["thought_signature"]; got != "sig-123" {
+				t.Fatalf("follow-up thought_signature = %#v", got)
+			}
+			toolMsg := messages[len(messages)-1].(map[string]any)
+			if toolMsg["role"] != "tool" {
+				t.Fatalf("follow-up tool message = %#v", toolMsg)
+			}
+			if got := toolMsg["content"].(string); !strings.Contains(got, "TSLA trading near $123.45") {
+				t.Fatalf("follow-up tool content = %q", got)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Tesla is trading near $123.45.\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":12,\"total_tokens\":22}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected upstream hit %d", hit)
+		}
 	}))
 	defer upstream.Close()
 
-	adapter := testAdapter(t, upstream.URL, nil)
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "html.duckduckgo.com" {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body:       io.NopCloser(strings.NewReader(duckHTML)),
+				}, nil
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		}),
+	}
+
+	adapter := testAdapterWithClient(t, upstream.URL, nil, client)
 	body := responsesRequestWithTools([]any{
 		map[string]any{
 			"type":                   "web_search",
@@ -679,8 +726,20 @@ func TestWebSearchCallRoundTripsAsResponsesWebSearchCall(t *testing.T) {
 		t.Fatalf("web search status = %v", item["status"])
 	}
 	action := item["action"].(map[string]any)
-	if action["type"] != "search" || action["query"] != "codex responses api" {
+	if action["type"] != "search" || action["query"] != "Tesla stock price" {
 		t.Fatalf("bad web search action: %#v", action)
+	}
+	message := firstDoneItem(t, events, "message")
+	content := message["content"].([]any)
+	if got := content[0].(map[string]any)["text"].(string); !strings.Contains(got, "Tesla is trading near $123.45.") {
+		t.Fatalf("final assistant text = %q", got)
+	}
+	assertCompleted(t, events)
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("upstream hits = %d", upstreamHits.Load())
+	}
+	if firstRequest == nil {
+		t.Fatal("first upstream request was not captured")
 	}
 }
 
@@ -758,17 +817,28 @@ func TestDebugRecorderWritesOrderedJSONFiles(t *testing.T) {
 
 func testAdapter(t *testing.T, providerURL string, debug *DebugRecorder) *Adapter {
 	t.Helper()
+	return testAdapterWithClient(t, providerURL, debug, http.DefaultClient)
+}
+
+func testAdapterWithClient(t *testing.T, providerURL string, debug *DebugRecorder, client *http.Client) *Adapter {
+	t.Helper()
 	adapter, err := NewAdapter(AdapterConfig{
 		ProviderURL:     providerURL,
 		Model:           "forced-model",
 		ReasoningEffort: "low",
 		Debug:           debug,
-		HTTPClient:      http.DefaultClient,
+		HTTPClient:      client,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return adapter
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func responsesRequestWithTools(tools []any) map[string]any {

@@ -196,7 +196,7 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isEventStream(upstream.Header.Get("Content-Type")) {
-		if err := a.translateChatStream(upstream.Body, ctx, sse, respID); err != nil {
+		if err := a.translateChatStream(r, upstream.Body, chatReq, ctx, sse, respID, 0); err != nil {
 			a.logger.Error("failed to translate upstream chat stream", zap.String("response_id", respID), zap.Error(err))
 			_ = sse.Event("response.failed", failedResponse(respID, "server_error", "stream_translation_error", err.Error()))
 		}
@@ -216,8 +216,10 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "response_translation_error", err.Error()))
 		return
 	}
-	a.rememberToolExtraContent(gen)
-	emitGenerationAsResponses(gen, sse, respID)
+	if err := a.handleGeneration(r, chatReq, gen, ctx, sse, respID, 0); err != nil {
+		a.logger.Error("failed to handle upstream chat response", zap.String("response_id", respID), zap.Error(err))
+		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "response_handling_error", err.Error()))
+	}
 }
 
 func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
@@ -1162,7 +1164,15 @@ func translateResponseFormat(value any) (any, bool) {
 	}, true
 }
 
-func (a *Adapter) translateChatStream(body io.Reader, ctx *translationContext, sse *responseSSEWriter, respID string) error {
+func (a *Adapter) translateChatStream(
+	inbound *http.Request,
+	body io.Reader,
+	upstreamReq map[string]any,
+	ctx *translationContext,
+	sse *responseSSEWriter,
+	respID string,
+	webSearchDepth int,
+) error {
 	gen := newChatGeneration(ctx)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -1209,9 +1219,7 @@ func (a *Adapter) translateChatStream(body io.Reader, ctx *translationContext, s
 	if err := process(); err != nil {
 		return err
 	}
-	a.rememberToolExtraContent(gen)
-	emitGenerationAsResponses(gen, sse, respID)
-	return nil
+	return a.handleGeneration(inbound, upstreamReq, gen, ctx, sse, respID, webSearchDepth)
 }
 
 type responseItemState struct {
@@ -1740,7 +1748,7 @@ func generationFromChatResponse(raw []byte, ctx *translationContext) (*chatGener
 	return gen, nil
 }
 
-func emitGenerationAsResponses(gen *chatGeneration, sse *responseSSEWriter, respID string) {
+func emitGenerationOutputItems(gen *chatGeneration, sse *responseSSEWriter, respID string) {
 	if gen.activeKind == "tool" {
 		gen.activeKind = ""
 		gen.activeToolIndex = -1
@@ -1753,6 +1761,9 @@ func emitGenerationAsResponses(gen *chatGeneration, sse *responseSSEWriter, resp
 		}
 		_ = sse.Event("response.output_item.done", map[string]any{"item": entry.item})
 	}
+}
+
+func emitGenerationCompletion(gen *chatGeneration, sse *responseSSEWriter, respID string) {
 	if reason, ok := incompleteReasonFromFinishReason(gen.finishReason); ok {
 		_ = sse.Event("response.incomplete", map[string]any{
 			"response": map[string]any{
