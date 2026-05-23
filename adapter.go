@@ -30,6 +30,7 @@ type AdapterConfig struct {
 	Model           string
 	ReasoningEffort string
 	APIKey          string
+	WebSearcher     WebSearcher
 	Debug           *DebugRecorder
 	HTTPClient      *http.Client
 	Logger          *zap.Logger
@@ -40,6 +41,7 @@ type Adapter struct {
 	model           string
 	reasoningEffort string
 	apiKey          string
+	search          WebSearcher
 	debug           *DebugRecorder
 	client          *http.Client
 	logger          *zap.Logger
@@ -70,11 +72,16 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	search := cfg.WebSearcher
+	if search == nil {
+		search = newDuckDuckGoSearcher(client, logger)
+	}
 	return &Adapter{
 		chatURL:         chatURL,
 		model:           cfg.Model,
 		reasoningEffort: cfg.ReasoningEffort,
 		apiKey:          strings.TrimSpace(cfg.APIKey),
+		search:          search,
 		debug:           cfg.Debug,
 		client:          client,
 		logger:          logger,
@@ -1093,9 +1100,24 @@ func webSearchSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"action":  map[string]any{"type": "string", "enum": []any{"search", "open_page", "find_in_page"}},
-			"query":   map[string]any{"type": "string"},
-			"queries": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"action":              map[string]any{"type": "string", "enum": []any{"search", "open_page", "find_in_page"}},
+			"query":               map[string]any{"type": "string"},
+			"queries":             map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"domains":             map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"external_web_access": map[string]any{"type": "boolean"},
+			"filters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"allowed_domains": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				},
+				"additionalProperties": true,
+			},
+			"search_context_size":  map[string]any{"type": "string", "enum": []any{"low", "medium", "high"}},
+			"search_content_types": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"user_location": map[string]any{
+				"type":                 "object",
+				"additionalProperties": true,
+			},
 			"url":     map[string]any{"type": "string"},
 			"pattern": map[string]any{"type": "string"},
 		},

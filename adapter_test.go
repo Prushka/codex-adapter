@@ -3,6 +3,7 @@ package adapter
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -640,24 +641,17 @@ func TestToolSearchCallRoundTripsAsClientToolSearch(t *testing.T) {
 }
 
 func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
-	duckHTML := `<!doctype html>
-<html>
-  <body>
-    <div class="result">
-      <a class="result__a" href="/l/?uddg=https%3A%2F%2Ffinance.example.com%2Ftsla">Tesla stock price - Example Finance</a>
-      <div class="result__snippet">TSLA trading near $123.45 with a positive move.</div>
-    </div>
-  </body>
-</html>`
-
 	var upstreamHits atomic.Int32
-	var firstRequest map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hit := upstreamHits.Add(1)
 		switch hit {
 		case 1:
-			if err := json.NewDecoder(r.Body).Decode(&firstRequest); err != nil {
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Fatal(err)
+			}
+			if req["stream"] != true {
+				t.Fatalf("first upstream request stream = %#v", req["stream"])
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-web\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"action\\\":\\\"search\\\",\\\"query\\\":\\\"Tesla stock price\\\"}\"},\"extra_content\":{\"google\":{\"thought_signature\":\"sig-123\"}}}]}}]}\n\n"))
@@ -695,21 +689,17 @@ func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	client := &http.Client{
-		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			if req.URL.Host == "html.duckduckgo.com" {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Status:     "200 OK",
-					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-					Body:       io.NopCloser(strings.NewReader(duckHTML)),
-				}, nil
-			}
-			return http.DefaultTransport.RoundTrip(req)
-		}),
+	searcher := &mockWebSearcher{
+		results: []searchResult{
+			{
+				Title:   "Tesla stock price - Example Finance",
+				URL:     "https://finance.example.com/tsla",
+				Snippet: "TSLA trading near $123.45 with a positive move.",
+			},
+		},
 	}
 
-	adapter := testAdapterWithClient(t, upstream.URL, nil, client)
+	adapter := testAdapterWithClientAndSearcher(t, upstream.URL, nil, http.DefaultClient, searcher)
 	body := responsesRequestWithTools([]any{
 		map[string]any{
 			"type":                   "web_search",
@@ -738,8 +728,96 @@ func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 	if upstreamHits.Load() != 2 {
 		t.Fatalf("upstream hits = %d", upstreamHits.Load())
 	}
-	if firstRequest == nil {
-		t.Fatal("first upstream request was not captured")
+	if len(searcher.queries) != 1 || searcher.queries[0] != "Tesla stock price" {
+		t.Fatalf("search queries = %#v", searcher.queries)
+	}
+}
+
+func TestDuckDuckGoSearchBackendParsesLiteHTML(t *testing.T) {
+	duckHTML := `<!doctype html>
+<html>
+  <body>
+    <table>
+      <tr class="result">
+        <td class="result-snippet">
+          <a class="result-link" href="/l/?uddg=https%3A%2F%2Ffinance.example.com%2Ftsla">Tesla stock price - Example Finance</a>
+          <div class="result-snippet">TSLA trading near $123.45 with a positive move.</div>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`
+
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Host, "duckduckgo.com") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body:       io.NopCloser(strings.NewReader(duckHTML)),
+				}, nil
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		}),
+	}
+
+	searcher := newDuckDuckGoSearcher(client, zap.NewNop())
+	results, err := searcher.Search(context.Background(), "Tesla stock price", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %#v", results)
+	}
+	if results[0].URL != "https://finance.example.com/tsla" {
+		t.Fatalf("result url = %q", results[0].URL)
+	}
+	if !strings.Contains(results[0].Snippet, "TSLA trading near $123.45") {
+		t.Fatalf("result snippet = %q", results[0].Snippet)
+	}
+}
+
+func TestSearxngSearchBackendParsesJSONResults(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("format"); got != "json" {
+			t.Fatalf("format = %q", got)
+		}
+		if got := r.URL.Query().Get("q"); got != "Tesla stock price" {
+			t.Fatalf("q = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{
+					"title":   "Tesla stock price - Example Finance",
+					"url":     "https://finance.example.com/tsla",
+					"content": "TSLA trading near $123.45 with a positive move.",
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	searcher, err := NewWebSearcher(WebSearchConfig{
+		Provider: "searxng",
+		Endpoint: upstream.URL + "/search",
+	}, upstream.Client(), zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := searcher.Search(context.Background(), "Tesla stock price", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %#v", results)
+	}
+	if results[0].URL != "https://finance.example.com/tsla" {
+		t.Fatalf("result url = %q", results[0].URL)
+	}
+	if !strings.Contains(results[0].Snippet, "TSLA trading near $123.45") {
+		t.Fatalf("result snippet = %q", results[0].Snippet)
 	}
 }
 
@@ -822,10 +900,16 @@ func testAdapter(t *testing.T, providerURL string, debug *DebugRecorder) *Adapte
 
 func testAdapterWithClient(t *testing.T, providerURL string, debug *DebugRecorder, client *http.Client) *Adapter {
 	t.Helper()
+	return testAdapterWithClientAndSearcher(t, providerURL, debug, client, nil)
+}
+
+func testAdapterWithClientAndSearcher(t *testing.T, providerURL string, debug *DebugRecorder, client *http.Client, searcher WebSearcher) *Adapter {
+	t.Helper()
 	adapter, err := NewAdapter(AdapterConfig{
 		ProviderURL:     providerURL,
 		Model:           "forced-model",
 		ReasoningEffort: "low",
+		WebSearcher:     searcher,
 		Debug:           debug,
 		HTTPClient:      client,
 	})
@@ -833,6 +917,24 @@ func testAdapterWithClient(t *testing.T, providerURL string, debug *DebugRecorde
 		t.Fatal(err)
 	}
 	return adapter
+}
+
+type mockWebSearcher struct {
+	results []searchResult
+	queries []string
+}
+
+func (m *mockWebSearcher) Name() string {
+	return "mock"
+}
+
+func (m *mockWebSearcher) Search(_ context.Context, query string, limit int) ([]searchResult, error) {
+	m.queries = append(m.queries, query)
+	results := append([]searchResult(nil), m.results...)
+	if limit > 0 && len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)

@@ -19,6 +19,8 @@ type cliConfig struct {
 	reasoningEffort string
 	apiKey          string
 	apiKeyEnv       string
+	searchProvider  string
+	searchURL       string
 	debug           bool
 	debugDir        string
 	timeout         time.Duration
@@ -42,6 +44,15 @@ func main() {
 		exitWithError(logger, err.Error(), zap.String("env", cfg.apiKeyEnv))
 	}
 
+	httpClient := &http.Client{Timeout: cfg.timeout}
+	searcher, err := codexadapter.NewWebSearcher(codexadapter.WebSearchConfig{
+		Provider: cfg.searchProvider,
+		Endpoint: cfg.searchURL,
+	}, httpClient, logger)
+	if err != nil {
+		exitWithError(logger, "failed to create web search backend", zap.Error(err))
+	}
+
 	var recorder *codexadapter.DebugRecorder
 	if cfg.debug {
 		recorder, err = codexadapter.NewDebugRecorder(cfg.debugDir)
@@ -55,8 +66,9 @@ func main() {
 		Model:           cfg.model,
 		ReasoningEffort: cfg.reasoningEffort,
 		APIKey:          upstreamAPIKey,
+		WebSearcher:     searcher,
 		Debug:           recorder,
-		HTTPClient:      &http.Client{Timeout: cfg.timeout},
+		HTTPClient:      httpClient,
 		Logger:          logger,
 	})
 	if err != nil {
@@ -86,6 +98,8 @@ func parseFlags() cliConfig {
 	flag.StringVar(&cfg.reasoningEffort, "reasoning-effort", "medium", "reasoning_effort value to force into every upstream request")
 	flag.StringVar(&cfg.apiKey, "api-key", "", "upstream provider API key; overrides any Authorization header sent by Codex")
 	flag.StringVar(&cfg.apiKeyEnv, "api-key-env", "", "environment variable containing the upstream provider API key")
+	flag.StringVar(&cfg.searchProvider, "search-provider", "duckduckgo", "local web search backend to use: duckduckgo, duckduckgo-lite, or searxng")
+	flag.StringVar(&cfg.searchURL, "search-url", "", "search backend URL for providers that need one, such as searxng")
 	flag.BoolVar(&cfg.debug, "debug", false, "save all translated requests and responses as ordered JSON files")
 	flag.StringVar(&cfg.debugDir, "debug-dir", "debug", "directory for debug JSON files")
 	flag.DurationVar(&cfg.timeout, "timeout", 10*time.Minute, "upstream request timeout")
@@ -103,6 +117,8 @@ func (c cliConfig) validate() error {
 		return fmt.Errorf("missing required flag: -reasoning-effort")
 	case c.apiKey != "" && c.apiKeyEnv != "":
 		return fmt.Errorf("only one API key source may be set: -api-key or -api-key-env")
+	case strings.EqualFold(strings.TrimSpace(c.searchProvider), "searxng") && strings.TrimSpace(c.searchURL) == "":
+		return fmt.Errorf("missing required flag: -search-url for searxng")
 	default:
 		return nil
 	}

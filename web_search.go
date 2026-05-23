@@ -121,11 +121,16 @@ func (a *Adapter) handleGeneration(
 
 func (a *Adapter) executeWebSearch(ctx context.Context, call *chatToolCall) (string, error) {
 	action := webSearchActionFromArguments(call.Arguments.String())
+	search := a.search
+	if search == nil {
+		search = newDuckDuckGoSearcher(a.client, a.logger)
+	}
 	a.debug.SaveJSON("web search request", map[string]any{
 		"call_id":  call.ID,
 		"name":     call.Name,
 		"action":   action,
 		"raw_args": call.Arguments.String(),
+		"backend":  search.Name(),
 	})
 
 	result, err := a.executeWebSearchAction(ctx, action)
@@ -137,6 +142,7 @@ func (a *Adapter) executeWebSearch(ctx context.Context, call *chatToolCall) (str
 		"name":    call.Name,
 		"action":  action,
 		"result":  result,
+		"backend": search.Name(),
 	})
 	return result, nil
 }
@@ -157,15 +163,25 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 	if len(queries) == 0 {
 		return "", fmt.Errorf("web search query is empty")
 	}
+	queries = expandWebSearchQueries(queries, action)
+	limit := webSearchResultLimit(action)
+	domains := webSearchAllowedDomains(action)
+	search := a.search
+	if search == nil {
+		search = newDuckDuckGoSearcher(a.client, a.logger)
+	}
 
 	var results []searchResult
 	seen := map[string]struct{}{}
 	for _, query := range queries {
-		queryResults, err := a.duckDuckGoSearch(ctx, query, maxWebSearchResults)
+		queryResults, err := search.Search(ctx, query, limit)
 		if err != nil {
 			return "", err
 		}
 		for _, result := range queryResults {
+			if len(domains) > 0 && !searchResultMatchesAllowedDomains(result, domains) {
+				continue
+			}
 			key := result.URL
 			if key == "" {
 				key = result.Title
@@ -178,96 +194,16 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 			}
 			seen[key] = struct{}{}
 			results = append(results, result)
-			if len(results) >= maxWebSearchResults {
+			if len(results) >= limit {
 				break
 			}
 		}
-		if len(results) >= maxWebSearchResults {
+		if len(results) >= limit {
 			break
 		}
 	}
 
 	return formatWebSearchResults(queries, results), nil
-}
-
-func (a *Adapter) duckDuckGoSearch(ctx context.Context, query string, limit int) ([]searchResult, error) {
-	if strings.TrimSpace(query) == "" {
-		return nil, nil
-	}
-	searchURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", webSearchUserAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func(body io.ReadCloser) {
-		if err := body.Close(); err != nil {
-			a.logger.Warn("failed to close search response body", zap.Error(err))
-		}
-	}(resp.Body)
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxWebSearchPageBytes))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("web search returned HTTP %d", resp.StatusCode)
-	}
-
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	var results []searchResult
-	doc.Find(".result").EachWithBreak(func(_ int, s *goquery.Selection) bool {
-		if len(results) >= limit {
-			return false
-		}
-		link := s.Find("a.result__a").First()
-		if link.Length() == 0 {
-			link = s.Find(".result__title a").First()
-		}
-		href, _ := link.Attr("href")
-		title := collapseSearchWhitespace(link.Text())
-		snippet := collapseSearchWhitespace(s.Find(".result__snippet").First().Text())
-		if title == "" && snippet == "" && href == "" {
-			return true
-		}
-		results = append(results, searchResult{
-			Title:   title,
-			URL:     normalizeSearchResultURL(href),
-			Snippet: snippet,
-		})
-		return true
-	})
-
-	if len(results) == 0 {
-		doc.Find("a.result__a").EachWithBreak(func(_ int, s *goquery.Selection) bool {
-			if len(results) >= limit {
-				return false
-			}
-			href, _ := s.Attr("href")
-			title := collapseSearchWhitespace(s.Text())
-			if title == "" && href == "" {
-				return true
-			}
-			results = append(results, searchResult{
-				Title: title,
-				URL:   normalizeSearchResultURL(href),
-			})
-			return true
-		})
-	}
-
-	return results, nil
 }
 
 func (a *Adapter) executeOpenPage(ctx context.Context, rawURL string) (string, error) {
@@ -305,6 +241,9 @@ func (a *Adapter) fetchPageText(ctx context.Context, rawURL string) (string, err
 	if u.Scheme == "" {
 		u.Scheme = "https"
 	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("unsupported page URL scheme %q", u.Scheme)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return "", err
@@ -328,19 +267,12 @@ func (a *Adapter) fetchPageText(ctx context.Context, rawURL string) (string, err
 		return "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("page fetch returned HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("page fetch returned HTTP %d: %s", resp.StatusCode, collapseSearchWhitespace(string(body)))
 	}
-
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	title, text, err := extractPageText(body, resp.Header.Get("Content-Type"), u.String())
 	if err != nil {
 		return "", err
 	}
-	doc.Find("script,style,noscript").Remove()
-
-	title := collapseSearchWhitespace(doc.Find("title").First().Text())
-	text := collapseSearchWhitespace(doc.Find("body").Text())
-	text = limitWebSearchText(text, maxWebSearchExcerptBytes)
-
 	if title == "" {
 		title = u.String()
 	}
@@ -397,6 +329,77 @@ func webSearchQueries(action map[string]any) []string {
 	return dedupeStrings(queries)
 }
 
+func expandWebSearchQueries(queries []string, action map[string]any) []string {
+	domains := webSearchAllowedDomains(action)
+	if len(domains) == 0 {
+		return queries
+	}
+	var out []string
+	for _, query := range queries {
+		out = append(out, query)
+		for _, domain := range domains {
+			out = append(out, fmt.Sprintf("site:%s %s", domain, query))
+		}
+	}
+	return dedupeStrings(out)
+}
+
+func webSearchAllowedDomains(action map[string]any) []string {
+	var domains []string
+	if rawDomains, ok := action["domains"].([]any); ok {
+		for _, raw := range rawDomains {
+			if domain, ok := raw.(string); ok && strings.TrimSpace(domain) != "" {
+				domains = append(domains, strings.TrimSpace(domain))
+			}
+		}
+	}
+	if filters, ok := action["filters"].(map[string]any); ok {
+		if rawDomains, ok := filters["allowed_domains"].([]any); ok {
+			for _, raw := range rawDomains {
+				if domain, ok := raw.(string); ok && strings.TrimSpace(domain) != "" {
+					domains = append(domains, strings.TrimSpace(domain))
+				}
+			}
+		}
+	}
+	return dedupeStrings(domains)
+}
+
+func searchResultMatchesAllowedDomains(result searchResult, domains []string) bool {
+	if len(domains) == 0 {
+		return true
+	}
+	parsed, err := url.Parse(result.URL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host == "" {
+		return false
+	}
+	for _, domain := range domains {
+		domain = strings.ToLower(strings.TrimSpace(domain))
+		if domain == "" {
+			continue
+		}
+		if host == domain || strings.HasSuffix(host, "."+domain) {
+			return true
+		}
+	}
+	return false
+}
+
+func webSearchResultLimit(action map[string]any) int {
+	switch strings.ToLower(strings.TrimSpace(stringField(action, "search_context_size"))) {
+	case "low":
+		return 3
+	case "high":
+		return 8
+	default:
+		return maxWebSearchResults
+	}
+}
+
 func dedupeStrings(values []string) []string {
 	seen := map[string]struct{}{}
 	var out []string
@@ -442,6 +445,40 @@ func formatWebSearchResults(queries []string, results []searchResult) string {
 
 func collapseSearchWhitespace(value string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+}
+
+func extractPageText(body []byte, contentType, fallbackTitle string) (string, string, error) {
+	if !looksLikeHTML(contentType, body) {
+		text := limitWebSearchText(string(body), maxWebSearchExcerptBytes)
+		return fallbackTitle, text, nil
+	}
+
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return "", "", err
+	}
+	doc.Find("script,style,noscript").Remove()
+
+	title := collapseSearchWhitespace(doc.Find("title").First().Text())
+	bodySelection := doc.Find("main,article,body").First()
+	text := ""
+	if bodySelection.Length() > 0 {
+		text = collapseSearchWhitespace(bodySelection.Text())
+	}
+	if text == "" {
+		text = collapseSearchWhitespace(doc.Text())
+	}
+	text = limitWebSearchText(text, maxWebSearchExcerptBytes)
+	return title, text, nil
+}
+
+func looksLikeHTML(contentType string, body []byte) bool {
+	contentType = strings.ToLower(contentType)
+	if strings.Contains(contentType, "html") || strings.Contains(contentType, "xml") {
+		return true
+	}
+	trimmed := bytes.TrimSpace(body)
+	return len(trimmed) > 0 && len(trimmed) < maxWebSearchPageBytes && trimmed[0] == '<'
 }
 
 func normalizeSearchResultURL(raw string) string {
