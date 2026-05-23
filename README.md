@@ -17,6 +17,16 @@ go run . \
 
 Then point Codex at `http://127.0.0.1:8080/v1` as its provider base URL.
 
+```toml
+model_provider = "codex-adapter"
+
+[model_providers.codex-adapter]
+name = "codex-adapter"
+base_url = "http://127.0.0.1:8080/v1"
+wire_api = "responses"
+supports_websockets = false
+```
+
 Options:
 
 - `-listen`: local listening address for Responses API requests.
