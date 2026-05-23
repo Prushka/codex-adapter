@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	maxWebSearchFollowUps    = 3
-	maxWebSearchResults      = 5
-	maxWebSearchPageBytes    = 2 << 20
-	maxWebSearchExcerptBytes = 6 << 10
+	maxWebSearchFollowUps    = 50
+	maxWebSearchResults      = 30
+	maxWebSearchPageBytes    = 2 << 24
+	maxWebSearchExcerptBytes = 6 << 16
 )
 
 type searchResult struct {
