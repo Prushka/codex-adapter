@@ -18,6 +18,11 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	maxUpstreamErrorBodyLogBytes = 16 << 10
+	maxUpstreamErrorMessageBytes = 4 << 10
+)
+
 type AdapterConfig struct {
 	ProviderURL     string
 	Model           string
@@ -176,12 +181,11 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(upstream.Body, 4<<20))
 		a.debug.SaveRawJSON("upstream chat error", raw)
+		errInfo := newUpstreamErrorInfo(upstream.StatusCode, upstream.Header, raw)
 		a.logger.Warn("upstream chat request failed",
-			zap.String("response_id", respID),
-			zap.String("upstream_url", a.chatURL),
-			zap.Int("status", upstream.StatusCode),
+			errInfo.logFields(respID, a.chatURL)...,
 		)
-		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "upstream_http_error", upstreamErrorMessage(upstream.StatusCode, raw)))
+		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "upstream_http_error", errInfo.message))
 		return
 	}
 
@@ -261,11 +265,11 @@ func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
 	}
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		a.debug.SaveRawJSON("upstream compact chat error", raw)
+		errInfo := newUpstreamErrorInfo(upstream.StatusCode, upstream.Header, raw)
 		a.logger.Warn("upstream compact chat request failed",
-			zap.String("upstream_url", a.chatURL),
-			zap.Int("status", upstream.StatusCode),
+			errInfo.logFields("", a.chatURL)...,
 		)
-		writeJSONError(w, http.StatusBadGateway, "upstream_http_error", upstreamErrorMessage(upstream.StatusCode, raw))
+		writeJSONError(w, http.StatusBadGateway, "upstream_http_error", errInfo.message)
 		return
 	}
 	a.debug.SaveRawJSON("upstream compact chat response", raw)
@@ -340,18 +344,6 @@ func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]
 	if v, ok := req["parallel_tool_calls"].(bool); ok {
 		chatReq["parallel_tool_calls"] = v
 	}
-	if v, ok := req["service_tier"].(string); ok && v != "" {
-		chatReq["service_tier"] = v
-	}
-	if v, ok := req["store"].(bool); ok {
-		chatReq["store"] = v
-	}
-	if v, ok := req["prompt_cache_key"].(string); ok && v != "" {
-		chatReq["prompt_cache_key"] = v
-	}
-	if metadata := metadataFromAny(req["client_metadata"]); len(metadata) > 0 {
-		chatReq["metadata"] = metadata
-	}
 	if responseFormat, ok := translateResponseFormat(req["text"]); ok {
 		chatReq["response_format"] = responseFormat
 	}
@@ -399,12 +391,149 @@ func failedResponse(respID, typ, code, message string) map[string]any {
 	}
 }
 
+type upstreamErrorInfo struct {
+	status         int
+	message        string
+	rawBody        string
+	bodyTruncated  bool
+	contentType    string
+	requestID      string
+	organizationID string
+}
+
+func newUpstreamErrorInfo(status int, header http.Header, raw []byte) upstreamErrorInfo {
+	body, truncated := truncateString(strings.TrimSpace(string(raw)), maxUpstreamErrorBodyLogBytes)
+	message := upstreamErrorMessage(status, raw)
+	contentType := header.Get("Content-Type")
+	return upstreamErrorInfo{
+		status:         status,
+		message:        message,
+		rawBody:        body,
+		bodyTruncated:  truncated,
+		contentType:    contentType,
+		requestID:      firstHeaderValue(header, "x-request-id", "x-goog-request-id", "request-id"),
+		organizationID: firstHeaderValue(header, "openai-organization", "x-organization-id"),
+	}
+}
+
+func (e upstreamErrorInfo) logFields(responseID, upstreamURL string) []zap.Field {
+	fields := []zap.Field{
+		zap.String("upstream_url", upstreamURL),
+		zap.Int("status", e.status),
+		zap.String("upstream_error", e.message),
+	}
+	if responseID != "" {
+		fields = append(fields, zap.String("response_id", responseID))
+	}
+	if e.contentType != "" {
+		fields = append(fields, zap.String("content_type", e.contentType))
+	}
+	if e.requestID != "" {
+		fields = append(fields, zap.String("upstream_request_id", e.requestID))
+	}
+	if e.organizationID != "" {
+		fields = append(fields, zap.String("upstream_organization_id", e.organizationID))
+	}
+	if e.rawBody != "" {
+		fields = append(fields,
+			zap.String("upstream_response_body", e.rawBody),
+			zap.Bool("upstream_response_body_truncated", e.bodyTruncated),
+		)
+	}
+	return fields
+}
+
 func upstreamErrorMessage(status int, raw []byte) string {
-	msg := strings.TrimSpace(string(raw))
+	msg := extractUpstreamErrorMessage(raw)
 	if msg == "" {
 		return fmt.Sprintf("upstream returned HTTP %d", status)
 	}
+	msg, truncated := truncateString(msg, maxUpstreamErrorMessageBytes)
+	if truncated {
+		msg += "..."
+	}
 	return fmt.Sprintf("upstream returned HTTP %d: %s", status, msg)
+}
+
+func extractUpstreamErrorMessage(raw []byte) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return string(raw)
+	}
+	msg := messageFromJSON(value)
+	if msg != "" {
+		return msg
+	}
+	return string(raw)
+}
+
+func messageFromJSON(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		var parts []string
+		for _, item := range v {
+			if part := messageFromJSON(item); part != "" {
+				parts = append(parts, part)
+			}
+		}
+		return strings.Join(parts, "; ")
+	case map[string]any:
+		for _, key := range []string{"message", "detail", "error_description"} {
+			if msg := messageFromJSON(v[key]); msg != "" {
+				return msg
+			}
+		}
+		if errValue, ok := v["error"]; ok {
+			if msg := messageFromJSON(errValue); msg != "" {
+				return msg
+			}
+		}
+		var parts []string
+		for _, key := range []string{"type", "code", "status"} {
+			if part := scalarString(v[key]); part != "" {
+				parts = append(parts, key+"="+part)
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		return scalarString(v)
+	}
+}
+
+func scalarString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case float64, bool:
+		return fmt.Sprint(v)
+	default:
+		return ""
+	}
+}
+
+func firstHeaderValue(header http.Header, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func truncateString(value string, limit int) (string, bool) {
+	if limit <= 0 || len(value) <= limit {
+		return value, false
+	}
+	return value[:limit], true
 }
 
 func normalizeChatCompletionsURL(raw string) (string, error) {
@@ -1902,29 +2031,6 @@ func stringField(m map[string]any, key string) string {
 		return s
 	}
 	return ""
-}
-
-func metadataFromAny(value any) map[string]string {
-	m, ok := value.(map[string]any)
-	if !ok {
-		return nil
-	}
-	out := make(map[string]string, len(m))
-	for key, raw := range m {
-		switch v := raw.(type) {
-		case string:
-			out[key] = v
-		case fmt.Stringer:
-			out[key] = v.String()
-		case float64:
-			out[key] = strconv.FormatFloat(v, 'f', -1, 64)
-		case bool:
-			out[key] = strconv.FormatBool(v)
-		default:
-			out[key] = compactJSONString(v)
-		}
-	}
-	return out
 }
 
 func firstString(m map[string]any, keys ...string) string {

@@ -11,6 +11,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestBuildChatRequestForcesModelReasoningAndMessages(t *testing.T) {
@@ -56,12 +59,10 @@ func TestBuildChatRequestForcesModelReasoningAndMessages(t *testing.T) {
 	if messages[1]["role"] != "user" || messages[1]["content"] != "Hello" {
 		t.Fatalf("bad user message: %#v", messages[1])
 	}
-	if chatReq["prompt_cache_key"] != "cache-123" {
-		t.Fatalf("prompt_cache_key = %v", chatReq["prompt_cache_key"])
-	}
-	metadata := chatReq["metadata"].(map[string]string)
-	if metadata["session"] != "s-1" || metadata["attempt"] != "2" {
-		t.Fatalf("metadata = %#v", metadata)
+	for _, key := range []string{"metadata", "prompt_cache_key", "store", "service_tier"} {
+		if _, ok := chatReq[key]; ok {
+			t.Fatalf("nonessential provider compatibility field %q was forwarded: %#v", key, chatReq[key])
+		}
 	}
 }
 
@@ -117,6 +118,54 @@ func TestPostChatConfiguredAPIKeyOverridesInboundAuthorization(t *testing.T) {
 
 	if got := <-authCh; got != "Bearer upstream-key" {
 		t.Fatalf("authorization = %q", got)
+	}
+}
+
+func TestUpstreamHTTPErrorIncludesProviderDetailsInLogsAndResponse(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("X-Goog-Request-Id", "goog-req-123")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}`))
+	}))
+	defer upstream.Close()
+
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:     upstream.URL,
+		Model:           "forced-model",
+		ReasoningEffort: "low",
+		HTTPClient:      http.DefaultClient,
+		Logger:          zap.New(core),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := callResponses(t, adapter, responsesRequestWithTools(nil))
+	failed := firstResponseEvent(t, events, "response.failed")
+	response := failed["response"].(map[string]any)
+	respErr := response["error"].(map[string]any)
+	if got := respErr["message"].(string); !strings.Contains(got, "API key not valid") {
+		t.Fatalf("failed response message = %q", got)
+	}
+
+	entries := logs.FilterMessage("upstream chat request failed").All()
+	if len(entries) != 1 {
+		t.Fatalf("log entries = %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["status"] != int64(400) && fields["status"] != 400 {
+		t.Fatalf("status field = %#v", fields["status"])
+	}
+	if got := fields["upstream_error"].(string); !strings.Contains(got, "API key not valid") {
+		t.Fatalf("upstream_error = %q", got)
+	}
+	if got := fields["upstream_response_body"].(string); !strings.Contains(got, "INVALID_ARGUMENT") {
+		t.Fatalf("upstream_response_body = %q", got)
+	}
+	if fields["upstream_request_id"] != "goog-req-123" {
+		t.Fatalf("upstream_request_id = %#v", fields["upstream_request_id"])
 	}
 }
 
@@ -705,6 +754,17 @@ func firstDoneItem(t *testing.T, events []map[string]any, typ string) map[string
 		}
 	}
 	t.Fatalf("missing done item type %s in %#v", typ, events)
+	return nil
+}
+
+func firstResponseEvent(t *testing.T, events []map[string]any, typ string) map[string]any {
+	t.Helper()
+	for _, event := range events {
+		if event["type"] == typ {
+			return event
+		}
+	}
+	t.Fatalf("missing response event type %s in %#v", typ, events)
 	return nil
 }
 
