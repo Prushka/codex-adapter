@@ -74,7 +74,7 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 	}
 	search := cfg.WebSearcher
 	if search == nil {
-		search = newDuckDuckGoSearcher(client, logger)
+		search = newGenericWebSearcher(client, logger, false)
 	}
 	return &Adapter{
 		chatURL:         chatURL,

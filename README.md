@@ -35,7 +35,7 @@ Options:
 - `-reasoning-effort`: `reasoning_effort` forced into every upstream request.
 - `-api-key-env`: environment variable containing the upstream provider API key. When set, the adapter overwrites Codex's inbound `Authorization` header before forwarding upstream.
 - `-api-key`: upstream provider API key supplied directly on the command line. Prefer `-api-key-env` for shell history/process-list hygiene. Mutually exclusive with `-api-key-env`.
-- `-search-provider`: local web search backend, default `duckduckgo`. Use `searxng` to point the adapter at a SearXNG instance.
+- `-search-provider`: local web search backend, default `duckduckgo`. Accepted values are `auto`, `duckduckgo`, `duckduckgo-lite`, `bing`, `yahoo`, and `searxng`. The default path is generic web search: DuckDuckGo first, then Bing and Yahoo fallbacks if the primary backend is blocked or returns no parseable results.
 - `-search-url`: backend URL for providers that need one, such as `searxng`.
 - `-debug`: writes ordered JSON debug files for inbound requests, upstream requests/responses, and outbound Responses events.
 - `-debug-dir`: debug output directory, default `debug`.
@@ -65,7 +65,8 @@ If neither `-api-key-env` nor `-api-key` is set, the adapter forwards the `Autho
 - `tool_search` is exposed as a synthetic chat function and reconstructed as a client-executed `tool_search_call`.
 - `web_search` and `image_generation` are exposed as synthetic functions because Chat Completions has no standard equivalent for Responses hosted tools. The adapter reconstructs the corresponding Responses items if the upstream model calls them.
 - `web_search` falls back to a local search-and-fetch follow-up when the upstream provider stops at a chat-completions tool call, so Codex still receives a completed Responses turn.
-- The default local search backend is DuckDuckGo HTML. SearXNG is supported as an alternative backend if you want to route searches through other engines.
+- The default local search backend is a generic HTML search chain. It tries DuckDuckGo, then Bing, then Yahoo, with redirect URL normalization for those providers so domain filters still work. There is no finance-specific search path.
+- SearXNG is supported as an alternative backend if you want to route searches through other engines.
 - Gemini/OpenAI compatibility metadata such as `tool_calls[].extra_content.google.thought_signature` is preserved on Responses tool-call items and cached by `call_id` so follow-up tool-result requests can send it back upstream.
 - The adapter itself stays stateless across Responses turns. Codex sends the full input for each turn on this wire path, so `previous_response_id` is not required here.
 - Streaming chat chunks are accumulated and emitted as Responses SSE events ending with `response.completed`, which Codex requires.

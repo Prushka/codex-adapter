@@ -98,7 +98,7 @@ func parseFlags() cliConfig {
 	flag.StringVar(&cfg.reasoningEffort, "reasoning-effort", "medium", "reasoning_effort value to force into every upstream request")
 	flag.StringVar(&cfg.apiKey, "api-key", "", "upstream provider API key; overrides any Authorization header sent by Codex")
 	flag.StringVar(&cfg.apiKeyEnv, "api-key-env", "", "environment variable containing the upstream provider API key")
-	flag.StringVar(&cfg.searchProvider, "search-provider", "duckduckgo", "local web search backend to use: duckduckgo, duckduckgo-lite, or searxng")
+	flag.StringVar(&cfg.searchProvider, "search-provider", "duckduckgo", "local web search backend to use: auto, duckduckgo, duckduckgo-lite, bing, yahoo, or searxng")
 	flag.StringVar(&cfg.searchURL, "search-url", "", "search backend URL for providers that need one, such as searxng")
 	flag.BoolVar(&cfg.debug, "debug", false, "save all translated requests and responses as ordered JSON files")
 	flag.StringVar(&cfg.debugDir, "debug-dir", "debug", "directory for debug JSON files")

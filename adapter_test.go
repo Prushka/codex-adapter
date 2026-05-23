@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -768,6 +769,61 @@ func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 	}
 }
 
+func TestWebSearchBackendErrorBecomesToolContent(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := upstreamHits.Add(1)
+		switch hit {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-web\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"generic query\\\"}\"}}]}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			messages := req["messages"].([]any)
+			toolMsg := messages[len(messages)-1].(map[string]any)
+			if toolMsg["role"] != "tool" {
+				t.Fatalf("follow-up tool message = %#v", toolMsg)
+			}
+			content := toolMsg["content"].(string)
+			if !strings.Contains(content, "Search backend errors") || !strings.Contains(content, "backend offline") {
+				t.Fatalf("tool content = %q", content)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"I could not retrieve search results.\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected upstream hit %d", hit)
+		}
+	}))
+	defer upstream.Close()
+
+	searcher := &mockWebSearcher{err: errors.New("backend offline")}
+	adapter := testAdapterWithClientAndSearcher(t, upstream.URL, nil, http.DefaultClient, searcher)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":                "web_search",
+			"external_web_access": true,
+		},
+	})
+
+	events := callResponses(t, adapter, body)
+	message := firstDoneItem(t, events, "message")
+	content := message["content"].([]any)
+	if got := content[0].(map[string]any)["text"].(string); !strings.Contains(got, "could not retrieve") {
+		t.Fatalf("final assistant text = %q", got)
+	}
+	assertCompleted(t, events)
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("upstream hits = %d", upstreamHits.Load())
+	}
+}
+
 func TestDuckDuckGoSearchBackendParsesLiteHTML(t *testing.T) {
 	duckHTML := `<!doctype html>
 <html>
@@ -810,6 +866,158 @@ func TestDuckDuckGoSearchBackendParsesLiteHTML(t *testing.T) {
 	}
 	if !strings.Contains(results[0].Snippet, "TSLA trading near $123.45") {
 		t.Fatalf("result snippet = %q", results[0].Snippet)
+	}
+}
+
+func TestBingSearchBackendParsesHTMLResults(t *testing.T) {
+	bingHTML := `<!doctype html>
+<html>
+  <body>
+    <ol id="b_results">
+      <li class="b_algo">
+        <h2><a href="https://www.bing.com/ck/a?!&amp;u=a1aHR0cHM6Ly9jb2RlLnZpc3VhbHN0dWRpby5jb20v&amp;ntb=1">Visual Studio Code</a></h2>
+        <div class="b_caption"><p>A lightweight source code editor for building software.</p></div>
+      </li>
+    </ol>
+  </body>
+</html>`
+
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Host, "bing.com") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body:       io.NopCloser(strings.NewReader(bingHTML)),
+				}, nil
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		}),
+	}
+
+	searcher := newBingSearcher(client, zap.NewNop())
+	results, err := searcher.Search(context.Background(), "open source code editor", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %#v", results)
+	}
+	if results[0].URL != "https://code.visualstudio.com/" {
+		t.Fatalf("result url = %q", results[0].URL)
+	}
+	if !strings.Contains(results[0].Snippet, "source code editor") {
+		t.Fatalf("result snippet = %q", results[0].Snippet)
+	}
+}
+
+func TestYahooSearchBackendParsesHTMLResults(t *testing.T) {
+	yahooHTML := `<!doctype html>
+<html>
+  <body>
+    <div id="web">
+      <ol class="reg searchCenterMiddle">
+        <li>
+          <div class="dd algo algo-sr">
+            <div class="compTitle">
+              <a href="https://r.search.yahoo.com/_ylt=abc/RU=https%3a%2f%2fcode.visualstudio.com%2f/RK=2/RS=def">
+                <h3 class="title"><span>Visual Studio Code - Code Editing</span></h3>
+              </a>
+            </div>
+            <div class="compText"><p>AI-powered editing and completions in one code editor.</p></div>
+          </div>
+        </li>
+      </ol>
+    </div>
+  </body>
+</html>`
+
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Host, "yahoo.com") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body:       io.NopCloser(strings.NewReader(yahooHTML)),
+				}, nil
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		}),
+	}
+
+	searcher := newYahooSearcher(client, zap.NewNop())
+	results, err := searcher.Search(context.Background(), "open source code editor", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %#v", results)
+	}
+	if results[0].URL != "https://code.visualstudio.com/" {
+		t.Fatalf("result url = %q", results[0].URL)
+	}
+	if !strings.Contains(results[0].Snippet, "AI-powered editing") {
+		t.Fatalf("result snippet = %q", results[0].Snippet)
+	}
+}
+
+func TestDefaultSearchBackendFallsBackAfterChallenge(t *testing.T) {
+	bingHTML := `<!doctype html>
+<html><body><ol id="b_results"><li class="b_algo"><h2><a href="https://www.bing.com/ck/a?!&amp;u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9yZXN1bHQ=&amp;ntb=1">Generic result</a></h2><div class="b_caption"><p>Recovered from the fallback backend.</p></div></li></ol></body></html>`
+	challengeHTML := `<!doctype html><html><body>Verify you are human. CAPTCHA required.</body></html>`
+
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case strings.Contains(req.URL.Host, "duckduckgo.com"):
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body:       io.NopCloser(strings.NewReader(challengeHTML)),
+				}, nil
+			case strings.Contains(req.URL.Host, "bing.com"):
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body:       io.NopCloser(strings.NewReader(bingHTML)),
+				}, nil
+			case strings.Contains(req.URL.Host, "yahoo.com"):
+				t.Fatalf("yahoo should not be called after bing succeeds")
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		}),
+	}
+
+	searcher, err := NewWebSearcher(WebSearchConfig{Provider: "duckduckgo"}, client, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := searcher.Search(context.Background(), "generic query", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %#v", results)
+	}
+	if results[0].URL != "https://example.com/result" {
+		t.Fatalf("result url = %q", results[0].URL)
+	}
+}
+
+func TestNormalizeSearchResultURLDecodesSearchRedirects(t *testing.T) {
+	cases := map[string]string{
+		"https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fduck":                      "https://example.com/duck",
+		"https://www.bing.com/ck/a?!&u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9iaW5n&ntb=1":               "https://example.com/bing",
+		"https://r.search.yahoo.com/_ylt=abc/RU=https%3a%2f%2fexample.com%2fyahoo/RK=2/RS=def": "https://example.com/yahoo",
+	}
+	for raw, want := range cases {
+		if got := normalizeSearchResultURL(raw); got != want {
+			t.Fatalf("normalizeSearchResultURL(%q) = %q, want %q", raw, got, want)
+		}
 	}
 }
 
@@ -957,6 +1165,7 @@ func testAdapterWithClientAndSearcher(t *testing.T, providerURL string, debug *D
 type mockWebSearcher struct {
 	results []searchResult
 	queries []string
+	err     error
 }
 
 func (m *mockWebSearcher) Name() string {
@@ -965,6 +1174,9 @@ func (m *mockWebSearcher) Name() string {
 
 func (m *mockWebSearcher) Search(_ context.Context, query string, limit int) ([]searchResult, error) {
 	m.queries = append(m.queries, query)
+	if m.err != nil {
+		return nil, m.err
+	}
 	results := append([]searchResult(nil), m.results...)
 	if limit > 0 && len(results) > limit {
 		results = results[:limit]

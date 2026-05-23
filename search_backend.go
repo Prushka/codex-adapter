@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,10 +33,14 @@ func NewWebSearcher(cfg WebSearchConfig, client *http.Client, logger *zap.Logger
 	}
 
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
-	case "", "duckduckgo":
-		return &duckDuckGoSearcher{client: client, logger: logger}, nil
+	case "", "auto", "duckduckgo":
+		return newGenericWebSearcher(client, logger, false), nil
 	case "duckduckgo-lite":
-		return &duckDuckGoSearcher{client: client, logger: logger, liteOnly: true}, nil
+		return newGenericWebSearcher(client, logger, true), nil
+	case "bing":
+		return newBingSearcher(client, logger), nil
+	case "yahoo":
+		return newYahooSearcher(client, logger), nil
 	case "searxng":
 		endpoint := strings.TrimSpace(cfg.Endpoint)
 		if endpoint == "" {
@@ -56,14 +59,14 @@ type duckDuckGoSearcher struct {
 	endpoints []string
 }
 
-func newDuckDuckGoSearcher(client *http.Client, logger *zap.Logger) WebSearcher {
+func newDuckDuckGoSearcher(client *http.Client, logger *zap.Logger, liteOnly ...bool) WebSearcher {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
 	}
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &duckDuckGoSearcher{
+	searcher := &duckDuckGoSearcher{
 		client: client,
 		logger: logger,
 		endpoints: []string{
@@ -72,9 +75,16 @@ func newDuckDuckGoSearcher(client *http.Client, logger *zap.Logger) WebSearcher 
 			"https://lite.duckduckgo.com/lite/?q=",
 		},
 	}
+	if len(liteOnly) > 0 {
+		searcher.liteOnly = liteOnly[0]
+	}
+	return searcher
 }
 
 func (s *duckDuckGoSearcher) Name() string {
+	if s.liteOnly {
+		return "duckduckgo-lite"
+	}
 	return "duckduckgo"
 }
 
@@ -113,6 +123,11 @@ func (s *duckDuckGoSearcher) searchEndpoint(ctx context.Context, endpoint, query
 	if err != nil {
 		return nil, err
 	}
+	if len(results) == 0 {
+		if challenge := searchChallengeError(s.Name(), body); challenge != nil {
+			return nil, challenge
+		}
+	}
 	return results, nil
 }
 
@@ -130,7 +145,7 @@ func (s *duckDuckGoSearcher) fetch(ctx context.Context, rawURL string) ([]byte, 
 		return nil, "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("duckduckgo search returned HTTP %d: %s", resp.StatusCode, collapseSearchWhitespace(string(body)))
+		return nil, "", searchHTTPError(s.Name(), resp, body)
 	}
 	return body, resp.Header.Get("Content-Type"), nil
 }
@@ -173,7 +188,7 @@ func (s *searxngSearcher) Search(ctx context.Context, query string, limit int) (
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("searxng search returned HTTP %d: %s", resp.StatusCode, collapseSearchWhitespace(string(body)))
+		return nil, searchHTTPError("searxng", resp, body)
 	}
 
 	var parsed struct {
@@ -281,102 +296,11 @@ func sleepBackoff(ctx context.Context, attempt int) {
 }
 
 func parseHTMLSearchResults(body []byte, contentType string, limit int) ([]searchResult, error) {
-	if !looksLikeHTML(contentType, body) {
-		return nil, fmt.Errorf("unexpected search response content type %q", contentType)
-	}
-	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	return extractHTMLSearchResults(doc, limit), nil
+	return parseHTMLSearchResultsWithPatterns(body, contentType, limit, duckDuckGoSearchPatterns())
 }
 
 func extractHTMLSearchResults(doc *goquery.Document, limit int) []searchResult {
-	type pattern struct {
-		root    string
-		link    []string
-		snippet []string
-	}
-	patterns := []pattern{
-		{
-			root:    ".result",
-			link:    []string{"a.result__a", "a[data-testid='result-title-a']", "a.result-link"},
-			snippet: []string{".result__snippet", "[data-testid='result-snippet']", ".result-snippet"},
-		},
-		{
-			root:    "div[data-testid='result']",
-			link:    []string{"a[data-testid='result-title-a']", "a.result-link", "a"},
-			snippet: []string{"[data-testid='result-snippet']", ".result-snippet"},
-		},
-		{
-			root:    "li.result",
-			link:    []string{"a.result__a", "a.result-link", "a"},
-			snippet: []string{".result__snippet", ".result-snippet"},
-		},
-	}
-
-	var results []searchResult
-	seen := map[string]struct{}{}
-	appendResult := func(title, href, snippet string) {
-		title = collapseSearchWhitespace(title)
-		href = normalizeSearchResultURL(href)
-		snippet = collapseSearchWhitespace(snippet)
-		key := strings.ToLower(strings.TrimSpace(href))
-		if key == "" {
-			key = strings.ToLower(strings.TrimSpace(title))
-		}
-		if key == "" {
-			return
-		}
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		results = append(results, searchResult{Title: title, URL: href, Snippet: snippet})
-	}
-
-	for _, pattern := range patterns {
-		if len(results) >= limit {
-			break
-		}
-		doc.Find(pattern.root).EachWithBreak(func(_ int, selection *goquery.Selection) bool {
-			if len(results) >= limit {
-				return false
-			}
-			link := firstMatchingSelection(selection, pattern.link...)
-			if link == nil {
-				return true
-			}
-			href, _ := link.Attr("href")
-			title := link.Text()
-			snippet := firstMatchingText(selection, pattern.snippet...)
-			if snippet == "" {
-				snippet = collapseSearchWhitespace(selection.Text())
-			}
-			appendResult(title, href, snippet)
-			return true
-		})
-	}
-
-	if len(results) == 0 {
-		doc.Find("a[href]").EachWithBreak(func(_ int, selection *goquery.Selection) bool {
-			if len(results) >= limit {
-				return false
-			}
-			href, _ := selection.Attr("href")
-			title := collapseSearchWhitespace(selection.Text())
-			if title == "" && href == "" {
-				return true
-			}
-			appendResult(title, href, "")
-			return true
-		})
-	}
-
-	if len(results) > limit {
-		results = results[:limit]
-	}
-	return results
+	return extractSearchResults(doc, limit, duckDuckGoSearchPatterns())
 }
 
 func firstMatchingSelection(selection *goquery.Selection, selectors ...string) *goquery.Selection {

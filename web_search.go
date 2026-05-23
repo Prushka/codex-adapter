@@ -123,7 +123,7 @@ func (a *Adapter) executeWebSearch(ctx context.Context, call *chatToolCall) (str
 	action := webSearchActionFromArguments(call.Arguments.String())
 	search := a.search
 	if search == nil {
-		search = newDuckDuckGoSearcher(a.client, a.logger)
+		search = newGenericWebSearcher(a.client, a.logger, false)
 	}
 	a.debug.SaveJSON("web search request", map[string]any{
 		"call_id":  call.ID,
@@ -168,15 +168,31 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 	domains := webSearchAllowedDomains(action)
 	search := a.search
 	if search == nil {
-		search = newDuckDuckGoSearcher(a.client, a.logger)
+		search = newGenericWebSearcher(a.client, a.logger, false)
 	}
 
 	var results []searchResult
+	var searchErrors []string
 	seen := map[string]struct{}{}
 	for _, query := range queries {
 		queryResults, err := search.Search(ctx, query, limit)
 		if err != nil {
-			return "", err
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			msg := limitWebSearchText(err.Error(), 1200)
+			searchErrors = append(searchErrors, fmt.Sprintf("%q: %s", query, msg))
+			a.debug.SaveJSON("web search backend error", map[string]any{
+				"query":   query,
+				"backend": search.Name(),
+				"error":   msg,
+			})
+			a.logger.Warn("web search backend failed",
+				zap.String("backend", search.Name()),
+				zap.String("query", query),
+				zap.Error(err),
+			)
+			continue
 		}
 		for _, result := range queryResults {
 			if len(domains) > 0 && !searchResultMatchesAllowedDomains(result, domains) {
@@ -203,6 +219,9 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 		}
 	}
 
+	if len(results) == 0 && len(searchErrors) > 0 {
+		return formatWebSearchFailure(queries, searchErrors), nil
+	}
 	return formatWebSearchResults(queries, results), nil
 }
 
@@ -443,6 +462,20 @@ func formatWebSearchResults(queries []string, results []searchResult) string {
 	return strings.TrimSpace(b.String())
 }
 
+func formatWebSearchFailure(queries []string, errs []string) string {
+	var b strings.Builder
+	b.WriteString(formatWebSearchResults(queries, nil))
+	if len(errs) == 0 {
+		return b.String()
+	}
+	b.WriteString("\n\nSearch backend errors:")
+	for _, errText := range errs {
+		b.WriteString("\n- ")
+		b.WriteString(limitWebSearchText(errText, 1200))
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func collapseSearchWhitespace(value string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
 }
@@ -479,30 +512,6 @@ func looksLikeHTML(contentType string, body []byte) bool {
 	}
 	trimmed := bytes.TrimSpace(body)
 	return len(trimmed) > 0 && len(trimmed) < maxWebSearchPageBytes && trimmed[0] == '<'
-}
-
-func normalizeSearchResultURL(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if strings.HasPrefix(raw, "//") {
-		raw = "https:" + raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	if q := u.Query().Get("uddg"); q != "" {
-		if decoded, err := url.QueryUnescape(q); err == nil && decoded != "" {
-			return decoded
-		}
-		return q
-	}
-	if u.Scheme == "" && u.Host == "" {
-		return raw
-	}
-	return u.String()
 }
 
 func limitWebSearchText(text string, limit int) string {
