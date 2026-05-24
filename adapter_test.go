@@ -1234,6 +1234,128 @@ func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 	}
 }
 
+func TestWebSearchCallWithAssistantTextStillTriggersFollowUp(t *testing.T) {
+	pageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <head><title>TSLA quote</title></head>
+  <body>
+    <main>TSLA trading near $123.45 with live quote data.</main>
+  </body>
+</html>`))
+	}))
+	defer pageServer.Close()
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := upstreamHits.Add(1)
+		switch hit {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+				"choices": []any{
+					map[string]any{
+						"delta": map[string]any{
+							"role":    "assistant",
+							"content": "The search returned links but no live price in the snippets. Let me open one of the pages directly.",
+							"tool_calls": []any{
+								map[string]any{
+									"index": 0,
+									"id":    "call-open",
+									"type":  "function",
+									"function": map[string]any{
+										"name": "web_search",
+										"arguments": mustJSON(map[string]any{
+											"action": "open_page",
+											"url":    pageServer.URL + "/quote",
+										}),
+									},
+								},
+							},
+						},
+					},
+				},
+			}) + "\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			messages := req["messages"].([]any)
+			if len(messages) < 3 {
+				t.Fatalf("follow-up messages = %#v", messages)
+			}
+			toolMsg := messages[len(messages)-1].(map[string]any)
+			if toolMsg["role"] != "tool" {
+				t.Fatalf("follow-up tool message = %#v", toolMsg)
+			}
+			if got := toolMsg["content"].(string); !strings.Contains(got, "TSLA trading near $123.45") {
+				t.Fatalf("follow-up tool content = %q", got)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Tesla is trading near $123.45.\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":12,\"total_tokens\":22}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected upstream hit %d", hit)
+		}
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":                 "web_search",
+			"external_web_access":  true,
+			"search_context_size":  "medium",
+			"search_content_types": []any{"webpage"},
+		},
+	})
+	body["input"] = []any{
+		map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "What's tesla's stock price?"},
+			},
+		},
+	}
+
+	events := callResponses(t, adapter, body)
+	item := firstDoneItem(t, events, "web_search_call")
+	if item["status"] != "completed" {
+		t.Fatalf("web search status = %v", item["status"])
+	}
+	action := item["action"].(map[string]any)
+	if action["type"] != "open_page" || !strings.Contains(action["url"].(string), "/quote") {
+		t.Fatalf("bad web search action: %#v", action)
+	}
+	var messages []map[string]any
+	for _, event := range events {
+		if event["type"] != "response.output_item.done" {
+			continue
+		}
+		item := event["item"].(map[string]any)
+		if item["type"] == "message" {
+			messages = append(messages, item)
+		}
+	}
+	if len(messages) != 2 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	final := messages[1]["content"].([]any)
+	if got := final[0].(map[string]any)["text"].(string); !strings.Contains(got, "Tesla is trading near $123.45.") {
+		t.Fatalf("final assistant text = %q", got)
+	}
+	assertCompleted(t, events)
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("upstream hits = %d", upstreamHits.Load())
+	}
+}
+
 func TestWebSearchBackendErrorBecomesToolContent(t *testing.T) {
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

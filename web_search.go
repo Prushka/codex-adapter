@@ -30,9 +30,6 @@ func (g *chatGeneration) singleWebSearchCall() *chatToolCall {
 	if len(g.tools) != 1 {
 		return nil
 	}
-	if g.message != nil && g.message.text.Len() > 0 {
-		return nil
-	}
 	for _, call := range g.tools {
 		if call == nil {
 			return nil
