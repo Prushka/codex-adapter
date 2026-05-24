@@ -665,6 +665,7 @@ type requestBuilder struct {
 	byChat             map[string]toolMapping
 	byKey              map[string]toolMapping
 	extraTools         []any
+	pendingImageMsgs   []map[string]any
 	renderedCallIDs    map[string]bool
 	lookupExtraContent func(callID string) any
 }
@@ -952,13 +953,19 @@ func (b *requestBuilder) translateInput(req map[string]any) []map[string]any {
 		for _, value := range input {
 			item, ok := value.(map[string]any)
 			if !ok {
+				messages = append(messages, b.flushPendingImageMessages()...)
 				messages = append(messages, markerMessage(value))
 				continue
 			}
+			if !isToolOutputItem(item) {
+				messages = append(messages, b.flushPendingImageMessages()...)
+			}
 			messages = append(messages, b.itemToMessages(item)...)
 		}
+		messages = append(messages, b.flushPendingImageMessages()...)
 	case nil:
 	default:
+		messages = append(messages, b.flushPendingImageMessages()...)
 		messages = append(messages, markerMessage(input))
 	}
 	return messages
@@ -1021,11 +1028,9 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 		if !b.renderedCallIDs[callID] {
 			return []map[string]any{markerMessage(item)}
 		}
-		return []map[string]any{{
-			"role":         "tool",
-			"tool_call_id": callID,
-			"content":      toolOutputToText(item["output"]),
-		}}
+		messages, imageMessages := toolOutputMessages(callID, item["output"])
+		b.pendingImageMsgs = append(b.pendingImageMsgs, imageMessages...)
+		return messages
 	case "tool_search_output":
 		callID := optionalCallID(item)
 		b.registerToolSearchOutputTools(item["tools"])
@@ -1042,6 +1047,24 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 		}}
 	default:
 		return []map[string]any{markerMessage(item)}
+	}
+}
+
+func (b *requestBuilder) flushPendingImageMessages() []map[string]any {
+	if len(b.pendingImageMsgs) == 0 {
+		return nil
+	}
+	messages := b.pendingImageMsgs
+	b.pendingImageMsgs = nil
+	return messages
+}
+
+func isToolOutputItem(item map[string]any) bool {
+	switch stringField(item, "type") {
+	case "function_call_output", "custom_tool_call_output":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1228,7 +1251,7 @@ func toolOutputToText(value any) string {
 				}
 			case "input_image":
 				if s := stringField(item, "image_url"); s != "" {
-					parts = append(parts, "[image] "+s)
+					parts = append(parts, "[image attached]")
 				}
 			case "encrypted_content":
 				parts = append(parts, "[encrypted_content omitted]")
@@ -1242,6 +1265,67 @@ func toolOutputToText(value any) string {
 	default:
 		return compactJSONString(v)
 	}
+}
+
+func toolOutputMessages(callID string, output any) ([]map[string]any, []map[string]any) {
+	text := toolOutputToText(output)
+	imageContent, hasImage := toolOutputImageContent(output, callID)
+	if hasImage && strings.TrimSpace(text) == "" {
+		text = "[image attached]"
+	}
+	messages := []map[string]any{{
+		"role":         "tool",
+		"tool_call_id": callID,
+		"content":      text,
+	}}
+	if hasImage {
+		return messages, []map[string]any{{
+			"role":    "user",
+			"content": imageContent,
+		}}
+	}
+	return messages, nil
+}
+
+func toolOutputImageContent(value any, callID string) ([]any, bool) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	parts := []any{
+		map[string]any{
+			"type": "text",
+			"text": "Tool output image for call " + callID + ".",
+		},
+	}
+	hasImage := false
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringField(item, "type") {
+		case "input_text":
+			if text := stringField(item, "text"); strings.TrimSpace(text) != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": text})
+			}
+		case "input_image":
+			imageURL := stringField(item, "image_url")
+			if imageURL == "" {
+				continue
+			}
+			image := map[string]any{"url": imageURL}
+			if detail := stringField(item, "detail"); detail != "" {
+				image["detail"] = strings.ToLower(detail)
+			}
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": image})
+			hasImage = true
+		}
+	}
+	if !hasImage {
+		return nil, false
+	}
+	return parts, true
 }
 
 func optionalCallID(item map[string]any) string {

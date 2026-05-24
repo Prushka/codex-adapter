@@ -113,6 +113,69 @@ func TestChatContentFromResponsesContentFlattensReasoningTextTypes(t *testing.T)
 	}
 }
 
+func TestFunctionCallOutputWithImageAddsMultimodalFollowUp(t *testing.T) {
+	adapter := testAdapter(t, "http://example.test/v1", nil)
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "view_image",
+				"description": "View an image.",
+				"parameters":  objectSchema(),
+			},
+		},
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "view_image",
+				"call_id":   "call-image",
+				"arguments": `{"path":"whatsthis.jpg"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call-image",
+				"output": []any{
+					map[string]any{
+						"type":      "input_image",
+						"image_url": "data:image/jpeg;base64,abc",
+						"detail":    "high",
+					},
+				},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 3 {
+		t.Fatalf("messages length = %d: %#v", len(messages), messages)
+	}
+	if messages[1]["role"] != "tool" || messages[1]["tool_call_id"] != "call-image" {
+		t.Fatalf("tool message = %#v", messages[1])
+	}
+	if got := messages[1]["content"].(string); strings.Contains(got, "data:image") {
+		t.Fatalf("tool message leaked image as text: %.80q", got)
+	}
+	if messages[2]["role"] != "user" {
+		t.Fatalf("image follow-up role = %#v", messages[2])
+	}
+	content := messages[2]["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("image follow-up content = %#v", content)
+	}
+	imagePart := content[1].(map[string]any)
+	if imagePart["type"] != "image_url" {
+		t.Fatalf("image part = %#v", imagePart)
+	}
+	image := imagePart["image_url"].(map[string]any)
+	if image["url"] != "data:image/jpeg;base64,abc" || image["detail"] != "high" {
+		t.Fatalf("image payload = %#v", image)
+	}
+}
+
 func TestPostChatForwardsInboundAuthorizationByDefault(t *testing.T) {
 	authCh := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
