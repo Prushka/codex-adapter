@@ -52,6 +52,8 @@ The `-provider-url` value may be an upstream base URL, a `/v1` URL, or a direct 
 - `POST /responses` and `POST /v1/responses`: accepts Responses API create requests and streams Responses SSE events.
 - `POST /responses/compact` and `POST /v1/responses/compact`: accepts the same request shape, sends a non-streaming upstream request, and returns `{"output":[...]}` with translated Responses output items.
 
+Set `-disable-upstream-streaming` to make `/responses` buffer the upstream Chat Completions response and then emit the translated Responses events in one burst.
+
 ## Options
 
 | Flag                | Default          | Description                                                                                       |
@@ -62,6 +64,7 @@ The `-provider-url` value may be an upstream base URL, a `/v1` URL, or a direct 
 | `-reasoning-effort` | `medium`         | `reasoning_effort` forced into every upstream request.                                            |
 | `-api-key-env`      | unset            | Environment variable containing the upstream provider API key.                                    |
 | `-api-key`          | unset            | Upstream provider API key supplied directly on the command line. Prefer `-api-key-env`.           |
+| `-disable-upstream-streaming` | `false` | Buffer upstream Chat Completions responses instead of requesting SSE chunks.                       |
 | `-search-provider`  | `duckduckgo`     | Local web search backend: `auto`, `duckduckgo`, `duckduckgo-lite`, `bing`, `yahoo`, or `searxng`. |
 | `-search-url`       | unset            | Backend URL for providers that need one. Required for `searxng`.                                  |
 | `-debug`            | `false`          | Write translated requests, responses, SSE events, and search activity as ordered JSON files.      |

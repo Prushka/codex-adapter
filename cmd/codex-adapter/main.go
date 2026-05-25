@@ -13,17 +13,18 @@ import (
 )
 
 type cliConfig struct {
-	listenAddr      string
-	providerURL     string
-	model           string
-	reasoningEffort string
-	apiKey          string
-	apiKeyEnv       string
-	searchProvider  string
-	searchURL       string
-	debug           bool
-	debugDir        string
-	timeout         time.Duration
+	listenAddr               string
+	providerURL              string
+	model                    string
+	reasoningEffort          string
+	apiKey                   string
+	apiKeyEnv                string
+	disableUpstreamStreaming bool
+	searchProvider           string
+	searchURL                string
+	debug                    bool
+	debugDir                 string
+	timeout                  time.Duration
 }
 
 func main() {
@@ -62,14 +63,15 @@ func main() {
 	}
 
 	handler, err := codexadapter.NewAdapter(codexadapter.AdapterConfig{
-		ProviderURL:     cfg.providerURL,
-		Model:           cfg.model,
-		ReasoningEffort: cfg.reasoningEffort,
-		APIKey:          upstreamAPIKey,
-		WebSearcher:     searcher,
-		Debug:           recorder,
-		HTTPClient:      httpClient,
-		Logger:          logger,
+		ProviderURL:              cfg.providerURL,
+		Model:                    cfg.model,
+		ReasoningEffort:          cfg.reasoningEffort,
+		APIKey:                   upstreamAPIKey,
+		DisableUpstreamStreaming: cfg.disableUpstreamStreaming,
+		WebSearcher:              searcher,
+		Debug:                    recorder,
+		HTTPClient:               httpClient,
+		Logger:                   logger,
 	})
 	if err != nil {
 		exitWithError(logger, "failed to create adapter", zap.Error(err))
@@ -98,6 +100,7 @@ func parseFlags() cliConfig {
 	flag.StringVar(&cfg.reasoningEffort, "reasoning-effort", "medium", "reasoning_effort value to force into every upstream request")
 	flag.StringVar(&cfg.apiKey, "api-key", "", "upstream provider API key; overrides any Authorization header sent by Codex")
 	flag.StringVar(&cfg.apiKeyEnv, "api-key-env", "", "environment variable containing the upstream provider API key")
+	flag.BoolVar(&cfg.disableUpstreamStreaming, "disable-upstream-streaming", false, "buffer upstream Chat Completions responses instead of requesting SSE")
 	flag.StringVar(&cfg.searchProvider, "search-provider", "duckduckgo", "local web search backend to use: auto, duckduckgo, duckduckgo-lite, bing, yahoo, or searxng")
 	flag.StringVar(&cfg.searchURL, "search-url", "", "search backend URL for providers that need one, such as searxng")
 	flag.BoolVar(&cfg.debug, "debug", false, "save all translated requests and responses as ordered JSON files")

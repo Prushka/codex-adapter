@@ -331,6 +331,82 @@ func TestStreamingFunctionCallToResponsesFunctionCall(t *testing.T) {
 	assertCompleted(t, events)
 }
 
+func TestResponsesEndpointCanUseBufferedUpstreamRequests(t *testing.T) {
+	var upstreamReq map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Fatalf("accept header = %q", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&upstreamReq); err != nil {
+			t.Fatal(err)
+		}
+		if upstreamReq["stream"] != false {
+			t.Fatalf("upstream stream = %#v", upstreamReq["stream"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"usage": map[string]any{"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9},
+			"choices": []any{
+				map[string]any{
+					"finish_reason": "tool_calls",
+					"message": map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"id":   "call-1",
+								"type": "function",
+								"extra_content": map[string]any{
+									"google": map[string]any{
+										"thought_signature": "sig-123",
+									},
+								},
+								"function": map[string]any{
+									"name":      "shell_command",
+									"arguments": "{\"command\":\"pwd\"}",
+								},
+							},
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:              upstream.URL,
+		Model:                    "forced-model",
+		ReasoningEffort:          "low",
+		DisableUpstreamStreaming: true,
+		HTTPClient:               http.DefaultClient,
+		Logger:                   zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := callResponses(t, adapter, responsesRequestWithTools([]any{
+		map[string]any{
+			"type":        "function",
+			"name":        "shell_command",
+			"description": "Run a command.",
+			"parameters":  objectSchema(),
+		},
+	}))
+
+	item := firstDoneItem(t, events, "function_call")
+	if item["call_id"] != "call-1" {
+		t.Fatalf("call_id = %v", item["call_id"])
+	}
+	if item["arguments"] != "{\"command\":\"pwd\"}" {
+		t.Fatalf("arguments = %v", item["arguments"])
+	}
+	extra := item["extra_content"].(map[string]any)
+	if extra["google"].(map[string]any)["thought_signature"] != "sig-123" {
+		t.Fatalf("extra_content = %#v", extra)
+	}
+	assertCompleted(t, events)
+}
+
 func TestGeminiExtraContentRoundTripsThroughAdapterCache(t *testing.T) {
 	var requestCount atomic.Int32
 	extraContent := map[string]any{

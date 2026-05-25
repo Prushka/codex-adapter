@@ -26,28 +26,30 @@ const (
 )
 
 type AdapterConfig struct {
-	ProviderURL     string
-	Model           string
-	ReasoningEffort string
-	APIKey          string
-	WebSearcher     WebSearcher
-	Debug           *DebugRecorder
-	HTTPClient      *http.Client
-	Logger          *zap.Logger
+	ProviderURL              string
+	Model                    string
+	ReasoningEffort          string
+	APIKey                   string
+	DisableUpstreamStreaming bool
+	WebSearcher              WebSearcher
+	Debug                    *DebugRecorder
+	HTTPClient               *http.Client
+	Logger                   *zap.Logger
 }
 
 type Adapter struct {
-	chatURL         string
-	model           string
-	reasoningEffort string
-	apiKey          string
-	search          WebSearcher
-	debug           *DebugRecorder
-	client          *http.Client
-	logger          *zap.Logger
-	extraMu         sync.Mutex
-	extraByCallID   map[string]any
-	extraOrder      []string
+	chatURL                  string
+	model                    string
+	reasoningEffort          string
+	apiKey                   string
+	disableUpstreamStreaming bool
+	search                   WebSearcher
+	debug                    *DebugRecorder
+	client                   *http.Client
+	logger                   *zap.Logger
+	extraMu                  sync.Mutex
+	extraByCallID            map[string]any
+	extraOrder               []string
 }
 
 func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
@@ -77,15 +79,16 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 		search = newGenericWebSearcher(client, logger, false)
 	}
 	return &Adapter{
-		chatURL:         chatURL,
-		model:           cfg.Model,
-		reasoningEffort: cfg.ReasoningEffort,
-		apiKey:          strings.TrimSpace(cfg.APIKey),
-		search:          search,
-		debug:           cfg.Debug,
-		client:          client,
-		logger:          logger,
-		extraByCallID:   map[string]any{},
+		chatURL:                  chatURL,
+		model:                    cfg.Model,
+		reasoningEffort:          cfg.ReasoningEffort,
+		apiKey:                   strings.TrimSpace(cfg.APIKey),
+		disableUpstreamStreaming: cfg.DisableUpstreamStreaming,
+		search:                   search,
+		debug:                    cfg.Debug,
+		client:                   client,
+		logger:                   logger,
+		extraByCallID:            map[string]any{},
 	}, nil
 }
 
@@ -166,7 +169,8 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatReq, ctx, err := a.buildChatRequest(responsesReq, true)
+	streamUpstream := !a.disableUpstreamStreaming
+	chatReq, ctx, err := a.buildChatRequest(responsesReq, streamUpstream)
 	if err != nil {
 		a.logger.Warn("failed to translate responses request", zap.String("response_id", respID), zap.Error(err))
 		_ = sse.Event("response.failed", failedResponse(respID, "invalid_request_error", "translation_error", err.Error()))
