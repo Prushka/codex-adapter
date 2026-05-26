@@ -1304,6 +1304,65 @@ func TestToolSearchCallRoundTripsAsClientToolSearch(t *testing.T) {
 	}
 }
 
+func TestToolSearchHistoryRendersWithoutCurrentToolDeclaration(t *testing.T) {
+	adapter := testAdapter(t, "http://example.test/v1", nil)
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "message",
+				"role":    "user",
+				"content": []any{map[string]any{"type": "input_text", "text": "Find deferred tooling."}},
+			},
+			map[string]any{
+				"type":      "tool_search_call",
+				"call_id":   "search-1",
+				"execution": "client",
+				"arguments": map[string]any{"query": "subagent"},
+			},
+			map[string]any{
+				"type":      "tool_search_output",
+				"call_id":   "search-1",
+				"execution": "client",
+				"status":    "completed",
+				"tools":     []any{},
+			},
+			map[string]any{
+				"type":    "message",
+				"role":    "user",
+				"content": []any{map[string]any{"type": "input_text", "text": "Continue."}},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 4 {
+		t.Fatalf("messages length = %d: %#v", len(messages), messages)
+	}
+	assistantMsg := messages[1]
+	calls, ok := assistantMsg["tool_calls"].([]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("assistant tool calls = %#v", assistantMsg)
+	}
+	call := calls[0].(map[string]any)
+	fn := call["function"].(map[string]any)
+	if call["id"] != "search-1" || fn["name"] != "tool_search" || fn["arguments"] != `{"query":"subagent"}` {
+		t.Fatalf("tool_search call = %#v", call)
+	}
+	toolMsg := messages[2]
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "search-1" || toolMsg["name"] != "tool_search" {
+		t.Fatalf("tool_search output message = %#v", toolMsg)
+	}
+	for _, message := range messages {
+		if content, ok := message["content"].(string); ok && strings.Contains(content, "[Responses API item]") {
+			t.Fatalf("tool_search history leaked marker: %#v", messages)
+		}
+	}
+}
+
 func TestToolSearchOutputRegistersDiscoveredNamespaceToolsForChatFollowUp(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]any
@@ -1769,6 +1828,137 @@ func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 	}
 }
 
+func TestParallelWebSearchCallsTriggerOneFollowUpWithAllResults(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := upstreamHits.Add(1)
+		switch hit {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+				"choices": []any{
+					map[string]any{
+						"delta": map[string]any{
+							"role": "assistant",
+							"tool_calls": []any{
+								map[string]any{
+									"index": 0,
+									"id":    "call-web-a",
+									"type":  "function",
+									"function": map[string]any{
+										"name":      "web_search",
+										"arguments": `{"action":"search","query":"Tesla stock price"}`,
+									},
+									"extra_content": map[string]any{
+										"google": map[string]any{"thought_signature": "sig-web-a"},
+									},
+								},
+								map[string]any{
+									"index": 1,
+									"id":    "call-web-b",
+									"type":  "function",
+									"function": map[string]any{
+										"name":      "web_search",
+										"arguments": `{"action":"search","query":"NVIDIA stock price"}`,
+									},
+								},
+							},
+						},
+					},
+				},
+			}) + "\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			messages := req["messages"].([]any)
+			if len(messages) < 4 {
+				t.Fatalf("follow-up messages = %#v", messages)
+			}
+			assistantMsg := messages[len(messages)-3].(map[string]any)
+			calls := assistantMsg["tool_calls"].([]any)
+			if len(calls) != 2 {
+				t.Fatalf("follow-up tool calls = %#v", assistantMsg)
+			}
+			firstCall := calls[0].(map[string]any)
+			extra := firstCall["extra_content"].(map[string]any)
+			if got := extra["google"].(map[string]any)["thought_signature"]; got != "sig-web-a" {
+				t.Fatalf("follow-up thought_signature = %#v", got)
+			}
+			for i, want := range []string{"call-web-a", "call-web-b"} {
+				call := calls[i].(map[string]any)
+				if call["id"] != want {
+					t.Fatalf("call %d = %#v", i, call)
+				}
+				fn := call["function"].(map[string]any)
+				if fn["name"] != "web_search" {
+					t.Fatalf("call %d function = %#v", i, fn)
+				}
+			}
+			toolA := messages[len(messages)-2].(map[string]any)
+			toolB := messages[len(messages)-1].(map[string]any)
+			if toolA["role"] != "tool" || toolA["tool_call_id"] != "call-web-a" || toolA["name"] != "web_search" || !strings.Contains(toolA["content"].(string), "Tesla stock price") {
+				t.Fatalf("tool A = %#v", toolA)
+			}
+			if toolB["role"] != "tool" || toolB["tool_call_id"] != "call-web-b" || toolB["name"] != "web_search" || !strings.Contains(toolB["content"].(string), "NVIDIA stock price") {
+				t.Fatalf("tool B = %#v", toolB)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Both prices were checked.\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":12,\"total_tokens\":22}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected upstream hit %d", hit)
+		}
+	}))
+	defer upstream.Close()
+
+	searcher := &mockWebSearcher{
+		results: []searchResult{
+			{Title: "Example quote", URL: "https://finance.example.com", Snippet: "Current quote data."},
+		},
+	}
+
+	adapter := testAdapterWithClientAndSearcher(t, upstream.URL, nil, http.DefaultClient, searcher)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":                "web_search",
+			"external_web_access": true,
+		},
+	})
+
+	events := callResponses(t, adapter, body)
+	var webSearchItems []map[string]any
+	for _, event := range events {
+		if event["type"] != "response.output_item.done" {
+			continue
+		}
+		item := event["item"].(map[string]any)
+		if item["type"] == "web_search_call" {
+			webSearchItems = append(webSearchItems, item)
+		}
+	}
+	if len(webSearchItems) != 2 {
+		t.Fatalf("web search items = %#v", webSearchItems)
+	}
+	message := firstDoneItem(t, events, "message")
+	content := message["content"].([]any)
+	if got := content[0].(map[string]any)["text"].(string); got != "Both prices were checked." {
+		t.Fatalf("final assistant text = %q", got)
+	}
+	assertCompleted(t, events)
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("upstream hits = %d", upstreamHits.Load())
+	}
+	wantQueries := []string{"Tesla stock price", "NVIDIA stock price"}
+	if strings.Join(searcher.queries, ",") != strings.Join(wantQueries, ",") {
+		t.Fatalf("search queries = %#v", searcher.queries)
+	}
+}
+
 func TestBuildChatRequestReplaysCachedWebSearchHistoryAsToolResult(t *testing.T) {
 	adapter, err := NewAdapter(AdapterConfig{
 		ProviderURL:      "http://example.test/v1",
@@ -2004,8 +2194,8 @@ func TestBuildWebSearchFollowUpRequestPreservesReasoningContent(t *testing.T) {
 	call.Arguments.WriteString(`{"query":"weather"}`)
 	followUp, err := buildWebSearchFollowUpRequest(
 		map[string]any{"messages": []any{map[string]any{"role": "user", "content": "go"}}},
-		call,
-		"weather result",
+		[]*chatToolCall{call},
+		[]string{"weather result"},
 		"searched mentally",
 	)
 	if err != nil {

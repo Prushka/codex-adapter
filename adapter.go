@@ -1342,7 +1342,7 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 		args := compactJSONString(item["arguments"])
 		chatName, ok := b.knownChatNameFor("tool_search", "", "tool_search")
 		if !ok {
-			return []map[string]any{markerMessage(item)}
+			chatName = "tool_search"
 		}
 		b.renderedCallIDs[callID] = true
 		b.renderedCallNames[callID] = chatName
@@ -1537,6 +1537,38 @@ func assistantToolCallMessage(callID, name, arguments string, extraContent any) 
 		"role":       "assistant",
 		"content":    nil,
 		"tool_calls": []any{toolCall},
+	}
+}
+
+func assistantToolCallsMessage(calls []*chatToolCall) map[string]any {
+	toolCalls := make([]any, 0, len(calls))
+	for _, call := range calls {
+		callID := call.ID
+		if callID == "" {
+			callID = newID("call")
+			call.ID = callID
+		}
+		args := call.Arguments.String()
+		if args == "" {
+			args = "{}"
+		}
+		toolCall := map[string]any{
+			"id":   callID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": args,
+			},
+		}
+		if call.ExtraContent != nil {
+			toolCall["extra_content"] = cloneJSONValue(call.ExtraContent)
+		}
+		toolCalls = append(toolCalls, toolCall)
+	}
+	return map[string]any{
+		"role":       "assistant",
+		"content":    nil,
+		"tool_calls": toolCalls,
 	}
 }
 

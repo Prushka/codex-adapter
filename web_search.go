@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
@@ -26,11 +27,18 @@ type searchResult struct {
 	Snippet string `json:"snippet"`
 }
 
-func (g *chatGeneration) singleWebSearchCall() *chatToolCall {
-	if len(g.tools) != 1 {
+func (g *chatGeneration) webSearchCalls() []*chatToolCall {
+	if len(g.tools) == 0 {
 		return nil
 	}
-	for _, call := range g.tools {
+	indexes := make([]int, 0, len(g.tools))
+	for index := range g.tools {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	calls := make([]*chatToolCall, 0, len(indexes))
+	for _, index := range indexes {
+		call := g.tools[index]
 		if call == nil {
 			return nil
 		}
@@ -38,12 +46,12 @@ func (g *chatGeneration) singleWebSearchCall() *chatToolCall {
 		if mapping.Kind == "" {
 			mapping = g.mappingForTool(call.Name, call.Type)
 		}
-		if mapping.Kind == "web_search" {
-			return call
+		if mapping.Kind != "web_search" {
+			return nil
 		}
-		return nil
+		calls = append(calls, call)
 	}
-	return nil
+	return calls
 }
 
 func (a *Adapter) handleGeneration(
@@ -59,8 +67,8 @@ func (a *Adapter) handleGeneration(
 	a.rememberMessageExtraContent(gen)
 	emitGenerationOutputItems(gen, sse, respID)
 
-	call := gen.singleWebSearchCall()
-	if call == nil {
+	calls := gen.webSearchCalls()
+	if len(calls) == 0 {
 		emitGenerationCompletion(gen, sse, respID)
 		return nil
 	}
@@ -70,16 +78,20 @@ func (a *Adapter) handleGeneration(
 		return nil
 	}
 
-	webSearchText, err := a.executeWebSearch(inbound.Context(), call)
-	if err != nil {
-		return fmt.Errorf("web search follow-up failed: %w", err)
+	webSearchResults := make([]string, 0, len(calls))
+	for _, call := range calls {
+		webSearchText, err := a.executeWebSearch(inbound.Context(), call)
+		if err != nil {
+			return fmt.Errorf("web search follow-up failed: %w", err)
+		}
+		a.rememberWebSearchHistory(call, webSearchText)
+		webSearchResults = append(webSearchResults, webSearchText)
 	}
-	a.rememberWebSearchHistory(call, webSearchText)
 	reasoningContent := ""
 	if a.reasoningHistory == reasoningHistoryReasoningContent {
 		reasoningContent = gen.reasoningContent()
 	}
-	followUpReq, err := buildWebSearchFollowUpRequest(upstreamReq, call, webSearchText, reasoningContent)
+	followUpReq, err := buildWebSearchFollowUpRequest(upstreamReq, calls, webSearchResults, reasoningContent)
 	if err != nil {
 		return fmt.Errorf("failed to build web search follow-up request: %w", err)
 	}
@@ -304,23 +316,29 @@ func (a *Adapter) fetchPageText(ctx context.Context, rawURL string) (string, err
 	return fmt.Sprintf("Title: %s\nURL: %s\nExcerpt:\n%s", title, u.String(), text), nil
 }
 
-func buildWebSearchFollowUpRequest(original map[string]any, call *chatToolCall, resultText, reasoningContent string) (map[string]any, error) {
+func buildWebSearchFollowUpRequest(original map[string]any, calls []*chatToolCall, resultTexts []string, reasoningContent string) (map[string]any, error) {
 	followUp := cloneJSONValue(original)
 	followUpReq, ok := followUp.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("unexpected upstream request shape")
 	}
-	assistantMessage := assistantToolCallMessage(call.ID, call.Name, call.Arguments.String(), call.ExtraContent)
+	if len(calls) == 0 || len(calls) != len(resultTexts) {
+		return nil, fmt.Errorf("web search follow-up call/result mismatch")
+	}
+	assistantMessage := assistantToolCallsMessage(calls)
 	if strings.TrimSpace(reasoningContent) != "" {
 		assistantMessage["reasoning_content"] = reasoningContent
 	}
-	toolMessage := map[string]any{
-		"role":         "tool",
-		"tool_call_id": call.ID,
-		"name":         call.Name,
-		"content":      resultText,
+	messages := []map[string]any{assistantMessage}
+	for i, call := range calls {
+		messages = append(messages, map[string]any{
+			"role":         "tool",
+			"tool_call_id": call.ID,
+			"name":         call.Name,
+			"content":      resultTexts[i],
+		})
 	}
-	followUpReq["messages"] = appendChatMessages(followUpReq["messages"], assistantMessage, toolMessage)
+	followUpReq["messages"] = appendChatMessages(followUpReq["messages"], messages...)
 	return followUpReq, nil
 }
 
