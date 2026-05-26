@@ -56,6 +56,7 @@ func (a *Adapter) handleGeneration(
 	webSearchDepth int,
 ) error {
 	a.rememberToolExtraContent(gen)
+	a.rememberMessageExtraContent(gen)
 	emitGenerationOutputItems(gen, sse, respID)
 
 	call := gen.singleWebSearchCall()

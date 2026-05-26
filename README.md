@@ -123,10 +123,10 @@ go run ./cmd/codex-adapter \
 - `web_search` and `image_generation` are exposed as synthetic functions because Chat Completions has no standard equivalent for Responses hosted tools. `image_generation` is marked completed only when the upstream call includes base64 image data.
 - `tool_choice`, `parallel_tool_calls`, and Responses JSON schema text formats are translated to their Chat Completions equivalents.
 - Nonessential Responses-only provider fields, such as `metadata`, `prompt_cache_key`, `store`, and `service_tier`, are not forwarded upstream.
-- Gemini/OpenAI compatibility metadata such as `tool_calls[].extra_content.google.thought_signature` is preserved on Responses tool-call items and cached by `call_id` so follow-up tool-result requests can send it back upstream.
+- Gemini/OpenAI compatibility metadata such as `tool_calls[].extra_content.google.thought_signature` and assistant message `extra_content` is preserved on Responses items where possible and cached so follow-up requests can send it back upstream even when Codex drops unknown item fields.
 - Streaming Chat Completions chunks are accumulated and emitted as Responses SSE events. A normal completion ends with `response.completed`; upstream `length` and `content_filter` finish reasons become `response.incomplete`.
 
-The adapter is stateless across Responses turns except for a bounded cache of tool-call `extra_content` keyed by `call_id`. Codex sends the full input on this wire path, so `previous_response_id` is not required.
+The adapter is stateless across Responses turns except for bounded caches of provider compatibility `extra_content`. Tool-call metadata is keyed by `call_id`; assistant-message metadata is keyed by message content and occurrence. Codex sends the full input on this wire path, so `previous_response_id` is not required.
 
 ## Debugging
 

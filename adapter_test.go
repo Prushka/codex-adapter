@@ -633,6 +633,89 @@ func TestGeminiExtraContentRoundTripsThroughAdapterCache(t *testing.T) {
 	}
 }
 
+func TestGeminiMessageExtraContentRoundTripsThroughAdapterCache(t *testing.T) {
+	var requestCount atomic.Int32
+	extraContent := map[string]any{
+		"google": map[string]any{
+			"thought_signature": "msg-sig-123",
+		},
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requestCount.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []any{
+					map[string]any{
+						"finish_reason": "stop",
+						"message": map[string]any{
+							"role":          "assistant",
+							"content":       "done",
+							"extra_content": extraContent,
+						},
+					},
+				},
+			})
+		case 2:
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			messages := req["messages"].([]any)
+			var got map[string]any
+			for _, raw := range messages {
+				message := raw.(map[string]any)
+				if message["role"] == "assistant" && message["content"] == "done" {
+					got = message["extra_content"].(map[string]any)
+					break
+				}
+			}
+			if got == nil || got["google"].(map[string]any)["thought_signature"] != "msg-sig-123" {
+				t.Fatalf("message extra_content = %#v", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []any{
+					map[string]any{
+						"finish_reason": "stop",
+						"message":       map[string]any{"role": "assistant", "content": "second"},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected upstream request")
+		}
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools(nil)
+	events := callResponses(t, adapter, body)
+	item := firstDoneItem(t, events, "message")
+	emittedExtra := item["extra_content"].(map[string]any)
+	if emittedExtra["google"].(map[string]any)["thought_signature"] != "msg-sig-123" {
+		t.Fatalf("emitted extra_content = %#v", emittedExtra)
+	}
+
+	// Existing Codex builds drop unknown ResponseItem fields, so the adapter
+	// restores Gemini's message-level extra_content from its local cache.
+	delete(item, "extra_content")
+	body["input"] = []any{
+		item,
+		map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "next"},
+			},
+		},
+	}
+	_ = callResponses(t, adapter, body)
+	if requestCount.Load() != 2 {
+		t.Fatalf("upstream request count = %d", requestCount.Load())
+	}
+}
+
 func TestStreamingTextAndReasoningAddBeforeDeltaAndDone(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -661,6 +744,24 @@ func TestStreamingTextAndReasoningAddBeforeDeltaAndDone(t *testing.T) {
 	}
 	if events[reasoningDelta]["delta"] != "thinking" || events[textDelta]["delta"] != "answer" {
 		t.Fatalf("bad deltas: %#v %#v", events[reasoningDelta], events[textDelta])
+	}
+}
+
+func TestStreamingMessageExtraContentIsEmitted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"done\",\"extra_content\":{\"google\":{\"thought_signature\":\"stream-msg-sig\"}}}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	events := callResponses(t, adapter, responsesRequestWithTools(nil))
+	item := firstDoneItem(t, events, "message")
+	extra := item["extra_content"].(map[string]any)
+	if extra["google"].(map[string]any)["thought_signature"] != "stream-msg-sig" {
+		t.Fatalf("extra_content = %#v", extra)
 	}
 }
 

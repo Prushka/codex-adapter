@@ -3,6 +3,8 @@ package adapter
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,9 +22,10 @@ import (
 )
 
 const (
-	maxUpstreamErrorBodyLogBytes = 16 << 10
-	maxUpstreamErrorMessageBytes = 4 << 10
-	maxToolExtraContentEntries   = 4096
+	maxUpstreamErrorBodyLogBytes  = 16 << 10
+	maxUpstreamErrorMessageBytes  = 4 << 10
+	maxToolExtraContentEntries    = 4096
+	maxMessageExtraContentEntries = 4096
 
 	reasoningHistoryAuto             = "auto"
 	reasoningHistoryDrop             = "drop"
@@ -57,6 +60,8 @@ type Adapter struct {
 	extraMu                  sync.Mutex
 	extraByCallID            map[string]any
 	extraOrder               []string
+	messageExtraByKey        map[string][]any
+	messageExtraOrder        []string
 }
 
 func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
@@ -101,6 +106,7 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 		client:                   client,
 		logger:                   logger,
 		extraByCallID:            map[string]any{},
+		messageExtraByKey:        map[string][]any{},
 	}, nil
 }
 
@@ -341,6 +347,7 @@ func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.rememberToolExtraContent(gen)
+	a.rememberMessageExtraContent(gen)
 	out := map[string]any{"output": gen.outputItems()}
 	a.debug.SaveJSON("outbound compact response", out)
 	w.Header().Set("Content-Type", "application/json")
@@ -395,6 +402,30 @@ func (a *Adapter) rememberToolExtraContent(gen *chatGeneration) {
 	}
 }
 
+func (a *Adapter) rememberMessageExtraContent(gen *chatGeneration) {
+	if gen == nil || gen.message == nil || gen.message.ExtraContent == nil || gen.message.text.Len() == 0 {
+		return
+	}
+	key := messageExtraContentKey("assistant", gen.message.text.String())
+	if key == "" {
+		return
+	}
+	a.extraMu.Lock()
+	defer a.extraMu.Unlock()
+	a.messageExtraByKey[key] = append(a.messageExtraByKey[key], cloneJSONValue(gen.message.ExtraContent))
+	a.messageExtraOrder = append(a.messageExtraOrder, key)
+	for len(a.messageExtraOrder) > maxMessageExtraContentEntries {
+		oldest := a.messageExtraOrder[0]
+		a.messageExtraOrder = a.messageExtraOrder[1:]
+		items := a.messageExtraByKey[oldest]
+		if len(items) <= 1 {
+			delete(a.messageExtraByKey, oldest)
+		} else {
+			a.messageExtraByKey[oldest] = items[1:]
+		}
+	}
+}
+
 func (a *Adapter) rememberExtraContent(callID string, extra any) {
 	if callID == "" || extra == nil {
 		return
@@ -421,8 +452,21 @@ func (a *Adapter) extraContentForCallID(callID string) any {
 	return cloneJSONValue(a.extraByCallID[callID])
 }
 
+func (a *Adapter) extraContentForMessage(key string, occurrence int) any {
+	if key == "" || occurrence < 0 {
+		return nil
+	}
+	a.extraMu.Lock()
+	defer a.extraMu.Unlock()
+	items := a.messageExtraByKey[key]
+	if occurrence >= len(items) {
+		return nil
+	}
+	return cloneJSONValue(items[occurrence])
+}
+
 func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]any, *translationContext, error) {
-	builder := newRequestBuilder(a.reasoningHistory, a.extraContentForCallID)
+	builder := newRequestBuilder(a.reasoningHistory, a.extraContentForCallID, a.extraContentForMessage)
 	tools := builder.translateTools(req["tools"])
 	messages := builder.translateInput(req)
 	if len(builder.extraTools) > 0 {
@@ -718,7 +762,9 @@ type requestBuilder struct {
 	pendingImageMsgs   []map[string]any
 	renderedCallIDs    map[string]bool
 	reasoningHistory   string
+	messageOccurrences map[string]int
 	lookupExtraContent func(callID string) any
+	lookupMessageExtra func(key string, occurrence int) any
 }
 
 type translationContext struct {
@@ -733,10 +779,11 @@ type toolMapping struct {
 }
 
 type assistantHistoryMessage struct {
-	reasoning strings.Builder
-	content   any
-	hasText   bool
-	toolCalls []any
+	reasoning    strings.Builder
+	content      any
+	extraContent any
+	hasText      bool
+	toolCalls    []any
 }
 
 func (m *assistantHistoryMessage) empty() bool {
@@ -758,24 +805,30 @@ func (m *assistantHistoryMessage) flush() []map[string]any {
 	if m.reasoning.Len() > 0 {
 		message["reasoning_content"] = m.reasoning.String()
 	}
+	if m.extraContent != nil {
+		message["extra_content"] = cloneJSONValue(m.extraContent)
+	}
 	if len(m.toolCalls) > 0 {
 		message["tool_calls"] = m.toolCalls
 	}
 	m.reasoning.Reset()
 	m.content = nil
+	m.extraContent = nil
 	m.hasText = false
 	m.toolCalls = nil
 	return []map[string]any{message}
 }
 
-func newRequestBuilder(reasoningHistory string, lookupExtraContent func(callID string) any) *requestBuilder {
+func newRequestBuilder(reasoningHistory string, lookupExtraContent func(callID string) any, lookupMessageExtra func(key string, occurrence int) any) *requestBuilder {
 	return &requestBuilder{
 		usedNames:          map[string]int{},
 		byChat:             map[string]toolMapping{},
 		byKey:              map[string]toolMapping{},
 		renderedCallIDs:    map[string]bool{},
 		reasoningHistory:   reasoningHistory,
+		messageOccurrences: map[string]int{},
 		lookupExtraContent: lookupExtraContent,
+		lookupMessageExtra: lookupMessageExtra,
 	}
 }
 
@@ -1085,6 +1138,7 @@ func (b *requestBuilder) mergeReasoningHistoryItem(item map[string]any, itemMess
 			*messages = append(*messages, pending.flush()...)
 		}
 		pending.content = itemMessages[0]["content"]
+		pending.extraContent = itemMessages[0]["extra_content"]
 		pending.hasText = true
 		return true
 	case "function_call", "custom_tool_call", "tool_search_call":
@@ -1102,14 +1156,50 @@ func (b *requestBuilder) mergeReasoningHistoryItem(item map[string]any, itemMess
 	}
 }
 
+func (b *requestBuilder) messageExtraContent(item map[string]any, role string, content any) any {
+	key := messageExtraContentKey(role, content)
+	occurrence := 0
+	if key != "" {
+		occurrence = b.messageOccurrences[key]
+		b.messageOccurrences[key] = occurrence + 1
+	}
+	if extra := item["extra_content"]; extra != nil {
+		return cloneJSONValue(extra)
+	}
+	if key == "" || b.lookupMessageExtra == nil {
+		return nil
+	}
+	return b.lookupMessageExtra(key, occurrence)
+}
+
+func messageExtraContentKey(role string, content any) string {
+	if role != "assistant" || content == nil {
+		return ""
+	}
+	data, err := json.Marshal(content)
+	if err != nil {
+		data = []byte(fmt.Sprint(content))
+	}
+	hashInput := make([]byte, 0, len(role)+1+len(data))
+	hashInput = append(hashInput, role...)
+	hashInput = append(hashInput, 0)
+	hashInput = append(hashInput, data...)
+	sum := sha256.Sum256(hashInput)
+	return hex.EncodeToString(sum[:])
+}
+
 func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 	switch stringField(item, "type") {
 	case "message":
 		role := normalizeRole(stringField(item, "role"))
-		return []map[string]any{{
+		message := map[string]any{
 			"role":    role,
 			"content": chatContentFromResponsesContent(item["content"], role),
-		}}
+		}
+		if extra := b.messageExtraContent(item, role, message["content"]); extra != nil {
+			message["extra_content"] = extra
+		}
+		return []map[string]any{message}
 	case "reasoning":
 		if b.reasoningHistory == reasoningHistoryAssistantContent {
 			if content := reasoningItemContent(item); content != "" {
@@ -1633,11 +1723,12 @@ type responseItemState struct {
 }
 
 type streamedAssistantItem struct {
-	id          string
-	outputIndex int
-	announced   bool
-	done        bool
-	text        strings.Builder
+	id           string
+	outputIndex  int
+	announced    bool
+	done         bool
+	ExtraContent any
+	text         strings.Builder
 }
 
 func (i *streamedAssistantItem) responseItem() map[string]any {
@@ -1645,7 +1736,7 @@ func (i *streamedAssistantItem) responseItem() map[string]any {
 	if id == "" {
 		id = newID("msg")
 	}
-	return map[string]any{
+	item := map[string]any{
 		"id":   id,
 		"type": "message",
 		"role": "assistant",
@@ -1653,6 +1744,10 @@ func (i *streamedAssistantItem) responseItem() map[string]any {
 			map[string]any{"type": "output_text", "text": i.text.String()},
 		},
 	}
+	if i.ExtraContent != nil {
+		item["extra_content"] = cloneJSONValue(i.ExtraContent)
+	}
+	return item
 }
 
 type streamedReasoningItem struct {
@@ -1755,6 +1850,9 @@ func (g *chatGeneration) applyStreamChunk(chunk map[string]any, sse *responseSSE
 				"output_index": g.message.outputIndex,
 				"delta":        s,
 			})
+		}
+		if extra := delta["extra_content"]; extra != nil {
+			g.messageState().ExtraContent = cloneJSONValue(extra)
 		}
 		if s := firstTextField(delta, "reasoning_content", "reasoning", "reasoning_delta"); s != "" {
 			g.ensureReasoningActive(sse, respID)
@@ -2178,6 +2276,9 @@ func generationFromChatResponse(raw []byte, ctx *translationContext) (*chatGener
 	message, _ := choice["message"].(map[string]any)
 	if s := textFromAny(message["content"]); s != "" {
 		gen.messageState().text.WriteString(s)
+	}
+	if extra := message["extra_content"]; extra != nil {
+		gen.messageState().ExtraContent = cloneJSONValue(extra)
 	}
 	if s := firstTextField(message, "reasoning_content", "reasoning"); s != "" {
 		gen.reasoningState().text.WriteString(s)
