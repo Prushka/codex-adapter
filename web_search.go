@@ -317,6 +317,7 @@ func buildWebSearchFollowUpRequest(original map[string]any, call *chatToolCall, 
 	toolMessage := map[string]any{
 		"role":         "tool",
 		"tool_call_id": call.ID,
+		"name":         call.Name,
 		"content":      resultText,
 	}
 	followUpReq["messages"] = appendChatMessages(followUpReq["messages"], assistantMessage, toolMessage)

@@ -827,6 +827,7 @@ type requestBuilder struct {
 	extraTools           []any
 	pendingImageMsgs     []map[string]any
 	renderedCallIDs      map[string]bool
+	renderedCallNames    map[string]string
 	reasoningHistory     string
 	messageOccurrences   map[string]int
 	webSearchOccurrences map[string]int
@@ -893,6 +894,7 @@ func newRequestBuilder(reasoningHistory string, lookupExtraContent func(callID s
 		byChat:               map[string]toolMapping{},
 		byKey:                map[string]toolMapping{},
 		renderedCallIDs:      map[string]bool{},
+		renderedCallNames:    map[string]string{},
 		reasoningHistory:     reasoningHistory,
 		messageOccurrences:   map[string]int{},
 		webSearchOccurrences: map[string]int{},
@@ -1221,6 +1223,19 @@ func (b *requestBuilder) mergeReasoningHistoryItem(item map[string]any, itemMess
 		}
 		pending.toolCalls = append(pending.toolCalls, calls...)
 		return true
+	case "web_search_call":
+		if len(itemMessages) == 0 {
+			pending.reasoning.Reset()
+			return true
+		}
+		calls, ok := itemMessages[0]["tool_calls"].([]any)
+		if !ok || len(calls) == 0 {
+			return false
+		}
+		pending.toolCalls = append(pending.toolCalls, calls...)
+		*messages = append(*messages, pending.flush()...)
+		*messages = append(*messages, itemMessages[1:]...)
+		return true
 	default:
 		return false
 	}
@@ -1293,6 +1308,7 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 			return []map[string]any{markerMessage(item)}
 		}
 		b.renderedCallIDs[callID] = true
+		b.renderedCallNames[callID] = chatName
 		return []map[string]any{assistantToolCallMessage(callID, chatName, args, b.extraContentForItem(item, callID))}
 	case "custom_tool_call":
 		name := stringField(item, "name")
@@ -1303,6 +1319,7 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 			return []map[string]any{markerMessage(item)}
 		}
 		b.renderedCallIDs[callID] = true
+		b.renderedCallNames[callID] = chatName
 		return []map[string]any{assistantToolCallMessage(callID, chatName, string(args), b.extraContentForItem(item, callID))}
 	case "tool_search_call":
 		callID := optionalCallID(item)
@@ -1312,6 +1329,7 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 			return []map[string]any{markerMessage(item)}
 		}
 		b.renderedCallIDs[callID] = true
+		b.renderedCallNames[callID] = chatName
 		return []map[string]any{assistantToolCallMessage(callID, chatName, args, b.extraContentForItem(item, callID))}
 	case "function_call_output", "custom_tool_call_output":
 		callID := stringField(item, "call_id")
@@ -1321,7 +1339,7 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 		if !b.renderedCallIDs[callID] {
 			return []map[string]any{markerMessage(item)}
 		}
-		messages, imageMessages := toolOutputMessages(callID, item["output"])
+		messages, imageMessages := toolOutputMessages(callID, b.renderedCallNames[callID], item["output"])
 		b.pendingImageMsgs = append(b.pendingImageMsgs, imageMessages...)
 		return messages
 	case "tool_search_output":
@@ -1336,6 +1354,7 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 		return []map[string]any{{
 			"role":         "tool",
 			"tool_call_id": callID,
+			"name":         b.renderedCallNames[callID],
 			"content":      compactJSONString(item),
 		}}
 	case "web_search_call":
@@ -1380,6 +1399,7 @@ func (b *requestBuilder) webSearchHistoryMessages(item map[string]any) []map[str
 		{
 			"role":         "tool",
 			"tool_call_id": callID,
+			"name":         name,
 			"content":      entry.Result,
 		},
 	}
@@ -1602,7 +1622,7 @@ func toolOutputToText(value any) string {
 	}
 }
 
-func toolOutputMessages(callID string, output any) ([]map[string]any, []map[string]any) {
+func toolOutputMessages(callID, name string, output any) ([]map[string]any, []map[string]any) {
 	text := toolOutputToText(output)
 	imageContent, hasImage := toolOutputImageContent(output, callID)
 	if hasImage && strings.TrimSpace(text) == "" {
@@ -1611,6 +1631,7 @@ func toolOutputMessages(callID string, output any) ([]map[string]any, []map[stri
 	messages := []map[string]any{{
 		"role":         "tool",
 		"tool_call_id": callID,
+		"name":         name,
 		"content":      text,
 	}}
 	if hasImage {

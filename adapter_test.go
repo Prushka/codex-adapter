@@ -1698,7 +1698,15 @@ func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 }
 
 func TestBuildChatRequestReplaysCachedWebSearchHistoryAsToolResult(t *testing.T) {
-	adapter := testAdapter(t, "http://example.test/v1", nil)
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:      "http://example.test/v1",
+		Model:            "forced-model",
+		ReasoningEffort:  "low",
+		ReasoningHistory: reasoningHistoryReasoningContent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	call := &chatToolCall{
 		ID:           "call-web",
 		Name:         "web_search",
@@ -1709,6 +1717,13 @@ func TestBuildChatRequestReplaysCachedWebSearchHistoryAsToolResult(t *testing.T)
 
 	req := map[string]any{
 		"input": []any{
+			map[string]any{
+				"type":    "reasoning",
+				"summary": []any{},
+				"content": []any{
+					map[string]any{"type": "reasoning_text", "text": "need current price"},
+				},
+			},
 			map[string]any{
 				"type":   "web_search_call",
 				"status": "completed",
@@ -1729,6 +1744,9 @@ func TestBuildChatRequestReplaysCachedWebSearchHistoryAsToolResult(t *testing.T)
 		t.Fatalf("messages = %#v", messages)
 	}
 	assistantMsg := messages[0]
+	if assistantMsg["reasoning_content"] != "need current price" {
+		t.Fatalf("assistant reasoning_content = %#v", assistantMsg)
+	}
 	calls, ok := assistantMsg["tool_calls"].([]any)
 	if !ok || len(calls) != 1 {
 		t.Fatalf("assistant tool calls = %#v", assistantMsg)
@@ -1742,7 +1760,7 @@ func TestBuildChatRequestReplaysCachedWebSearchHistoryAsToolResult(t *testing.T)
 		t.Fatalf("thought signature = %#v", got)
 	}
 	toolMsg := messages[1]
-	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call-web" || !strings.Contains(toolMsg["content"].(string), "$123.45") {
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call-web" || toolMsg["name"] != "web_search" || !strings.Contains(toolMsg["content"].(string), "$123.45") {
 		t.Fatalf("tool message = %#v", toolMsg)
 	}
 }
