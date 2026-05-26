@@ -35,15 +35,21 @@ Point Codex at the adapter:
 model_provider = "codex-adapter"
 model = "gpt-5.5" # placeholder for model_catalog compatibility, actual model is configured in the adapter
 disable_response_storage = true
+model_catalog_json = "~/.codex/models.json" # replace with the latest version from codex, IMPORTANT: update context window settings so compact could work properly!
 
 [model_providers.codex-adapter]
 name = "codex-adapter"
 base_url = "http://127.0.0.1:8080/v1"
 wire_api = "responses"
 supports_websockets = false
+
 ```
 
 The `-provider-url` value may be an upstream base URL, a `/v1` URL, or a direct `/chat/completions` URL. The adapter normalizes it to the upstream Chat Completions endpoint.
+
+Post setup:
+
+1. Turn off Image Gen skill as it doesn't work as of now. This may lead the model to emit image generation tool calls.
 
 ## Endpoints
 
