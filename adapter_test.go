@@ -2100,6 +2100,103 @@ func TestBuildChatRequestReplaysCachedWebSearchHistoryAsToolResult(t *testing.T)
 	}
 }
 
+func TestBuildChatRequestReplaysParallelWebSearchHistoryAsSingleToolTurn(t *testing.T) {
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:      "http://example.test/v1",
+		Model:            "forced-model",
+		ReasoningEffort:  "low",
+		ReasoningHistory: reasoningHistoryReasoningContent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	call1 := &chatToolCall{ID: "web_search:16", Name: "web_search"}
+	call1.Arguments.WriteString(`{"query":"OpenAI Chat Completions API overview documentation"}`)
+	adapter.rememberWebSearchHistory(call1, "Chat Completions official result")
+	call2 := &chatToolCall{ID: "web_search:17", Name: "web_search"}
+	call2.Arguments.WriteString(`{"query":"OpenAI Responses API overview documentation"}`)
+	adapter.rememberWebSearchHistory(call2, "Responses official result")
+
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "reasoning",
+				"summary": []any{},
+				"content": []any{
+					map[string]any{"type": "reasoning_text", "text": "issue parallel searches"},
+				},
+			},
+			map[string]any{
+				"type":   "web_search_call",
+				"status": "completed",
+				"action": map[string]any{
+					"type":  "search",
+					"query": "OpenAI Chat Completions API overview documentation",
+				},
+			},
+			map[string]any{
+				"type":   "web_search_call",
+				"status": "completed",
+				"action": map[string]any{
+					"type":  "search",
+					"query": "OpenAI Responses API overview documentation",
+				},
+			},
+			map[string]any{
+				"type":    "reasoning",
+				"summary": []any{},
+				"content": []any{
+					map[string]any{"type": "reasoning_text", "text": "summarize both results"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "Final summary."},
+				},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 4 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	assistantMsg := messages[0]
+	if assistantMsg["reasoning_content"] != "issue parallel searches" {
+		t.Fatalf("assistant reasoning_content = %#v", assistantMsg)
+	}
+	calls, ok := assistantMsg["tool_calls"].([]any)
+	if !ok || len(calls) != 2 {
+		t.Fatalf("assistant tool calls = %#v", assistantMsg)
+	}
+	for i, wantID := range []string{"web_search:16", "web_search:17"} {
+		toolCall := calls[i].(map[string]any)
+		if toolCall["id"] != wantID {
+			t.Fatalf("tool call %d = %#v", i, toolCall)
+		}
+	}
+	if messages[1]["role"] != "tool" || messages[1]["tool_call_id"] != "web_search:16" || !strings.Contains(messages[1]["content"].(string), "Chat Completions") {
+		t.Fatalf("first tool message = %#v", messages[1])
+	}
+	if messages[2]["role"] != "tool" || messages[2]["tool_call_id"] != "web_search:17" || !strings.Contains(messages[2]["content"].(string), "Responses") {
+		t.Fatalf("second tool message = %#v", messages[2])
+	}
+	finalMsg := messages[3]
+	if finalMsg["reasoning_content"] != "summarize both results" || finalMsg["content"] != "Final summary." {
+		t.Fatalf("final assistant message = %#v", finalMsg)
+	}
+	if _, ok := finalMsg["tool_calls"]; ok {
+		t.Fatalf("final assistant unexpectedly has tool calls: %#v", finalMsg)
+	}
+}
+
 func TestBuildChatRequestDropsUncachedWebSearchHistory(t *testing.T) {
 	adapter := testAdapter(t, "http://example.test/v1", nil)
 	req := map[string]any{

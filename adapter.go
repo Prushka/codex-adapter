@@ -853,10 +853,11 @@ type assistantHistoryMessage struct {
 	extraContent any
 	hasText      bool
 	toolCalls    []any
+	toolMessages []map[string]any
 }
 
 func (m *assistantHistoryMessage) empty() bool {
-	return m.reasoning.Len() == 0 && !m.hasText && len(m.toolCalls) == 0
+	return m.reasoning.Len() == 0 && !m.hasText && len(m.toolCalls) == 0 && len(m.toolMessages) == 0
 }
 
 func (m *assistantHistoryMessage) flush() []map[string]any {
@@ -880,12 +881,15 @@ func (m *assistantHistoryMessage) flush() []map[string]any {
 	if len(m.toolCalls) > 0 {
 		message["tool_calls"] = m.toolCalls
 	}
+	out := []map[string]any{message}
+	out = append(out, m.toolMessages...)
 	m.reasoning.Reset()
 	m.content = nil
 	m.extraContent = nil
 	m.hasText = false
 	m.toolCalls = nil
-	return []map[string]any{message}
+	m.toolMessages = nil
+	return out
 }
 
 func newRequestBuilder(reasoningHistory string, lookupExtraContent func(callID string) any, lookupMessageExtra func(key string, occurrence int) any, lookupWebSearch func(key string, occurrence int) *webSearchHistoryEntry) *requestBuilder {
@@ -1200,6 +1204,9 @@ func (b *requestBuilder) translateInput(req map[string]any) []map[string]any {
 func (b *requestBuilder) mergeReasoningHistoryItem(item map[string]any, itemMessages []map[string]any, pending *assistantHistoryMessage, messages *[]map[string]any) bool {
 	switch stringField(item, "type") {
 	case "reasoning":
+		if pending.hasText || len(pending.toolCalls) > 0 || len(pending.toolMessages) > 0 {
+			*messages = append(*messages, pending.flush()...)
+		}
 		if content := reasoningItemContent(item); content != "" {
 			pending.reasoning.WriteString(content)
 		}
@@ -1208,7 +1215,7 @@ func (b *requestBuilder) mergeReasoningHistoryItem(item map[string]any, itemMess
 		if normalizeRole(stringField(item, "role")) != "assistant" || len(itemMessages) != 1 {
 			return false
 		}
-		if pending.hasText {
+		if pending.hasText || len(pending.toolCalls) > 0 || len(pending.toolMessages) > 0 {
 			*messages = append(*messages, pending.flush()...)
 		}
 		pending.content = itemMessages[0]["content"]
@@ -1249,8 +1256,7 @@ func (b *requestBuilder) mergeToolCallHistoryItem(item map[string]any, itemMessa
 			return false
 		}
 		pending.toolCalls = append(pending.toolCalls, calls...)
-		*messages = append(*messages, pending.flush()...)
-		*messages = append(*messages, itemMessages[1:]...)
+		pending.toolMessages = append(pending.toolMessages, itemMessages[1:]...)
 		return true
 	default:
 		return false
