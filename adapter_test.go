@@ -2437,6 +2437,87 @@ func TestWebSearchBackendErrorBecomesToolContent(t *testing.T) {
 	}
 }
 
+func TestWebSearchOpenPageErrorBecomesToolContent(t *testing.T) {
+	pageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "blocked by origin", http.StatusForbidden)
+	}))
+	defer pageServer.Close()
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := upstreamHits.Add(1)
+		switch hit {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			args, _ := json.Marshal(map[string]string{"action": "open_page", "url": pageServer.URL + "/blocked"})
+			chunk := map[string]any{
+				"choices": []any{
+					map[string]any{
+						"delta": map[string]any{
+							"role": "assistant",
+							"tool_calls": []any{
+								map[string]any{
+									"index": 0,
+									"id":    "call-web",
+									"type":  "function",
+									"function": map[string]any{
+										"name":      "web_search",
+										"arguments": string(args),
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			data, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: " + string(data) + "\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			messages := req["messages"].([]any)
+			toolMsg := messages[len(messages)-1].(map[string]any)
+			if toolMsg["role"] != "tool" {
+				t.Fatalf("follow-up tool message = %#v", toolMsg)
+			}
+			content := toolMsg["content"].(string)
+			if !strings.Contains(content, "Web search action failed") || !strings.Contains(content, "HTTP 403") || !strings.Contains(content, pageServer.URL+"/blocked") {
+				t.Fatalf("tool content = %q", content)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"I could not open the page.\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected upstream hit %d", hit)
+		}
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":                "web_search",
+			"external_web_access": true,
+		},
+	})
+
+	events := callResponses(t, adapter, body)
+	message := firstDoneItem(t, events, "message")
+	content := message["content"].([]any)
+	if got := content[0].(map[string]any)["text"].(string); !strings.Contains(got, "could not open") {
+		t.Fatalf("final assistant text = %q", got)
+	}
+	assertCompleted(t, events)
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("upstream hits = %d", upstreamHits.Load())
+	}
+}
+
 func TestDuckDuckGoSearchBackendParsesLiteHTML(t *testing.T) {
 	duckHTML := `<!doctype html>
 <html>

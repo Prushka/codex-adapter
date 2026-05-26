@@ -158,7 +158,23 @@ func (a *Adapter) executeWebSearch(ctx context.Context, call *chatToolCall) (str
 
 	result, err := a.executeWebSearchAction(ctx, action)
 	if err != nil {
-		return "", err
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		msg := limitWebSearchText(err.Error(), 1200)
+		result = formatWebSearchActionFailure(action, msg)
+		a.debug.SaveJSON("web search action error", map[string]any{
+			"call_id": call.ID,
+			"name":    call.Name,
+			"action":  action,
+			"error":   msg,
+			"backend": search.Name(),
+		})
+		a.logger.Warn("web search action failed",
+			zap.String("backend", search.Name()),
+			zap.String("call_id", call.ID),
+			zap.String("error", msg),
+		)
 	}
 	a.debug.SaveJSON("web search response", map[string]any{
 		"call_id": call.ID,
@@ -675,6 +691,37 @@ func formatWebSearchFailure(queries []string, errs []string) string {
 		b.WriteString("\n- ")
 		b.WriteString(limitWebSearchText(errText, 1200))
 	}
+	return strings.TrimSpace(b.String())
+}
+
+func formatWebSearchActionFailure(action map[string]any, errText string) string {
+	actionType := strings.TrimSpace(stringField(action, "type"))
+	if actionType == "" {
+		actionType = "search"
+	}
+	target := ""
+	switch actionType {
+	case "open_page", "find_in_page":
+		target = strings.TrimSpace(stringField(action, "url"))
+	default:
+		target = strings.TrimSpace(stringField(action, "query"))
+	}
+	var b strings.Builder
+	b.WriteString("Web search action failed.\n")
+	b.WriteString("Action: ")
+	b.WriteString(actionType)
+	b.WriteByte('\n')
+	if target != "" {
+		b.WriteString("Target: ")
+		b.WriteString(target)
+		b.WriteByte('\n')
+	}
+	if errText != "" {
+		b.WriteString("Error: ")
+		b.WriteString(errText)
+		b.WriteByte('\n')
+	}
+	b.WriteString("Use the available search results or try another source if needed.")
 	return strings.TrimSpace(b.String())
 }
 
