@@ -23,12 +23,18 @@ const (
 	maxUpstreamErrorBodyLogBytes = 16 << 10
 	maxUpstreamErrorMessageBytes = 4 << 10
 	maxToolExtraContentEntries   = 4096
+
+	reasoningHistoryAuto             = "auto"
+	reasoningHistoryDrop             = "drop"
+	reasoningHistoryReasoningContent = "reasoning-content"
+	reasoningHistoryAssistantContent = "assistant-content"
 )
 
 type AdapterConfig struct {
 	ProviderURL              string
 	Model                    string
 	ReasoningEffort          string
+	ReasoningHistory         string
 	APIKey                   string
 	DisableUpstreamStreaming bool
 	WebSearcher              WebSearcher
@@ -41,6 +47,7 @@ type Adapter struct {
 	chatURL                  string
 	model                    string
 	reasoningEffort          string
+	reasoningHistory         string
 	apiKey                   string
 	disableUpstreamStreaming bool
 	search                   WebSearcher
@@ -62,6 +69,10 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 	if cfg.ReasoningEffort == "" {
 		return nil, errors.New("reasoning effort is required")
 	}
+	reasoningHistory, err := resolveReasoningHistoryMode(cfg.ReasoningHistory, cfg.Model)
+	if err != nil {
+		return nil, err
+	}
 	chatURL, err := normalizeChatCompletionsURL(cfg.ProviderURL)
 	if err != nil {
 		return nil, err
@@ -82,6 +93,7 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 		chatURL:                  chatURL,
 		model:                    cfg.Model,
 		reasoningEffort:          cfg.ReasoningEffort,
+		reasoningHistory:         reasoningHistory,
 		apiKey:                   strings.TrimSpace(cfg.APIKey),
 		disableUpstreamStreaming: cfg.DisableUpstreamStreaming,
 		search:                   search,
@@ -94,6 +106,34 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 
 func (a *Adapter) ChatCompletionsURL() string {
 	return a.chatURL
+}
+
+func resolveReasoningHistoryMode(raw, model string) (string, error) {
+	mode := strings.TrimSpace(strings.ToLower(raw))
+	if mode == "" {
+		mode = reasoningHistoryAuto
+	}
+	switch mode {
+	case reasoningHistoryAuto:
+		if modelUsesKimiReasoningContent(model) {
+			return reasoningHistoryReasoningContent, nil
+		}
+		return reasoningHistoryDrop, nil
+	case reasoningHistoryDrop, reasoningHistoryReasoningContent, reasoningHistoryAssistantContent:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid reasoning history mode %q: expected auto, drop, reasoning-content, or assistant-content", raw)
+	}
+}
+
+func modelUsesKimiReasoningContent(model string) bool {
+	model = strings.ToLower(model)
+	return strings.Contains(model, "kimi-k2-thinking") || strings.Contains(model, "kimi-k2.6")
+}
+
+func modelNeedsPreservedThinking(model string) bool {
+	model = strings.ToLower(model)
+	return strings.Contains(model, "kimi-k2.6")
 }
 
 func (a *Adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -382,7 +422,7 @@ func (a *Adapter) extraContentForCallID(callID string) any {
 }
 
 func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]any, *translationContext, error) {
-	builder := newRequestBuilder(a.extraContentForCallID)
+	builder := newRequestBuilder(a.reasoningHistory, a.extraContentForCallID)
 	tools := builder.translateTools(req["tools"])
 	messages := builder.translateInput(req)
 	if len(builder.extraTools) > 0 {
@@ -397,6 +437,12 @@ func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]
 		"reasoning_effort": a.reasoningEffort,
 		"messages":         messages,
 		"stream":           stream,
+	}
+	if a.reasoningHistory == reasoningHistoryReasoningContent && modelNeedsPreservedThinking(a.model) {
+		chatReq["thinking"] = map[string]any{
+			"type": "enabled",
+			"keep": "all",
+		}
 	}
 	if stream {
 		chatReq["stream_options"] = map[string]any{"include_usage": true}
@@ -671,6 +717,7 @@ type requestBuilder struct {
 	extraTools         []any
 	pendingImageMsgs   []map[string]any
 	renderedCallIDs    map[string]bool
+	reasoningHistory   string
 	lookupExtraContent func(callID string) any
 }
 
@@ -685,12 +732,49 @@ type toolMapping struct {
 	Namespace string
 }
 
-func newRequestBuilder(lookupExtraContent func(callID string) any) *requestBuilder {
+type assistantHistoryMessage struct {
+	reasoning strings.Builder
+	content   any
+	hasText   bool
+	toolCalls []any
+}
+
+func (m *assistantHistoryMessage) empty() bool {
+	return m.reasoning.Len() == 0 && !m.hasText && len(m.toolCalls) == 0
+}
+
+func (m *assistantHistoryMessage) flush() []map[string]any {
+	if m.empty() {
+		return nil
+	}
+	message := map[string]any{"role": "assistant"}
+	if m.hasText {
+		message["content"] = m.content
+	} else if len(m.toolCalls) > 0 {
+		message["content"] = nil
+	} else {
+		message["content"] = ""
+	}
+	if m.reasoning.Len() > 0 {
+		message["reasoning_content"] = m.reasoning.String()
+	}
+	if len(m.toolCalls) > 0 {
+		message["tool_calls"] = m.toolCalls
+	}
+	m.reasoning.Reset()
+	m.content = nil
+	m.hasText = false
+	m.toolCalls = nil
+	return []map[string]any{message}
+}
+
+func newRequestBuilder(reasoningHistory string, lookupExtraContent func(callID string) any) *requestBuilder {
 	return &requestBuilder{
 		usedNames:          map[string]int{},
 		byChat:             map[string]toolMapping{},
 		byKey:              map[string]toolMapping{},
 		renderedCallIDs:    map[string]bool{},
+		reasoningHistory:   reasoningHistory,
 		lookupExtraContent: lookupExtraContent,
 	}
 }
@@ -946,6 +1030,7 @@ func reservedMCPToolName(name string) bool {
 
 func (b *requestBuilder) translateInput(req map[string]any) []map[string]any {
 	var messages []map[string]any
+	var pendingAssistant assistantHistoryMessage
 	if instructions, ok := req["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
 		messages = append(messages, map[string]any{"role": "system", "content": instructions})
 	}
@@ -958,21 +1043,63 @@ func (b *requestBuilder) translateInput(req map[string]any) []map[string]any {
 			item, ok := value.(map[string]any)
 			if !ok {
 				messages = append(messages, b.flushPendingImageMessages()...)
+				messages = append(messages, pendingAssistant.flush()...)
 				messages = append(messages, markerMessage(value))
 				continue
 			}
 			if !isToolOutputItem(item) {
 				messages = append(messages, b.flushPendingImageMessages()...)
 			}
-			messages = append(messages, b.itemToMessages(item)...)
+			itemMessages := b.itemToMessages(item)
+			if b.reasoningHistory == reasoningHistoryReasoningContent {
+				if b.mergeReasoningHistoryItem(item, itemMessages, &pendingAssistant, &messages) {
+					continue
+				}
+			}
+			messages = append(messages, pendingAssistant.flush()...)
+			messages = append(messages, itemMessages...)
 		}
+		messages = append(messages, pendingAssistant.flush()...)
 		messages = append(messages, b.flushPendingImageMessages()...)
 	case nil:
 	default:
 		messages = append(messages, b.flushPendingImageMessages()...)
+		messages = append(messages, pendingAssistant.flush()...)
 		messages = append(messages, markerMessage(input))
 	}
 	return messages
+}
+
+func (b *requestBuilder) mergeReasoningHistoryItem(item map[string]any, itemMessages []map[string]any, pending *assistantHistoryMessage, messages *[]map[string]any) bool {
+	switch stringField(item, "type") {
+	case "reasoning":
+		if content := reasoningItemContent(item); content != "" {
+			pending.reasoning.WriteString(content)
+		}
+		return true
+	case "message":
+		if normalizeRole(stringField(item, "role")) != "assistant" || len(itemMessages) != 1 {
+			return false
+		}
+		if pending.hasText {
+			*messages = append(*messages, pending.flush()...)
+		}
+		pending.content = itemMessages[0]["content"]
+		pending.hasText = true
+		return true
+	case "function_call", "custom_tool_call", "tool_search_call":
+		if len(itemMessages) != 1 {
+			return false
+		}
+		calls, ok := itemMessages[0]["tool_calls"].([]any)
+		if !ok || len(calls) == 0 {
+			return false
+		}
+		pending.toolCalls = append(pending.toolCalls, calls...)
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
@@ -984,11 +1111,13 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 			"content": chatContentFromResponsesContent(item["content"], role),
 		}}
 	case "reasoning":
-		if content := reasoningItemContent(item); content != "" {
-			return []map[string]any{{
-				"role":    "assistant",
-				"content": content,
-			}}
+		if b.reasoningHistory == reasoningHistoryAssistantContent {
+			if content := reasoningItemContent(item); content != "" {
+				return []map[string]any{{
+					"role":    "assistant",
+					"content": content,
+				}}
+			}
 		}
 		return nil
 	case "function_call":
@@ -1594,6 +1723,13 @@ func (g *chatGeneration) reasoningState() *streamedReasoningItem {
 		g.reasoning = &streamedReasoningItem{id: newID("rs"), outputIndex: -1}
 	}
 	return g.reasoning
+}
+
+func (g *chatGeneration) reasoningContent() string {
+	if g.reasoning == nil {
+		return ""
+	}
+	return g.reasoning.text.String()
 }
 
 func (g *chatGeneration) applyStreamChunk(chunk map[string]any, sse *responseSSEWriter, respID string) error {

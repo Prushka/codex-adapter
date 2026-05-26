@@ -70,7 +70,7 @@ func TestBuildChatRequestForcesModelReasoningAndMessages(t *testing.T) {
 	}
 }
 
-func TestBuildChatRequestFlattensReasoningItems(t *testing.T) {
+func TestBuildChatRequestDropsReasoningItemsByDefault(t *testing.T) {
 	adapter := testAdapter(t, "http://example.test/v1", nil)
 	req := map[string]any{
 		"input": []any{
@@ -89,17 +89,153 @@ func TestBuildChatRequestFlattensReasoningItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 1 || messages[0]["role"] != "user" || messages[0]["content"] != "" {
+		t.Fatalf("messages = %#v", messages)
+	}
+}
+
+func TestBuildChatRequestCanUseLegacyAssistantContentReasoning(t *testing.T) {
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:      "http://example.test/v1",
+		Model:            "forced-model",
+		ReasoningEffort:  "low",
+		ReasoningHistory: reasoningHistoryAssistantContent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "reasoning",
+				"summary": []any{},
+				"content": []any{
+					map[string]any{"type": "reasoning_text", "text": "hidden detail"},
+				},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 1 || messages[0]["role"] != "assistant" || messages[0]["content"] != "hidden detail" {
+		t.Fatalf("messages = %#v", messages)
+	}
+}
+
+func TestBuildChatRequestUsesKimiReasoningContentAndPreservedThinking(t *testing.T) {
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:     "http://example.test/v1",
+		Model:           "kimi-k2.6",
+		ReasoningEffort: "low",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "reasoning",
+				"summary": []any{},
+				"content": []any{
+					map[string]any{"type": "reasoning_text", "text": "hidden detail"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "visible answer"},
+				},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thinking := chatReq["thinking"].(map[string]any)
+	if thinking["type"] != "enabled" || thinking["keep"] != "all" {
+		t.Fatalf("thinking = %#v", thinking)
+	}
+	messages := chatReq["messages"].([]map[string]any)
 	if len(messages) != 1 {
-		t.Fatalf("messages length = %d", len(messages))
+		t.Fatalf("messages length = %d: %#v", len(messages), messages)
 	}
-	if messages[0]["role"] != "assistant" {
-		t.Fatalf("role = %v", messages[0]["role"])
+	if messages[0]["role"] != "assistant" || messages[0]["content"] != "visible answer" || messages[0]["reasoning_content"] != "hidden detail" {
+		t.Fatalf("assistant message = %#v", messages[0])
 	}
-	if got := messages[0]["content"]; got != "hidden detail" {
-		t.Fatalf("content = %v", got)
+}
+
+func TestBuildChatRequestMergesReasoningContentWithToolCalls(t *testing.T) {
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:      "http://example.test/v1",
+		Model:            "forced-model",
+		ReasoningEffort:  "low",
+		ReasoningHistory: reasoningHistoryReasoningContent,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got, ok := messages[0]["content"].(string); !ok || strings.HasPrefix(got, "[Responses API item]") {
-		t.Fatalf("reasoning content still marked: %#v", messages[0]["content"])
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "shell_command",
+				"description": "Run a shell command.",
+				"parameters":  objectSchema(),
+			},
+		},
+		"input": []any{
+			map[string]any{
+				"type":    "reasoning",
+				"summary": []any{},
+				"content": []any{
+					map[string]any{"type": "reasoning_text", "text": "need a command"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "I'll inspect it."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "call-1",
+				"name":      "shell_command",
+				"arguments": "{\"cmd\":\"pwd\"}",
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call-1",
+				"output":  "/tmp/project",
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages length = %d: %#v", len(messages), messages)
+	}
+	assistantMsg := messages[0]
+	if assistantMsg["reasoning_content"] != "need a command" || assistantMsg["content"] != "I'll inspect it." {
+		t.Fatalf("assistant message = %#v", assistantMsg)
+	}
+	if calls, ok := assistantMsg["tool_calls"].([]any); !ok || len(calls) != 1 {
+		t.Fatalf("tool calls = %#v", assistantMsg["tool_calls"])
+	}
+	if messages[1]["role"] != "tool" || messages[1]["content"] != "/tmp/project" {
+		t.Fatalf("tool message = %#v", messages[1])
 	}
 }
 
@@ -1492,6 +1628,32 @@ func TestWebSearchCallWithAssistantTextStillTriggersFollowUp(t *testing.T) {
 	assertCompleted(t, events)
 	if upstreamHits.Load() != 2 {
 		t.Fatalf("upstream hits = %d", upstreamHits.Load())
+	}
+}
+
+func TestBuildWebSearchFollowUpRequestPreservesReasoningContent(t *testing.T) {
+	call := &chatToolCall{
+		ID:   "call-web",
+		Name: "web_search",
+	}
+	call.Arguments.WriteString(`{"query":"weather"}`)
+	followUp, err := buildWebSearchFollowUpRequest(
+		map[string]any{"messages": []any{map[string]any{"role": "user", "content": "go"}}},
+		call,
+		"weather result",
+		"searched mentally",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := followUp["messages"].([]any)
+	assistantMsg := messages[len(messages)-2].(map[string]any)
+	if assistantMsg["reasoning_content"] != "searched mentally" {
+		t.Fatalf("assistant message = %#v", assistantMsg)
+	}
+	toolMsg := messages[len(messages)-1].(map[string]any)
+	if toolMsg["role"] != "tool" || toolMsg["content"] != "weather result" {
+		t.Fatalf("tool message = %#v", toolMsg)
 	}
 }
 

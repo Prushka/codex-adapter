@@ -17,6 +17,7 @@ type cliConfig struct {
 	providerURL              string
 	model                    string
 	reasoningEffort          string
+	reasoningHistory         string
 	apiKey                   string
 	apiKeyEnv                string
 	disableUpstreamStreaming bool
@@ -66,6 +67,7 @@ func main() {
 		ProviderURL:              cfg.providerURL,
 		Model:                    cfg.model,
 		ReasoningEffort:          cfg.reasoningEffort,
+		ReasoningHistory:         cfg.reasoningHistory,
 		APIKey:                   upstreamAPIKey,
 		DisableUpstreamStreaming: cfg.disableUpstreamStreaming,
 		WebSearcher:              searcher,
@@ -98,6 +100,7 @@ func parseFlags() cliConfig {
 	flag.StringVar(&cfg.providerURL, "provider-url", "", "OpenAI-compatible upstream provider base URL or /v1 URL")
 	flag.StringVar(&cfg.model, "model", "", "upstream chat_completions model to force into every request")
 	flag.StringVar(&cfg.reasoningEffort, "reasoning-effort", "medium", "reasoning_effort value to force into every upstream request")
+	flag.StringVar(&cfg.reasoningHistory, "reasoning-history", "auto", "historical reasoning translation: auto, drop, reasoning-content, or assistant-content")
 	flag.StringVar(&cfg.apiKey, "api-key", "", "upstream provider API key; overrides any Authorization header sent by Codex")
 	flag.StringVar(&cfg.apiKeyEnv, "api-key-env", "", "environment variable containing the upstream provider API key")
 	flag.BoolVar(&cfg.disableUpstreamStreaming, "disable-upstream-streaming", false, "buffer upstream Chat Completions responses instead of requesting SSE")

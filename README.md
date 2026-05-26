@@ -62,20 +62,21 @@ Set `-disable-upstream-streaming` to make `/responses` buffer the upstream Chat 
 
 ## Options
 
-| Flag                | Default          | Description                                                                                       |
-|---------------------|------------------|---------------------------------------------------------------------------------------------------|
-| `-listen`           | `127.0.0.1:8080` | Local listening address for Codex requests.                                                       |
-| `-provider-url`     | required         | Upstream OpenAI-compatible base URL, `/v1` URL, or direct Chat Completions URL.                   |
-| `-model`            | required         | Upstream model forced into every Chat Completions request.                                        |
-| `-reasoning-effort` | `medium`         | `reasoning_effort` forced into every upstream request.                                            |
-| `-api-key-env`      | unset            | Environment variable containing the upstream provider API key.                                    |
-| `-api-key`          | unset            | Upstream provider API key supplied directly on the command line. Prefer `-api-key-env`.           |
-| `-disable-upstream-streaming` | `false` | Buffer upstream Chat Completions responses instead of requesting SSE chunks.                       |
-| `-search-provider`  | `duckduckgo`     | Local web search backend: `auto`, `duckduckgo`, `duckduckgo-lite`, `bing`, `yahoo`, or `searxng`. |
-| `-search-url`       | unset            | Backend URL for providers that need one. Required for `searxng`.                                  |
-| `-debug`            | `false`          | Write translated requests, responses, SSE events, and search activity as ordered JSON files.      |
-| `-debug-dir`        | `debug`          | Directory for debug JSON files.                                                                   |
-| `-timeout`          | `10m`            | Timeout for upstream and local search HTTP requests.                                              |
+| Flag                          | Default          | Description                                                                                       |
+|-------------------------------|------------------|---------------------------------------------------------------------------------------------------|
+| `-listen`                     | `127.0.0.1:8080` | Local listening address for Codex requests.                                                       |
+| `-provider-url`               | required         | Upstream OpenAI-compatible base URL, `/v1` URL, or direct Chat Completions URL.                   |
+| `-model`                      | required         | Upstream model forced into every Chat Completions request.                                        |
+| `-reasoning-effort`           | `medium`         | `reasoning_effort` forced into every upstream request.                                            |
+| `-reasoning-history`          | `auto`           | Historical Responses reasoning translation: `auto`, `drop`, `reasoning-content`, or `assistant-content`. |
+| `-api-key-env`                | unset            | Environment variable containing the upstream provider API key.                                    |
+| `-api-key`                    | unset            | Upstream provider API key supplied directly on the command line. Prefer `-api-key-env`.           |
+| `-disable-upstream-streaming` | `false`          | Buffer upstream Chat Completions responses instead of requesting SSE chunks.                       |
+| `-search-provider`            | `duckduckgo`     | Local web search backend: `auto`, `duckduckgo`, `duckduckgo-lite`, `bing`, `yahoo`, or `searxng`. |
+| `-search-url`                 | unset            | Backend URL for providers that need one. Required for `searxng`.                                  |
+| `-debug`                      | `false`          | Write translated requests, responses, SSE events, and search activity as ordered JSON files.      |
+| `-debug-dir`                  | `debug`          | Directory for debug JSON files.                                                                   |
+| `-timeout`                    | `10m`            | Timeout for upstream and local search HTTP requests.                                              |
 
 `-api-key` and `-api-key-env` are mutually exclusive. If neither is set, the adapter forwards the inbound `Authorization` header sent by Codex. If either adapter-owned key source is set, it overrides Codex's inbound authorization and is sent upstream as `Authorization: Bearer <key>`. Values that already include an authorization scheme, such as `Bearer sk-...`, are forwarded as-is.
 
@@ -113,7 +114,8 @@ go run ./cmd/codex-adapter \
 
 - Responses `instructions` become a system message. `developer` input messages are also sent upstream as system messages for Chat Completions compatibility.
 - Responses `input` strings and message items become Chat Completions `messages`. User `input_image` content is translated to Chat Completions `image_url` parts.
-- Responses reasoning items and upstream reasoning fields are translated to Responses reasoning output items where possible.
+- Upstream `reasoning_content`, `reasoning`, and `reasoning_delta` fields are translated to Responses reasoning output items where possible.
+- Historical Responses reasoning items are not sent upstream as normal assistant text by default. `-reasoning-history auto` sends them as Chat Completions `reasoning_content` for Kimi K2 thinking/K2.6 models, adds `thinking: {"type":"enabled","keep":"all"}` for Kimi K2.6 preserved thinking, and drops them for other models. Use `-reasoning-history reasoning-content` for other compatible providers, `drop` for strict providers such as DeepSeek reasoner-style APIs, or `assistant-content` for the previous legacy behavior.
 - Responses function tools become Chat Completions `function` tools.
 - Namespace tools are flattened using Codex-style names and reconstructed with `namespace` on the way back. Tool names with a reserved `mcp__` prefix are renamed before sending upstream.
 - Responses custom/freeform tools, including `apply_patch`, are exposed upstream as strict functions with one required string property named `input`. Returned calls are reconstructed as `custom_tool_call` items.

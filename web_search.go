@@ -73,7 +73,11 @@ func (a *Adapter) handleGeneration(
 	if err != nil {
 		return fmt.Errorf("web search follow-up failed: %w", err)
 	}
-	followUpReq, err := buildWebSearchFollowUpRequest(upstreamReq, call, webSearchText)
+	reasoningContent := ""
+	if a.reasoningHistory == reasoningHistoryReasoningContent {
+		reasoningContent = gen.reasoningContent()
+	}
+	followUpReq, err := buildWebSearchFollowUpRequest(upstreamReq, call, webSearchText, reasoningContent)
 	if err != nil {
 		return fmt.Errorf("failed to build web search follow-up request: %w", err)
 	}
@@ -298,13 +302,16 @@ func (a *Adapter) fetchPageText(ctx context.Context, rawURL string) (string, err
 	return fmt.Sprintf("Title: %s\nURL: %s\nExcerpt:\n%s", title, u.String(), text), nil
 }
 
-func buildWebSearchFollowUpRequest(original map[string]any, call *chatToolCall, resultText string) (map[string]any, error) {
+func buildWebSearchFollowUpRequest(original map[string]any, call *chatToolCall, resultText, reasoningContent string) (map[string]any, error) {
 	followUp := cloneJSONValue(original)
 	followUpReq, ok := followUp.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("unexpected upstream request shape")
 	}
 	assistantMessage := assistantToolCallMessage(call.ID, call.Name, call.Arguments.String(), call.ExtraContent)
+	if strings.TrimSpace(reasoningContent) != "" {
+		assistantMessage["reasoning_content"] = reasoningContent
+	}
 	toolMessage := map[string]any{
 		"role":         "tool",
 		"tool_call_id": call.ID,
