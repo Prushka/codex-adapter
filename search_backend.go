@@ -19,6 +19,10 @@ type WebSearcher interface {
 	Search(ctx context.Context, query string, limit int) ([]searchResult, error)
 }
 
+type searchResultPageEnrichingSearcher interface {
+	allowSearchResultPageEnrichment()
+}
+
 type WebSearchConfig struct {
 	Provider string
 	Endpoint string
@@ -87,6 +91,8 @@ func (s *duckDuckGoSearcher) Name() string {
 	}
 	return "duckduckgo"
 }
+
+func (s *duckDuckGoSearcher) allowSearchResultPageEnrichment() {}
 
 func (s *duckDuckGoSearcher) Search(ctx context.Context, query string, limit int) ([]searchResult, error) {
 	if strings.TrimSpace(query) == "" {
@@ -160,6 +166,8 @@ func (s *searxngSearcher) Name() string {
 	return "searxng"
 }
 
+func (s *searxngSearcher) allowSearchResultPageEnrichment() {}
+
 func (s *searxngSearcher) Search(ctx context.Context, query string, limit int) ([]searchResult, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil
@@ -216,9 +224,16 @@ func (s *searxngSearcher) Search(ctx context.Context, query string, limit int) (
 		if title == "" && snippet == "" && strings.TrimSpace(result.URL) == "" {
 			continue
 		}
+		if isBlockedSearchResultURL(result.URL) {
+			continue
+		}
+		normalizedURL := normalizeSearchResultURL(result.URL)
+		if isBlockedSearchResultURL(normalizedURL) {
+			continue
+		}
 		results = append(results, searchResult{
 			Title:   title,
-			URL:     normalizeSearchResultURL(result.URL),
+			URL:     normalizedURL,
 			Snippet: snippet,
 		})
 		if len(results) >= limit {

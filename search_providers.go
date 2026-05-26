@@ -62,6 +62,8 @@ func (s *fallbackSearcher) Name() string {
 	return s.name
 }
 
+func (s *fallbackSearcher) allowSearchResultPageEnrichment() {}
+
 func (s *fallbackSearcher) Search(ctx context.Context, query string, limit int) ([]searchResult, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil
@@ -123,6 +125,8 @@ func (s *bingSearcher) Name() string {
 	return "bing"
 }
 
+func (s *bingSearcher) allowSearchResultPageEnrichment() {}
+
 func (s *bingSearcher) Search(ctx context.Context, query string, limit int) ([]searchResult, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil
@@ -181,6 +185,8 @@ func newYahooSearcher(client *http.Client, logger *zap.Logger) WebSearcher {
 func (s *yahooSearcher) Name() string {
 	return "yahoo"
 }
+
+func (s *yahooSearcher) allowSearchResultPageEnrichment() {}
 
 func (s *yahooSearcher) Search(ctx context.Context, query string, limit int) ([]searchResult, error) {
 	if strings.TrimSpace(query) == "" {
@@ -241,7 +247,13 @@ func extractSearchResults(doc *goquery.Document, limit int, patterns []searchRes
 	seen := map[string]struct{}{}
 	appendResult := func(title, href, snippet string) {
 		title = collapseSearchWhitespace(title)
+		if isBlockedSearchResultURL(href) {
+			return
+		}
 		href = normalizeSearchResultURL(href)
+		if isBlockedSearchResultURL(href) {
+			return
+		}
 		snippet = collapseSearchWhitespace(snippet)
 		key := strings.ToLower(strings.TrimSpace(href))
 		if key == "" {
@@ -391,6 +403,9 @@ func normalizeSearchResultURL(raw string) string {
 	if raw == "" {
 		return ""
 	}
+	if isBlockedSearchResultURL(raw) {
+		return ""
+	}
 	if decoded := normalizeDuckDuckGoSearchResultURL(raw); decoded != "" {
 		return decoded
 	}
@@ -410,7 +425,39 @@ func normalizeSearchResultURL(raw string) string {
 	if u.Scheme == "" && u.Host == "" {
 		return raw
 	}
+	if isBlockedSearchResultURL(u.String()) {
+		return ""
+	}
 	return u.String()
+}
+
+func isBlockedSearchResultURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	path := strings.ToLower(strings.TrimSpace(u.EscapedPath()))
+	query := u.Query()
+	if query.Get("ad_domain") != "" || query.Get("ad_provider") != "" || query.Get("ad_type") != "" {
+		return true
+	}
+	if isHostOrSubdomain(host, "duckduckgo.com") && path == "/y.js" {
+		return true
+	}
+	if isHostOrSubdomain(host, "bing.com") && strings.Contains(path, "/aclick") {
+		return true
+	}
+	switch host {
+	case "googleadservices.com", "www.googleadservices.com", "doubleclick.net", "www.doubleclick.net", "clickserve.dartsearch.net":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeDuckDuckGoSearchResultURL(raw string) string {

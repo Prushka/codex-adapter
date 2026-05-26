@@ -1995,6 +1995,43 @@ func TestWebSearchQueriesFallbackRunsEachQuerySeparately(t *testing.T) {
 	}
 }
 
+func TestExecuteSearchAddsGenericPageExcerptsForEligibleSearchers(t *testing.T) {
+	pageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <head><title>Useful result</title></head>
+  <body>
+    <main>This article explains generic search result enrichment with concrete details from the page.</main>
+  </body>
+</html>`))
+	}))
+	defer pageServer.Close()
+
+	searcher := &enrichableMockWebSearcher{
+		mockWebSearcher: mockWebSearcher{
+			results: []searchResult{
+				{
+					Title:   "Useful result",
+					URL:     pageServer.URL + "/article",
+					Snippet: "Short search snippet.",
+				},
+			},
+		},
+	}
+	adapter := testAdapterWithClientAndSearcher(t, "http://example.test/v1", nil, pageServer.Client(), searcher)
+
+	text, err := adapter.executeSearch(context.Background(), map[string]any{
+		"query": "generic query",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "Short search snippet.") || !strings.Contains(text, "Page excerpt: This article explains generic search result enrichment") {
+		t.Fatalf("search result was not enriched with page excerpt:\n%s", text)
+	}
+}
+
 func TestBuildChatRequestReplaysCachedWebSearchHistoryAsToolResult(t *testing.T) {
 	adapter, err := NewAdapter(AdapterConfig{
 		ProviderURL:      "http://example.test/v1",
@@ -2348,6 +2385,48 @@ func TestDuckDuckGoSearchBackendParsesLiteHTML(t *testing.T) {
 	}
 }
 
+func TestSearchBackendFiltersAdRedirectResults(t *testing.T) {
+	duckHTML := `<!doctype html>
+<html>
+  <body>
+    <div class="result">
+      <a class="result__a" href="https://duckduckgo.com/y.js?ad_domain=ads.example&amp;ad_provider=bingv7aa&amp;ad_type=txad">Sponsored result</a>
+      <a class="result__snippet">Buy something unrelated.</a>
+    </div>
+    <div class="result">
+      <a class="result__a" href="/l/?uddg=https%3A%2F%2Fexample.com%2Farticle">Useful result</a>
+      <a class="result__snippet">This is the relevant organic result.</a>
+    </div>
+  </body>
+</html>`
+
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.Host, "duckduckgo.com") {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Status:     "200 OK",
+					Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
+					Body:       io.NopCloser(strings.NewReader(duckHTML)),
+				}, nil
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		}),
+	}
+
+	searcher := newDuckDuckGoSearcher(client, zap.NewNop())
+	results, err := searcher.Search(context.Background(), "generic query", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %#v", results)
+	}
+	if results[0].URL != "https://example.com/article" || strings.Contains(results[0].Title, "Sponsored") {
+		t.Fatalf("ad result was not filtered: %#v", results)
+	}
+}
+
 func TestBingSearchBackendParsesHTMLResults(t *testing.T) {
 	bingHTML := `<!doctype html>
 <html>
@@ -2679,6 +2758,12 @@ func (m *mockWebSearcher) Search(_ context.Context, query string, limit int) ([]
 	}
 	return results, nil
 }
+
+type enrichableMockWebSearcher struct {
+	mockWebSearcher
+}
+
+func (m *enrichableMockWebSearcher) allowSearchResultPageEnrichment() {}
 
 type queryEchoWebSearcher struct {
 	queries []string

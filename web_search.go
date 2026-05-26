@@ -9,16 +9,19 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"go.uber.org/zap"
 )
 
 const (
-	maxWebSearchFollowUps    = 50
-	maxWebSearchResults      = 30
-	maxWebSearchPageBytes    = 2 << 24
-	maxWebSearchExcerptBytes = 6 << 16
+	maxWebSearchFollowUps        = 50
+	maxWebSearchResults          = 30
+	maxWebSearchPageBytes        = 2 << 24
+	maxWebSearchExcerptBytes     = 6 << 16
+	maxSearchResultExcerptBytes  = 14000
+	searchResultPageFetchTimeout = 10 * time.Second
 )
 
 type searchResult struct {
@@ -241,6 +244,9 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 			groups = append(groups, group)
 		}
 	}
+	if searcherAllowsPageExcerptEnrichment(search) {
+		groups = a.enrichSearchResultGroups(ctx, groups, webSearchPageExcerptResultLimit(action))
+	}
 
 	if resultCount == 0 && len(searchErrors) > 0 {
 		return formatWebSearchFailure(queries, searchErrors), nil
@@ -439,6 +445,156 @@ func searchResultMatchesAllowedDomains(result searchResult, domains []string) bo
 		}
 	}
 	return false
+}
+
+func searcherAllowsPageExcerptEnrichment(search WebSearcher) bool {
+	if search == nil {
+		return false
+	}
+	_, ok := search.(searchResultPageEnrichingSearcher)
+	return ok
+}
+
+func webSearchPageExcerptResultLimit(action map[string]any) int {
+	switch strings.ToLower(strings.TrimSpace(stringField(action, "search_context_size"))) {
+	case "low":
+		return 0
+	case "high":
+		return 5
+	default:
+		return 3
+	}
+}
+
+func (a *Adapter) enrichSearchResultGroups(ctx context.Context, groups []querySearchResults, perQueryLimit int) []querySearchResults {
+	if perQueryLimit <= 0 || len(groups) == 0 {
+		return groups
+	}
+	cache := map[string]string{}
+	for groupIndex := range groups {
+		enriched := 0
+		for resultIndex := range groups[groupIndex].Results {
+			if enriched >= perQueryLimit {
+				break
+			}
+			result := &groups[groupIndex].Results[resultIndex]
+			if !shouldFetchSearchResultPage(result.URL) {
+				continue
+			}
+			key := strings.ToLower(strings.TrimSpace(result.URL))
+			excerpt, ok := cache[key]
+			if !ok {
+				var err error
+				excerpt, err = a.fetchSearchResultPageExcerpt(ctx, result.URL, maxSearchResultExcerptBytes)
+				if err != nil {
+					if a.logger != nil {
+						a.logger.Debug("failed to enrich search result page",
+							zap.String("url", result.URL),
+							zap.Error(err),
+						)
+					}
+					excerpt = ""
+				}
+				cache[key] = excerpt
+			}
+			if excerpt == "" {
+				continue
+			}
+			result.Snippet = mergeSearchResultSnippet(result.Snippet, excerpt)
+			enriched++
+		}
+	}
+	return groups
+}
+
+func shouldFetchSearchResultPage(rawURL string) bool {
+	if rawURL == "" || isBlockedSearchResultURL(rawURL) {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	path := strings.ToLower(u.EscapedPath())
+	for _, suffix := range []string{
+		".7z", ".avi", ".bmp", ".bz2", ".dmg", ".doc", ".docx", ".exe", ".gif", ".gz",
+		".ico", ".jpeg", ".jpg", ".mov", ".mp3", ".mp4", ".pdf", ".png", ".ppt", ".pptx",
+		".rar", ".svg", ".tar", ".tgz", ".webm", ".webp", ".xls", ".xlsx", ".zip",
+	} {
+		if strings.HasSuffix(path, suffix) {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *Adapter) fetchSearchResultPageExcerpt(ctx context.Context, rawURL string, limit int) (string, error) {
+	if limit <= 0 {
+		return "", nil
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" {
+		u.Scheme = "https"
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("unsupported page URL scheme %q", u.Scheme)
+	}
+	pageCtx, cancel := context.WithTimeout(ctx, searchResultPageFetchTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pageCtx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", webSearchUserAgent)
+	req.Header.Set("Accept", "text/html,text/plain;q=0.9,application/xhtml+xml;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	client := a.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, body, err := doRequestWithRetry(pageCtx, client, req, a.logger, "search result page")
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", searchHTTPError("search result page", resp, body)
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if contentType != "" && !strings.Contains(contentType, "html") && !strings.Contains(contentType, "xml") && !strings.Contains(contentType, "text/plain") {
+		return "", fmt.Errorf("unsupported page content type %q", resp.Header.Get("Content-Type"))
+	}
+	_, text, err := extractPageText(body, resp.Header.Get("Content-Type"), u.String())
+	if err != nil {
+		return "", err
+	}
+	return limitWebSearchText(text, limit), nil
+}
+
+func mergeSearchResultSnippet(snippet, excerpt string) string {
+	snippet = collapseSearchWhitespace(snippet)
+	excerpt = collapseSearchWhitespace(excerpt)
+	if excerpt == "" {
+		return snippet
+	}
+	if snippet == "" {
+		return "Page excerpt: " + excerpt
+	}
+	snippetKey := strings.ToLower(snippet)
+	excerptKey := strings.ToLower(excerpt)
+	if strings.Contains(snippetKey, excerptKey) {
+		return snippet
+	}
+	if len(excerptKey) > 160 && strings.Contains(snippetKey, excerptKey[:160]) {
+		return snippet
+	}
+	return snippet + "\nPage excerpt: " + excerpt
 }
 
 func webSearchResultLimit(action map[string]any) int {

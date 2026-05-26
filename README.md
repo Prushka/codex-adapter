@@ -95,7 +95,7 @@ Supported search actions:
 - `open_page`: fetches and extracts readable text from a URL.
 - `find_in_page`: fetches a URL and returns excerpts around a pattern.
 
-Domain filters from `domains` or `filters.allowed_domains` are applied after search results are normalized. The default backend tries DuckDuckGo first, then Bing and Yahoo if the primary backend is blocked or returns no parseable results. `duckduckgo-lite` starts with DuckDuckGo Lite before using the same fallbacks.
+Domain filters from `domains` or `filters.allowed_domains` are applied after search results are normalized. The default backend filters obvious ad/click-tracking results, tries DuckDuckGo first, then Bing and Yahoo if the primary backend is blocked or returns no parseable results. `duckduckgo-lite` starts with DuckDuckGo Lite before using the same fallbacks. For built-in search backends, medium and high context searches also add short page excerpts from the top organic results.
 
 Example SearXNG setup:
 
