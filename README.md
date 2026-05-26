@@ -120,13 +120,13 @@ go run ./cmd/codex-adapter \
 - Namespace tools are flattened using Codex-style names and reconstructed with `namespace` on the way back. Tool names with a reserved `mcp__` prefix are renamed before sending upstream.
 - Responses custom/freeform tools, including `apply_patch`, are exposed upstream as strict functions with one required string property named `input`. Returned calls are reconstructed as `custom_tool_call` items.
 - `tool_search` is exposed as a synthetic function and reconstructed as a client-executed `tool_search_call`. Tool definitions discovered through `tool_search_output` are registered for later follow-up calls.
-- `web_search` and `image_generation` are exposed as synthetic functions because Chat Completions has no standard equivalent for Responses hosted tools. `image_generation` is marked completed only when the upstream call includes base64 image data.
+- `web_search` and `image_generation` are exposed as synthetic functions because Chat Completions has no standard equivalent for Responses hosted tools. Completed `web_search_call` history is replayed from a bounded in-memory cache as synthetic assistant tool calls plus tool results when possible, and dropped instead of rendered as raw Responses JSON when the cache is unavailable. `image_generation` is marked completed only when the upstream call includes base64 image data.
 - `tool_choice`, `parallel_tool_calls`, and Responses JSON schema text formats are translated to their Chat Completions equivalents.
 - Nonessential Responses-only provider fields, such as `metadata`, `prompt_cache_key`, `store`, and `service_tier`, are not forwarded upstream.
 - Gemini/OpenAI compatibility metadata such as `tool_calls[].extra_content.google.thought_signature` and assistant message `extra_content` is preserved on Responses items where possible and cached so follow-up requests can send it back upstream even when Codex drops unknown item fields.
 - Streaming Chat Completions chunks are accumulated and emitted as Responses SSE events. A normal completion ends with `response.completed`; upstream `length` and `content_filter` finish reasons become `response.incomplete`.
 
-The adapter is stateless across Responses turns except for bounded caches of provider compatibility `extra_content`. Tool-call metadata is keyed by `call_id`; assistant-message metadata is keyed by message content and occurrence. Codex sends the full input on this wire path, so `previous_response_id` is not required.
+The adapter is stateless across Responses turns except for bounded caches of provider compatibility `extra_content` and synthetic web-search history. Tool-call metadata is keyed by `call_id`; assistant-message metadata is keyed by message content and occurrence; web-search history is keyed by normalized action and occurrence. Codex sends the full input on this wire path, so `previous_response_id` is not required.
 
 ## Debugging
 

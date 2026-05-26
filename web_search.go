@@ -74,6 +74,7 @@ func (a *Adapter) handleGeneration(
 	if err != nil {
 		return fmt.Errorf("web search follow-up failed: %w", err)
 	}
+	a.rememberWebSearchHistory(call, webSearchText)
 	reasoningContent := ""
 	if a.reasoningHistory == reasoningHistoryReasoningContent {
 		reasoningContent = gen.reasoningContent()

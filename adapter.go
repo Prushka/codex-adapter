@@ -26,6 +26,7 @@ const (
 	maxUpstreamErrorMessageBytes  = 4 << 10
 	maxToolExtraContentEntries    = 40960
 	maxMessageExtraContentEntries = 40960
+	maxWebSearchHistoryEntries    = 40960
 
 	reasoningHistoryAuto             = "auto"
 	reasoningHistoryDrop             = "drop"
@@ -62,6 +63,16 @@ type Adapter struct {
 	extraOrder               []string
 	messageExtraByKey        map[string][]any
 	messageExtraOrder        []string
+	webSearchByKey           map[string][]webSearchHistoryEntry
+	webSearchOrder           []string
+}
+
+type webSearchHistoryEntry struct {
+	CallID       string
+	Name         string
+	Arguments    string
+	Result       string
+	ExtraContent any
 }
 
 func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
@@ -107,6 +118,7 @@ func NewAdapter(cfg AdapterConfig) (*Adapter, error) {
 		logger:                   logger,
 		extraByCallID:            map[string]any{},
 		messageExtraByKey:        map[string][]any{},
+		webSearchByKey:           map[string][]webSearchHistoryEntry{},
 	}, nil
 }
 
@@ -426,6 +438,45 @@ func (a *Adapter) rememberMessageExtraContent(gen *chatGeneration) {
 	}
 }
 
+func (a *Adapter) rememberWebSearchHistory(call *chatToolCall, result string) {
+	if call == nil {
+		return
+	}
+	action := webSearchActionFromArguments(call.Arguments.String())
+	key := webSearchHistoryKey(action)
+	if key == "" {
+		return
+	}
+	entry := webSearchHistoryEntry{
+		CallID:       call.ID,
+		Name:         call.Name,
+		Arguments:    call.Arguments.String(),
+		Result:       result,
+		ExtraContent: cloneJSONValue(call.ExtraContent),
+	}
+	if entry.Name == "" {
+		entry.Name = "web_search"
+	}
+	if strings.TrimSpace(entry.Arguments) == "" {
+		entry.Arguments = webSearchArgumentsFromAction(action)
+	}
+
+	a.extraMu.Lock()
+	defer a.extraMu.Unlock()
+	a.webSearchByKey[key] = append(a.webSearchByKey[key], entry)
+	a.webSearchOrder = append(a.webSearchOrder, key)
+	for len(a.webSearchOrder) > maxWebSearchHistoryEntries {
+		oldest := a.webSearchOrder[0]
+		a.webSearchOrder = a.webSearchOrder[1:]
+		items := a.webSearchByKey[oldest]
+		if len(items) <= 1 {
+			delete(a.webSearchByKey, oldest)
+		} else {
+			a.webSearchByKey[oldest] = items[1:]
+		}
+	}
+}
+
 func (a *Adapter) rememberExtraContent(callID string, extra any) {
 	if callID == "" || extra == nil {
 		return
@@ -465,8 +516,23 @@ func (a *Adapter) extraContentForMessage(key string, occurrence int) any {
 	return cloneJSONValue(items[occurrence])
 }
 
+func (a *Adapter) webSearchHistoryForAction(key string, occurrence int) *webSearchHistoryEntry {
+	if key == "" || occurrence < 0 {
+		return nil
+	}
+	a.extraMu.Lock()
+	defer a.extraMu.Unlock()
+	items := a.webSearchByKey[key]
+	if occurrence >= len(items) {
+		return nil
+	}
+	entry := items[occurrence]
+	entry.ExtraContent = cloneJSONValue(entry.ExtraContent)
+	return &entry
+}
+
 func (a *Adapter) buildChatRequest(req map[string]any, stream bool) (map[string]any, *translationContext, error) {
-	builder := newRequestBuilder(a.reasoningHistory, a.extraContentForCallID, a.extraContentForMessage)
+	builder := newRequestBuilder(a.reasoningHistory, a.extraContentForCallID, a.extraContentForMessage, a.webSearchHistoryForAction)
 	tools := builder.translateTools(req["tools"])
 	messages := builder.translateInput(req)
 	if len(builder.extraTools) > 0 {
@@ -755,16 +821,18 @@ func isEventStream(contentType string) bool {
 }
 
 type requestBuilder struct {
-	usedNames          map[string]int
-	byChat             map[string]toolMapping
-	byKey              map[string]toolMapping
-	extraTools         []any
-	pendingImageMsgs   []map[string]any
-	renderedCallIDs    map[string]bool
-	reasoningHistory   string
-	messageOccurrences map[string]int
-	lookupExtraContent func(callID string) any
-	lookupMessageExtra func(key string, occurrence int) any
+	usedNames            map[string]int
+	byChat               map[string]toolMapping
+	byKey                map[string]toolMapping
+	extraTools           []any
+	pendingImageMsgs     []map[string]any
+	renderedCallIDs      map[string]bool
+	reasoningHistory     string
+	messageOccurrences   map[string]int
+	webSearchOccurrences map[string]int
+	lookupExtraContent   func(callID string) any
+	lookupMessageExtra   func(key string, occurrence int) any
+	lookupWebSearch      func(key string, occurrence int) *webSearchHistoryEntry
 }
 
 type translationContext struct {
@@ -819,16 +887,18 @@ func (m *assistantHistoryMessage) flush() []map[string]any {
 	return []map[string]any{message}
 }
 
-func newRequestBuilder(reasoningHistory string, lookupExtraContent func(callID string) any, lookupMessageExtra func(key string, occurrence int) any) *requestBuilder {
+func newRequestBuilder(reasoningHistory string, lookupExtraContent func(callID string) any, lookupMessageExtra func(key string, occurrence int) any, lookupWebSearch func(key string, occurrence int) *webSearchHistoryEntry) *requestBuilder {
 	return &requestBuilder{
-		usedNames:          map[string]int{},
-		byChat:             map[string]toolMapping{},
-		byKey:              map[string]toolMapping{},
-		renderedCallIDs:    map[string]bool{},
-		reasoningHistory:   reasoningHistory,
-		messageOccurrences: map[string]int{},
-		lookupExtraContent: lookupExtraContent,
-		lookupMessageExtra: lookupMessageExtra,
+		usedNames:            map[string]int{},
+		byChat:               map[string]toolMapping{},
+		byKey:                map[string]toolMapping{},
+		renderedCallIDs:      map[string]bool{},
+		reasoningHistory:     reasoningHistory,
+		messageOccurrences:   map[string]int{},
+		webSearchOccurrences: map[string]int{},
+		lookupExtraContent:   lookupExtraContent,
+		lookupMessageExtra:   lookupMessageExtra,
+		lookupWebSearch:      lookupWebSearch,
 	}
 }
 
@@ -1268,8 +1338,50 @@ func (b *requestBuilder) itemToMessages(item map[string]any) []map[string]any {
 			"tool_call_id": callID,
 			"content":      compactJSONString(item),
 		}}
+	case "web_search_call":
+		return b.webSearchHistoryMessages(item)
 	default:
 		return []map[string]any{markerMessage(item)}
+	}
+}
+
+func (b *requestBuilder) webSearchHistoryMessages(item map[string]any) []map[string]any {
+	action, ok := item["action"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	key := webSearchHistoryKey(action)
+	occurrence := 0
+	if key != "" {
+		occurrence = b.webSearchOccurrences[key]
+		b.webSearchOccurrences[key] = occurrence + 1
+	}
+	if key == "" || b.lookupWebSearch == nil {
+		return nil
+	}
+	entry := b.lookupWebSearch(key, occurrence)
+	if entry == nil {
+		return nil
+	}
+	callID := entry.CallID
+	if callID == "" {
+		callID = webSearchHistoryCallID(key, occurrence)
+	}
+	name := entry.Name
+	if name == "" {
+		name = "web_search"
+	}
+	args := strings.TrimSpace(entry.Arguments)
+	if args == "" {
+		args = webSearchArgumentsFromAction(action)
+	}
+	return []map[string]any{
+		assistantToolCallMessage(callID, name, args, entry.ExtraContent),
+		{
+			"role":         "tool",
+			"tool_call_id": callID,
+			"content":      entry.Result,
+		},
 	}
 }
 
@@ -1292,12 +1404,12 @@ func isToolOutputItem(item map[string]any) bool {
 }
 
 func reasoningItemContent(item map[string]any) string {
-	if content := chatContentFromResponsesContent(item["summary"], "assistant"); content != nil {
+	if content := chatContentFromResponsesContent(item["content"], "assistant"); content != nil {
 		if text, ok := content.(string); ok && strings.TrimSpace(text) != "" {
 			return text
 		}
 	}
-	if content := chatContentFromResponsesContent(item["content"], "assistant"); content != nil {
+	if content := chatContentFromResponsesContent(item["summary"], "assistant"); content != nil {
 		if text, ok := content.(string); ok && strings.TrimSpace(text) != "" {
 			return text
 		}
@@ -2679,6 +2791,44 @@ func webSearchActionFromArguments(arguments string) map[string]any {
 		}
 	}
 	return out
+}
+
+func webSearchHistoryKey(action any) string {
+	if action == nil {
+		return ""
+	}
+	data, err := json.Marshal(action)
+	if err != nil {
+		data = []byte(fmt.Sprint(action))
+	}
+	hashInput := make([]byte, 0, len("web_search")+1+len(data))
+	hashInput = append(hashInput, "web_search"...)
+	hashInput = append(hashInput, 0)
+	hashInput = append(hashInput, data...)
+	sum := sha256.Sum256(hashInput)
+	return hex.EncodeToString(sum[:])
+}
+
+func webSearchHistoryCallID(key string, occurrence int) string {
+	if len(key) > 16 {
+		key = key[:16]
+	}
+	return fmt.Sprintf("call_web_search_%s_%d", key, occurrence)
+}
+
+func webSearchArgumentsFromAction(action map[string]any) string {
+	args := map[string]any{}
+	for key, value := range action {
+		if key == "type" {
+			args["action"] = value
+			continue
+		}
+		args[key] = value
+	}
+	if _, ok := args["action"]; !ok {
+		args["action"] = "search"
+	}
+	return compactJSONString(args)
 }
 
 func jsonValueOrObject(raw string) any {

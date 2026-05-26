@@ -171,6 +171,93 @@ func TestBuildChatRequestUsesKimiReasoningContentAndPreservedThinking(t *testing
 	}
 }
 
+func TestBuildChatRequestReasoningContentPrefersRawContentOverSummary(t *testing.T) {
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:      "http://example.test/v1",
+		Model:            "forced-model",
+		ReasoningEffort:  "low",
+		ReasoningHistory: reasoningHistoryReasoningContent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "reasoning",
+				"summary": []any{
+					map[string]any{"type": "summary_text", "text": "short summary"},
+				},
+				"content": []any{
+					map[string]any{"type": "reasoning_text", "text": "raw hidden detail"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "visible answer"},
+				},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 1 {
+		t.Fatalf("messages length = %d: %#v", len(messages), messages)
+	}
+	if messages[0]["reasoning_content"] != "raw hidden detail" {
+		t.Fatalf("assistant message = %#v", messages[0])
+	}
+}
+
+func TestBuildChatRequestEncryptedOnlyReasoningHistoryIsNotFlattened(t *testing.T) {
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:      "http://example.test/v1",
+		Model:            "forced-model",
+		ReasoningEffort:  "low",
+		ReasoningHistory: reasoningHistoryReasoningContent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":              "reasoning",
+				"summary":           []any{},
+				"encrypted_content": "opaque-provider-state",
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "visible answer"},
+				},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 1 {
+		t.Fatalf("messages length = %d: %#v", len(messages), messages)
+	}
+	if _, ok := messages[0]["reasoning_content"]; ok {
+		t.Fatalf("encrypted reasoning was flattened into assistant history: %#v", messages[0])
+	}
+	if messages[0]["role"] != "assistant" || messages[0]["content"] != "visible answer" {
+		t.Fatalf("assistant message = %#v", messages[0])
+	}
+}
+
 func TestBuildChatRequestMergesReasoningContentWithToolCalls(t *testing.T) {
 	adapter, err := NewAdapter(AdapterConfig{
 		ProviderURL:      "http://example.test/v1",
@@ -1607,6 +1694,93 @@ func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 	}
 	if len(searcher.queries) != 1 || searcher.queries[0] != "Tesla stock price" {
 		t.Fatalf("search queries = %#v", searcher.queries)
+	}
+}
+
+func TestBuildChatRequestReplaysCachedWebSearchHistoryAsToolResult(t *testing.T) {
+	adapter := testAdapter(t, "http://example.test/v1", nil)
+	call := &chatToolCall{
+		ID:           "call-web",
+		Name:         "web_search",
+		ExtraContent: map[string]any{"google": map[string]any{"thought_signature": "sig-web"}},
+	}
+	call.Arguments.WriteString(`{"query":"Tesla stock price"}`)
+	adapter.rememberWebSearchHistory(call, "Title: Tesla quote\nSnippet: TSLA trading near $123.45")
+
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":   "web_search_call",
+				"status": "completed",
+				"action": map[string]any{
+					"type":  "search",
+					"query": "Tesla stock price",
+				},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	assistantMsg := messages[0]
+	calls, ok := assistantMsg["tool_calls"].([]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("assistant tool calls = %#v", assistantMsg)
+	}
+	toolCall := calls[0].(map[string]any)
+	if toolCall["id"] != "call-web" {
+		t.Fatalf("tool call = %#v", toolCall)
+	}
+	extra := toolCall["extra_content"].(map[string]any)
+	if got := extra["google"].(map[string]any)["thought_signature"]; got != "sig-web" {
+		t.Fatalf("thought signature = %#v", got)
+	}
+	toolMsg := messages[1]
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call-web" || !strings.Contains(toolMsg["content"].(string), "$123.45") {
+		t.Fatalf("tool message = %#v", toolMsg)
+	}
+}
+
+func TestBuildChatRequestDropsUncachedWebSearchHistory(t *testing.T) {
+	adapter := testAdapter(t, "http://example.test/v1", nil)
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "What is TSLA?"},
+				},
+			},
+			map[string]any{
+				"type":   "web_search_call",
+				"status": "completed",
+				"action": map[string]any{
+					"type":  "search",
+					"query": "Tesla stock price",
+				},
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 1 || messages[0]["role"] != "user" || messages[0]["content"] != "What is TSLA?" {
+		t.Fatalf("messages = %#v", messages)
+	}
+	for _, message := range messages {
+		if content, ok := message["content"].(string); ok && strings.Contains(content, "[Responses API item]") {
+			t.Fatalf("web search history leaked marker: %#v", messages)
+		}
 	}
 }
 
