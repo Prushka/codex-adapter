@@ -1180,6 +1180,8 @@ func (b *requestBuilder) translateInput(req map[string]any) []map[string]any {
 				if b.mergeReasoningHistoryItem(item, itemMessages, &pendingAssistant, &messages) {
 					continue
 				}
+			} else if b.mergeToolCallHistoryItem(item, itemMessages, &pendingAssistant, &messages) {
+				continue
 			}
 			messages = append(messages, pendingAssistant.flush()...)
 			messages = append(messages, itemMessages...)
@@ -1214,6 +1216,21 @@ func (b *requestBuilder) mergeReasoningHistoryItem(item map[string]any, itemMess
 		pending.hasText = true
 		return true
 	case "function_call", "custom_tool_call", "tool_search_call":
+		return b.mergeToolCallHistoryItem(item, itemMessages, pending, messages)
+	case "web_search_call":
+		merged := b.mergeToolCallHistoryItem(item, itemMessages, pending, messages)
+		if merged && len(itemMessages) == 0 {
+			pending.reasoning.Reset()
+		}
+		return merged
+	default:
+		return false
+	}
+}
+
+func (b *requestBuilder) mergeToolCallHistoryItem(item map[string]any, itemMessages []map[string]any, pending *assistantHistoryMessage, messages *[]map[string]any) bool {
+	switch stringField(item, "type") {
+	case "function_call", "custom_tool_call", "tool_search_call":
 		if len(itemMessages) != 1 {
 			return false
 		}
@@ -1225,7 +1242,6 @@ func (b *requestBuilder) mergeReasoningHistoryItem(item map[string]any, itemMess
 		return true
 	case "web_search_call":
 		if len(itemMessages) == 0 {
-			pending.reasoning.Reset()
 			return true
 		}
 		calls, ok := itemMessages[0]["tool_calls"].([]any)

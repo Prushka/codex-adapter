@@ -94,6 +94,78 @@ func TestBuildChatRequestDropsReasoningItemsByDefault(t *testing.T) {
 	}
 }
 
+func TestBuildChatRequestMergesConsecutiveToolCallsByDefault(t *testing.T) {
+	adapter := testAdapter(t, "http://example.test/v1", nil)
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "exec_command",
+				"description": "Run a command.",
+				"parameters":  objectSchema(),
+			},
+		},
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "call-a",
+				"name":      "exec_command",
+				"arguments": `{"cmd":"pwd"}`,
+				"extra_content": map[string]any{
+					"google": map[string]any{"thought_signature": "sig-a"},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "call-b",
+				"name":      "exec_command",
+				"arguments": `{"cmd":"ls"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call-a",
+				"output":  "/tmp/project",
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call-b",
+				"output":  "adapter.go",
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 3 {
+		t.Fatalf("messages length = %d: %#v", len(messages), messages)
+	}
+	assistantMsg := messages[0]
+	calls, ok := assistantMsg["tool_calls"].([]any)
+	if !ok || len(calls) != 2 {
+		t.Fatalf("assistant tool calls = %#v", assistantMsg)
+	}
+	firstCall := calls[0].(map[string]any)
+	extra := firstCall["extra_content"].(map[string]any)
+	if got := extra["google"].(map[string]any)["thought_signature"]; got != "sig-a" {
+		t.Fatalf("thought signature = %#v", got)
+	}
+	for i, want := range []string{"call-a", "call-b"} {
+		call := calls[i].(map[string]any)
+		if call["id"] != want {
+			t.Fatalf("call %d = %#v", i, call)
+		}
+	}
+	for i, want := range []string{"call-a", "call-b"} {
+		toolMsg := messages[i+1]
+		if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != want || toolMsg["name"] != "exec_command" {
+			t.Fatalf("tool message %d = %#v", i, toolMsg)
+		}
+	}
+}
+
 func TestBuildChatRequestCanUseLegacyAssistantContentReasoning(t *testing.T) {
 	adapter, err := NewAdapter(AdapterConfig{
 		ProviderURL:      "http://example.test/v1",
