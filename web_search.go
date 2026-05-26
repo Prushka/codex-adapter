@@ -27,6 +27,11 @@ type searchResult struct {
 	Snippet string `json:"snippet"`
 }
 
+type querySearchResults struct {
+	Query   string
+	Results []searchResult
+}
+
 func (g *chatGeneration) webSearchCalls() []*chatToolCall {
 	if len(g.tools) == 0 {
 		return nil
@@ -186,7 +191,8 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 		search = newGenericWebSearcher(a.client, a.logger, false)
 	}
 
-	var results []searchResult
+	var groups []querySearchResults
+	resultCount := 0
 	var searchErrors []string
 	seen := map[string]struct{}{}
 	for _, query := range queries {
@@ -209,6 +215,7 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 			)
 			continue
 		}
+		group := querySearchResults{Query: query}
 		for _, result := range queryResults {
 			if len(domains) > 0 && !searchResultMatchesAllowedDomains(result, domains) {
 				continue
@@ -224,20 +231,21 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 				continue
 			}
 			seen[key] = struct{}{}
-			results = append(results, result)
-			if len(results) >= limit {
+			group.Results = append(group.Results, result)
+			resultCount++
+			if len(group.Results) >= limit {
 				break
 			}
 		}
-		if len(results) >= limit {
-			break
+		if len(group.Results) > 0 {
+			groups = append(groups, group)
 		}
 	}
 
-	if len(results) == 0 && len(searchErrors) > 0 {
+	if resultCount == 0 && len(searchErrors) > 0 {
 		return formatWebSearchFailure(queries, searchErrors), nil
 	}
-	return formatWebSearchResults(queries, results), nil
+	return formatWebSearchResults(queries, groups), nil
 }
 
 func (a *Adapter) executeOpenPage(ctx context.Context, rawURL string) (string, error) {
@@ -461,27 +469,40 @@ func dedupeStrings(values []string) []string {
 	return out
 }
 
-func formatWebSearchResults(queries []string, results []searchResult) string {
+func formatWebSearchResults(queries []string, groups []querySearchResults) string {
 	queryLabel := strings.Join(queries, ", ")
 	if queryLabel == "" {
 		queryLabel = "web search"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Search results for %q:\n", queryLabel)
-	if len(results) == 0 {
+	if len(groups) == 0 {
+		fmt.Fprintf(&b, "Search results for %q:\n", queryLabel)
 		b.WriteString("No results found.")
 		return b.String()
 	}
-	for i, result := range results {
-		if i > 0 {
+	for groupIndex, group := range groups {
+		if groupIndex > 0 {
 			b.WriteString("\n\n")
 		}
-		fmt.Fprintf(&b, "%d. %s\n", i+1, strings.TrimSpace(result.Title))
-		if result.URL != "" {
-			fmt.Fprintf(&b, "URL: %s\n", result.URL)
+		label := strings.TrimSpace(group.Query)
+		if label == "" {
+			label = queryLabel
 		}
-		if result.Snippet != "" {
-			b.WriteString(result.Snippet)
+		fmt.Fprintf(&b, "Search results for %q:\n", label)
+		for i, result := range group.Results {
+			if i > 0 {
+				b.WriteString("\n\n")
+			}
+			fmt.Fprintf(&b, "%d. %s\n", i+1, strings.TrimSpace(result.Title))
+			if result.URL != "" {
+				fmt.Fprintf(&b, "URL: %s\n", result.URL)
+			}
+			if result.Snippet != "" {
+				b.WriteString(result.Snippet)
+			}
+		}
+		if len(group.Results) == 0 {
+			b.WriteString("No results found.")
 		}
 	}
 	return strings.TrimSpace(b.String())

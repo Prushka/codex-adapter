@@ -941,7 +941,7 @@ func (b *requestBuilder) translateTools(value any) []any {
 		case "tool_search":
 			out = append(out, b.hostedFunctionTool("tool_search", "tool_search", stringField(tool, "description"), schemaOrDefault(tool["parameters"])))
 		case "web_search":
-			out = append(out, b.hostedFunctionTool("web_search", "web_search", "Request a web search action. The chat-completions proxy will translate this into a Responses web_search_call item for Codex.", webSearchSchema()))
+			out = append(out, b.hostedFunctionTool("web_search", "web_search", webSearchToolDescription, webSearchSchema()))
 		case "image_generation":
 			out = append(out, b.hostedFunctionTool("image_generation", "image_generation", "Request image generation. If the provider cannot return base64 image data in result, Codex will receive a failed image_generation_call item.", imageGenerationSchema()))
 		default:
@@ -1778,6 +1778,8 @@ func webSearchSchema() map[string]any {
 		"additionalProperties": true,
 	}
 }
+
+const webSearchToolDescription = "Request a web search action. Use query for one search, or queries for a single hosted web_search action with multiple searches. When explicitly asked for parallel tool calls, issue multiple web_search tool calls in the same assistant turn."
 
 func imageGenerationSchema() map[string]any {
 	return map[string]any{

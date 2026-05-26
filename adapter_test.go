@@ -1959,6 +1959,42 @@ func TestParallelWebSearchCallsTriggerOneFollowUpWithAllResults(t *testing.T) {
 	}
 }
 
+func TestWebSearchToolSchemaAcceptsCodexQueryShapes(t *testing.T) {
+	schema := webSearchSchema()
+	props := schema["properties"].(map[string]any)
+	if _, ok := props["query"]; !ok {
+		t.Fatalf("web_search chat schema missing query: %#v", props)
+	}
+	if _, ok := props["queries"]; !ok {
+		t.Fatalf("web_search chat schema missing queries: %#v", props)
+	}
+	if got := schema["additionalProperties"]; got != true {
+		t.Fatalf("additionalProperties = %#v", got)
+	}
+	if !strings.Contains(webSearchToolDescription, "query") || !strings.Contains(webSearchToolDescription, "multiple web_search tool calls") {
+		t.Fatalf("web search description does not describe query shapes: %q", webSearchToolDescription)
+	}
+}
+
+func TestWebSearchQueriesFallbackRunsEachQuerySeparately(t *testing.T) {
+	searcher := &queryEchoWebSearcher{}
+	adapter := testAdapterWithClientAndSearcher(t, "http://example.test/v1", nil, http.DefaultClient, searcher)
+
+	text, err := adapter.executeSearch(context.Background(), map[string]any{
+		"queries":             []any{"nvidia stock", "tesla stock"},
+		"search_context_size": "low",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(searcher.queries, ",") != "nvidia stock,tesla stock" {
+		t.Fatalf("queries = %#v", searcher.queries)
+	}
+	if !strings.Contains(text, `Search results for "nvidia stock":`) || !strings.Contains(text, `Search results for "tesla stock":`) {
+		t.Fatalf("result text did not preserve query sections:\n%s", text)
+	}
+}
+
 func TestBuildChatRequestReplaysCachedWebSearchHistoryAsToolResult(t *testing.T) {
 	adapter, err := NewAdapter(AdapterConfig{
 		ProviderURL:      "http://example.test/v1",
@@ -2642,6 +2678,26 @@ func (m *mockWebSearcher) Search(_ context.Context, query string, limit int) ([]
 		results = results[:limit]
 	}
 	return results, nil
+}
+
+type queryEchoWebSearcher struct {
+	queries []string
+}
+
+func (q *queryEchoWebSearcher) Name() string {
+	return "query-echo"
+}
+
+func (q *queryEchoWebSearcher) Search(_ context.Context, query string, limit int) ([]searchResult, error) {
+	q.queries = append(q.queries, query)
+	if limit <= 0 {
+		return nil, nil
+	}
+	return []searchResult{{
+		Title:   query + " title",
+		URL:     "https://example.test/" + strings.ReplaceAll(query, " ", "-"),
+		Snippet: query + " snippet",
+	}}, nil
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
