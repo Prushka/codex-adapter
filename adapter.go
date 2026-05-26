@@ -24,8 +24,8 @@ import (
 const (
 	maxUpstreamErrorBodyLogBytes  = 16 << 10
 	maxUpstreamErrorMessageBytes  = 4 << 10
-	maxToolExtraContentEntries    = 4096
-	maxMessageExtraContentEntries = 4096
+	maxToolExtraContentEntries    = 40960
+	maxMessageExtraContentEntries = 40960
 
 	reasoningHistoryAuto             = "auto"
 	reasoningHistoryDrop             = "drop"
