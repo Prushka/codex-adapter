@@ -19,9 +19,6 @@ func NewDebugRecorder(dir string) (*DebugRecorder, error) {
 	if dir == "" {
 		dir = "debug"
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
 	return &DebugRecorder{dir: dir}, nil
 }
 
@@ -58,6 +55,9 @@ func (r *DebugRecorder) write(label string, data []byte) {
 	r.seq++
 	name := fmt.Sprintf("%06d-%s.json", r.seq, sanitizeDebugLabel(label))
 	path := filepath.Join(r.dir, name)
+	if err := os.MkdirAll(r.dir, 0o755); err != nil {
+		return
+	}
 	_ = os.WriteFile(path, append(data, '\n'), 0o644)
 }
 

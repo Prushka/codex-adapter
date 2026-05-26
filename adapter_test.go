@@ -2024,6 +2024,23 @@ func TestDebugRecorderWritesOrderedJSONFiles(t *testing.T) {
 	}
 }
 
+func TestDebugRecorderCreatesDirectoryOnFirstWrite(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "debug")
+	rec, err := NewDebugRecorder(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("debug dir exists before first write: %v", err)
+	}
+
+	rec.SaveJSON("first request", map[string]any{"a": 1})
+
+	if _, err := os.Stat(filepath.Join(dir, "000001-first-request.json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func testAdapter(t *testing.T, providerURL string, debug *DebugRecorder) *Adapter {
 	t.Helper()
 	return testAdapterWithClient(t, providerURL, debug, http.DefaultClient)
