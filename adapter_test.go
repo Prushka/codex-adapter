@@ -2518,6 +2518,125 @@ func TestWebSearchOpenPageErrorBecomesToolContent(t *testing.T) {
 	}
 }
 
+func TestParallelWebSearchOpenPageErrorStillFollowsUpWithAllResults(t *testing.T) {
+	pageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/blocked":
+			http.Error(w, "blocked by origin", http.StatusForbidden)
+		case "/ok":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html><head><title>Allowed page</title></head><body><main>Useful page text.</main></body></html>"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer pageServer.Close()
+
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := upstreamHits.Add(1)
+		switch hit {
+		case 1:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+				"choices": []any{
+					map[string]any{
+						"delta": map[string]any{
+							"role": "assistant",
+							"tool_calls": []any{
+								map[string]any{
+									"index": 0,
+									"id":    "call-blocked",
+									"type":  "function",
+									"function": map[string]any{
+										"name":      "web_search",
+										"arguments": mustJSON(map[string]string{"action": "open_page", "url": pageServer.URL + "/blocked"}),
+									},
+									"extra_content": map[string]any{
+										"google": map[string]any{"thought_signature": "sig-blocked"},
+									},
+								},
+								map[string]any{
+									"index": 1,
+									"id":    "call-ok",
+									"type":  "function",
+									"function": map[string]any{
+										"name":      "web_search",
+										"arguments": mustJSON(map[string]string{"action": "open_page", "url": pageServer.URL + "/ok"}),
+									},
+								},
+							},
+						},
+					},
+				},
+			}) + "\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			messages := req["messages"].([]any)
+			if len(messages) < 4 {
+				t.Fatalf("follow-up messages = %#v", messages)
+			}
+			assistantMsg := messages[len(messages)-3].(map[string]any)
+			calls := assistantMsg["tool_calls"].([]any)
+			if len(calls) != 2 {
+				t.Fatalf("follow-up tool calls = %#v", assistantMsg)
+			}
+			firstCall := calls[0].(map[string]any)
+			extra := firstCall["extra_content"].(map[string]any)
+			if got := extra["google"].(map[string]any)["thought_signature"]; got != "sig-blocked" {
+				t.Fatalf("follow-up thought_signature = %#v", got)
+			}
+			toolA := messages[len(messages)-2].(map[string]any)
+			toolB := messages[len(messages)-1].(map[string]any)
+			if toolA["role"] != "tool" || toolA["tool_call_id"] != "call-blocked" {
+				t.Fatalf("tool A = %#v", toolA)
+			}
+			contentA := toolA["content"].(string)
+			if !strings.Contains(contentA, "Web search action failed") || !strings.Contains(contentA, "HTTP 403") {
+				t.Fatalf("tool A content = %q", contentA)
+			}
+			if toolB["role"] != "tool" || toolB["tool_call_id"] != "call-ok" {
+				t.Fatalf("tool B = %#v", toolB)
+			}
+			contentB := toolB["content"].(string)
+			if !strings.Contains(contentB, "Allowed page") || !strings.Contains(contentB, "Useful page text.") {
+				t.Fatalf("tool B content = %q", contentB)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Handled both pages.\"}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected upstream hit %d", hit)
+		}
+	}))
+	defer upstream.Close()
+
+	adapter := testAdapter(t, upstream.URL, nil)
+	body := responsesRequestWithTools([]any{
+		map[string]any{
+			"type":                "web_search",
+			"external_web_access": true,
+		},
+	})
+
+	events := callResponses(t, adapter, body)
+	message := firstDoneItem(t, events, "message")
+	content := message["content"].([]any)
+	if got := content[0].(map[string]any)["text"].(string); got != "Handled both pages." {
+		t.Fatalf("final assistant text = %q", got)
+	}
+	assertCompleted(t, events)
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("upstream hits = %d", upstreamHits.Load())
+	}
+}
+
 func TestDuckDuckGoSearchBackendParsesLiteHTML(t *testing.T) {
 	duckHTML := `<!doctype html>
 <html>
