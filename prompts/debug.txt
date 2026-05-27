@@ -1,0 +1,7 @@
+What's tesla's stock price?
+test
+Spawn 3 subagents to explore and summarize the project
+Write a hello_world.txt with hello world using apply_patch
+First, run 3 parallel tool calls: 2 web search calls for openai's chat/completions and responses apis and 1 cmd tool call to echo "cat" (run all 3 at once in parallel).
+Then open boths official openai's chat completions and responses API pages in parallel, and summarize your findings.
+Write a new line with text "wow" in hello_world.txt
