@@ -1,8 +1,19 @@
 # codex-adapter
 
-`codex-adapter` is a local proxy that lets Codex speak the OpenAI Responses API to an upstream provider that only exposes an OpenAI-compatible Chat Completions API.
+`codex-adapter` is a Responses-to-Chat-Completions bridge for Codex with full tool-call translation, hosted-tool emulation, reasoning replay, and Gemini/Kimi compatibility.
+
+It lets Codex use OpenAI-compatible Chat Completions providers while preserving Codex's Responses-style workflow: standard function tools, `apply_patch`, local web search, `tool_search`, provider reasoning fields, and compatibility metadata such as Gemini thought signatures.
 
 It accepts Codex requests on `/v1/responses`, translates them to `/v1/chat/completions`, then translates upstream Chat Completions responses or streaming chunks back into Responses API events. The adapter always forces the configured upstream model and `reasoning_effort` so Codex cannot accidentally send provider-incompatible values.
+
+## Features
+
+- Bridges Codex's Responses API wire format to OpenAI-compatible Chat Completions providers.
+- Translates standard function tools, namespace tools, custom/freeform tools, `apply_patch`, `tool_search`, `web_search`, and `image_generation`.
+- Executes hosted-style `web_search` locally with DuckDuckGo, Bing, Yahoo, or SearXNG backends, including `search`, `open_page`, and `find_in_page`.
+- Handles pure web-search turns, parallel web-search turns, and mixed `web_search` plus client-tool turns while replaying search history in the correct tool-call order.
+- Preserves provider compatibility metadata, including Gemini `extra_content.google.thought_signature` and Kimi `reasoning_content` history where supported.
+- Supports streaming and non-streaming upstream Chat Completions responses, `/responses/compact`, debug trace output, and an optional key-rotation proxy.
 
 ## Requirements
 
@@ -33,9 +44,9 @@ Point Codex at the adapter:
 
 ```toml
 model_provider = "codex-adapter"
-model = "gpt-5.5" # placeholder for model_catalog compatibility, actual model is configured in the adapter
+model = "gpt-5" # any Codex catalog model id; the upstream model is forced by the adapter
 disable_response_storage = true
-model_catalog_json = "~/.codex/models.json" # replace with the latest version from codex, IMPORTANT: update context window settings so compact could work properly!
+model_catalog_json = "~/.codex/models.json" # keep this copied from the Codex version you run; tune context windows to match the upstream model so compact has the right budget
 
 [model_providers.codex-adapter]
 name = "codex-adapter"
@@ -49,7 +60,7 @@ The `-provider-url` value may be an upstream base URL, a `/v1` URL, or a direct 
 
 Post setup:
 
-1. Turn off Image Gen skill as it doesn't work as of now. This may lead the model to emit image generation tool calls.
+1. Turn off Codex image-generation skills unless the upstream model can return base64 image data through the synthetic `image_generation` function. The adapter can translate the call shape, but it can only complete an `image_generation_call` when the upstream response includes image bytes.
 
 ## Endpoints
 
@@ -96,12 +107,16 @@ For environment-based setup, set `-api-keys-env` to a variable containing comma-
 
 ## Local Web Search
 
-Chat Completions has no standard hosted `web_search` tool, so the adapter exposes `web_search` to the upstream model as a synthetic function. When the upstream model makes a single `web_search` call, the adapter:
+Chat Completions has no standard hosted `web_search` tool, so the adapter exposes `web_search` to the upstream model as a synthetic function.
+
+When the upstream model emits only `web_search` calls, including parallel searches, the adapter:
 
 1. Emits the corresponding Responses `web_search_call` item for Codex.
 2. Runs the requested local search action.
-3. Appends the search result as a Chat Completions tool message.
+3. Appends each search result as a Chat Completions tool message in call order.
 4. Sends a follow-up Chat Completions request so Codex receives a completed turn.
+
+When the upstream model emits a mixed turn, such as `web_search`, `web_search`, and `exec_command` in the same assistant message, the adapter executes and caches the web searches but does not auto-follow-up immediately. Codex receives the `web_search_call` items and client tool calls, executes the client tools, then sends the full history back. The adapter replays the cached web-search results as Chat Completions tool messages alongside the client tool outputs so the upstream provider sees one coherent parallel tool-call turn.
 
 Supported search actions:
 
@@ -136,13 +151,19 @@ go run ./cmd/codex-adapter \
 - Namespace tools are flattened using Codex-style names and reconstructed with `namespace` on the way back. Tool names with a reserved `mcp__` prefix are renamed before sending upstream.
 - Responses custom/freeform tools, including `apply_patch`, are exposed upstream as strict functions with one required string property named `input`. Returned calls are reconstructed as `custom_tool_call` items.
 - `tool_search` is exposed as a synthetic function and reconstructed as a client-executed `tool_search_call`. Tool definitions discovered through `tool_search_output` are registered for later follow-up calls.
-- `web_search` and `image_generation` are exposed as synthetic functions because Chat Completions has no standard equivalent for Responses hosted tools. Completed `web_search_call` history is replayed from a bounded in-memory cache as synthetic assistant tool calls plus tool results when possible, and dropped instead of rendered as raw Responses JSON when the cache is unavailable. `image_generation` is marked completed only when the upstream call includes base64 image data.
+- `web_search` and `image_generation` are exposed as synthetic functions because Chat Completions has no standard equivalent for Responses hosted tools. Completed `web_search_call` history is replayed from a bounded in-memory cache as synthetic assistant tool calls plus tool results when possible. If a web-search item cannot be matched to cached execution history, it is omitted instead of being rendered as raw Responses JSON. Cached web-search replay preserves ordering with adjacent client tool calls, including mixed and parallel tool turns. `image_generation` is marked completed only when the upstream call includes base64 image data.
 - `tool_choice`, `parallel_tool_calls`, and Responses JSON schema text formats are translated to their Chat Completions equivalents.
 - Nonessential Responses-only provider fields, such as `metadata`, `prompt_cache_key`, `store`, and `service_tier`, are not forwarded upstream.
 - Gemini/OpenAI compatibility metadata such as `tool_calls[].extra_content.google.thought_signature` and assistant message `extra_content` is preserved on Responses items where possible and cached so follow-up requests can send it back upstream even when Codex drops unknown item fields.
 - Streaming Chat Completions chunks are accumulated and emitted as Responses SSE events. A normal completion ends with `response.completed`; upstream `length` and `content_filter` finish reasons become `response.incomplete`.
 
 The adapter is stateless across Responses turns except for bounded caches of provider compatibility `extra_content` and synthetic web-search history. Tool-call metadata is keyed by `call_id`; assistant-message metadata is keyed by message content and occurrence; web-search history is keyed by normalized action and occurrence. Codex sends the full input on this wire path, so `previous_response_id` is not required.
+
+## Provider Notes
+
+- **Gemini OpenAI compatibility**: Gemini may return `extra_content.google.thought_signature` on assistant messages or tool calls. The adapter keeps that metadata on outbound Responses items and replays it on later Chat Completions assistant messages and assistant tool-call messages.
+- **Kimi thinking models**: `-reasoning-history auto` enables `reasoning-content` history for Kimi K2 thinking/K2.6 model names. For Kimi K2.6 preserved thinking, the adapter also sends `thinking: {"type":"enabled","keep":"all"}` and keeps `reasoning_content` attached to assistant message and tool-call history.
+- **Strict providers**: Use `-reasoning-history drop` for providers that reject historical reasoning fields.
 
 ## Debugging
 
