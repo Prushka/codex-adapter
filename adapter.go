@@ -1235,11 +1235,7 @@ func (b *requestBuilder) mergeReasoningHistoryItem(item map[string]any, itemMess
 	case "function_call", "custom_tool_call", "tool_search_call":
 		return b.mergeToolCallHistoryItem(item, itemMessages, pending, messages)
 	case "web_search_call":
-		merged := b.mergeToolCallHistoryItem(item, itemMessages, pending, messages)
-		if merged && len(itemMessages) == 0 {
-			pending.reasoning.Reset()
-		}
-		return merged
+		return b.mergeToolCallHistoryItem(item, itemMessages, pending, messages)
 	default:
 		return false
 	}

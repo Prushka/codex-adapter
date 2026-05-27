@@ -44,8 +44,16 @@ type querySearchResults struct {
 }
 
 func (g *chatGeneration) webSearchCalls() []*chatToolCall {
-	if len(g.tools) == 0 {
+	calls, allWebSearch := g.webSearchCallsForTurn()
+	if !allWebSearch {
 		return nil
+	}
+	return calls
+}
+
+func (g *chatGeneration) webSearchCallsForTurn() ([]*chatToolCall, bool) {
+	if len(g.tools) == 0 {
+		return nil, false
 	}
 	indexes := make([]int, 0, len(g.tools))
 	for index := range g.tools {
@@ -53,21 +61,41 @@ func (g *chatGeneration) webSearchCalls() []*chatToolCall {
 	}
 	sort.Ints(indexes)
 	calls := make([]*chatToolCall, 0, len(indexes))
+	allWebSearch := true
 	for _, index := range indexes {
 		call := g.tools[index]
 		if call == nil {
-			return nil
+			allWebSearch = false
+			continue
 		}
 		mapping := call.Mapping
 		if mapping.Kind == "" {
 			mapping = g.mappingForTool(call.Name, call.Type)
 		}
 		if mapping.Kind != "web_search" {
-			return nil
+			allWebSearch = false
+			continue
 		}
 		calls = append(calls, call)
 	}
-	return calls
+	return calls, allWebSearch && len(calls) > 0
+}
+
+func (a *Adapter) executeAndRememberWebSearchCalls(
+	inbound *http.Request,
+	calls []*chatToolCall,
+	ctx *translationContext,
+) ([]string, error) {
+	webSearchResults := make([]string, 0, len(calls))
+	for _, call := range calls {
+		webSearchText, err := a.executeWebSearch(inbound.Context(), call, ctx)
+		if err != nil {
+			return nil, err
+		}
+		a.rememberWebSearchHistory(call, webSearchText)
+		webSearchResults = append(webSearchResults, webSearchText)
+	}
+	return webSearchResults, nil
 }
 
 func (a *Adapter) handleGeneration(
@@ -83,8 +111,15 @@ func (a *Adapter) handleGeneration(
 	a.rememberMessageExtraContent(gen)
 	emitGenerationOutputItems(gen, sse, respID)
 
-	calls := gen.webSearchCalls()
+	calls, allWebSearch := gen.webSearchCallsForTurn()
 	if len(calls) == 0 {
+		emitGenerationCompletion(gen, sse, respID)
+		return nil
+	}
+	if !allWebSearch {
+		if _, err := a.executeAndRememberWebSearchCalls(inbound, calls, ctx); err != nil {
+			return fmt.Errorf("web search execution failed: %w", err)
+		}
 		emitGenerationCompletion(gen, sse, respID)
 		return nil
 	}
@@ -94,14 +129,9 @@ func (a *Adapter) handleGeneration(
 		return nil
 	}
 
-	webSearchResults := make([]string, 0, len(calls))
-	for _, call := range calls {
-		webSearchText, err := a.executeWebSearch(inbound.Context(), call, ctx)
-		if err != nil {
-			return fmt.Errorf("web search follow-up failed: %w", err)
-		}
-		a.rememberWebSearchHistory(call, webSearchText)
-		webSearchResults = append(webSearchResults, webSearchText)
+	webSearchResults, err := a.executeAndRememberWebSearchCalls(inbound, calls, ctx)
+	if err != nil {
+		return fmt.Errorf("web search follow-up failed: %w", err)
 	}
 	reasoningContent := ""
 	if a.reasoningHistory == reasoningHistoryReasoningContent {

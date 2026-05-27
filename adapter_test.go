@@ -2053,6 +2053,175 @@ func TestParallelWebSearchCallsTriggerOneFollowUpWithAllResults(t *testing.T) {
 	}
 }
 
+func TestMixedWebSearchAndFunctionCallCachesSearchForClientToolFollowUp(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := upstreamHits.Add(1)
+		if hit != 1 {
+			t.Fatalf("unexpected upstream hit %d", hit)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + mustJSON(map[string]any{
+			"choices": []any{
+				map[string]any{
+					"delta": map[string]any{
+						"role":              "assistant",
+						"reasoning_content": "need current data and local files",
+						"tool_calls": []any{
+							map[string]any{
+								"index": 0,
+								"id":    "call-web",
+								"type":  "function",
+								"function": map[string]any{
+									"name":      "web_search",
+									"arguments": `{"action":"search","query":"Tesla stock price"}`,
+								},
+								"extra_content": map[string]any{
+									"google": map[string]any{"thought_signature": "sig-web"},
+								},
+							},
+							map[string]any{
+								"index": 1,
+								"id":    "call-exec",
+								"type":  "function",
+								"function": map[string]any{
+									"name":      "exec_command",
+									"arguments": `{"cmd":"pwd"}`,
+								},
+							},
+						},
+					},
+				},
+			},
+		}) + "\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	searcher := &mockWebSearcher{
+		results: []searchResult{
+			{
+				Title:   "Tesla stock price - Example Finance",
+				URL:     "https://finance.example.com/tsla",
+				Snippet: "TSLA trading near $123.45 with a positive move.",
+			},
+		},
+	}
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:      upstream.URL,
+		Model:            "kimi-k2.6",
+		ReasoningEffort:  "low",
+		ReasoningHistory: reasoningHistoryReasoningContent,
+		WebSearcher:      searcher,
+		HTTPClient:       http.DefaultClient,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tools := []any{
+		map[string]any{
+			"type":                "web_search",
+			"external_web_access": true,
+		},
+		map[string]any{
+			"type":        "function",
+			"name":        "exec_command",
+			"description": "Run a command.",
+			"parameters":  objectSchema(),
+		},
+	}
+	body := responsesRequestWithTools(tools)
+	events := callResponses(t, adapter, body)
+
+	var doneItems []any
+	var webSearchItems, functionItems []map[string]any
+	for _, event := range events {
+		if event["type"] != "response.output_item.done" {
+			continue
+		}
+		item := event["item"].(map[string]any)
+		doneItems = append(doneItems, item)
+		switch item["type"] {
+		case "web_search_call":
+			webSearchItems = append(webSearchItems, item)
+		case "function_call":
+			functionItems = append(functionItems, item)
+		}
+	}
+	if len(webSearchItems) != 1 {
+		t.Fatalf("web search items = %#v", webSearchItems)
+	}
+	if len(functionItems) != 1 {
+		t.Fatalf("function items = %#v", functionItems)
+	}
+	assertCompleted(t, events)
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("upstream hits = %d", upstreamHits.Load())
+	}
+	if len(searcher.queries) != 1 || searcher.queries[0] != "Tesla stock price" {
+		t.Fatalf("search queries = %#v", searcher.queries)
+	}
+
+	replayInput := []any{
+		map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "go"},
+			},
+		},
+	}
+	replayInput = append(replayInput, doneItems...)
+	replayInput = append(replayInput, map[string]any{
+		"type":    "function_call_output",
+		"call_id": "call-exec",
+		"output":  "/tmp/project",
+	})
+
+	chatReq, _, err := adapter.buildChatRequest(map[string]any{
+		"tools": tools,
+		"input": replayInput,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := chatReq["thinking"].(map[string]any); !ok {
+		t.Fatalf("thinking was not enabled: %#v", chatReq)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 4 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	assistantMsg := messages[1]
+	if assistantMsg["reasoning_content"] != "need current data and local files" {
+		t.Fatalf("assistant reasoning_content = %#v", assistantMsg)
+	}
+	calls, ok := assistantMsg["tool_calls"].([]any)
+	if !ok || len(calls) != 2 {
+		t.Fatalf("assistant tool calls = %#v", assistantMsg)
+	}
+	firstCall := calls[0].(map[string]any)
+	if firstCall["id"] != "call-web" {
+		t.Fatalf("first call = %#v", firstCall)
+	}
+	extra := firstCall["extra_content"].(map[string]any)
+	if got := extra["google"].(map[string]any)["thought_signature"]; got != "sig-web" {
+		t.Fatalf("thought signature = %#v", got)
+	}
+	secondCall := calls[1].(map[string]any)
+	if secondCall["id"] != "call-exec" {
+		t.Fatalf("second call = %#v", secondCall)
+	}
+	if messages[2]["role"] != "tool" || messages[2]["tool_call_id"] != "call-web" || messages[2]["name"] != "web_search" || !strings.Contains(messages[2]["content"].(string), "$123.45") {
+		t.Fatalf("web search tool message = %#v", messages[2])
+	}
+	if messages[3]["role"] != "tool" || messages[3]["tool_call_id"] != "call-exec" || messages[3]["name"] != "exec_command" || messages[3]["content"] != "/tmp/project" {
+		t.Fatalf("function tool message = %#v", messages[3])
+	}
+}
+
 func TestWebSearchToolSchemaAcceptsCodexQueryShapes(t *testing.T) {
 	schema := webSearchSchema()
 	props := schema["properties"].(map[string]any)
@@ -2439,6 +2608,85 @@ func TestBuildChatRequestDropsUncachedWebSearchHistory(t *testing.T) {
 	messages := chatReq["messages"].([]map[string]any)
 	if len(messages) != 1 || messages[0]["role"] != "user" || messages[0]["content"] != "What is TSLA?" {
 		t.Fatalf("messages = %#v", messages)
+	}
+	for _, message := range messages {
+		if content, ok := message["content"].(string); ok && strings.Contains(content, "[Responses API item]") {
+			t.Fatalf("web search history leaked marker: %#v", messages)
+		}
+	}
+}
+
+func TestBuildChatRequestKeepsReasoningForFunctionCallsAfterUncachedWebSearch(t *testing.T) {
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:      "http://example.test/v1",
+		Model:            "forced-model",
+		ReasoningEffort:  "low",
+		ReasoningHistory: reasoningHistoryReasoningContent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "exec_command",
+				"description": "Run a command.",
+				"parameters":  objectSchema(),
+			},
+		},
+		"input": []any{
+			map[string]any{
+				"type":    "reasoning",
+				"summary": []any{},
+				"content": []any{
+					map[string]any{"type": "reasoning_text", "text": "inspect files"},
+				},
+			},
+			map[string]any{
+				"type":   "web_search_call",
+				"status": "completed",
+				"action": map[string]any{
+					"type":  "search",
+					"query": "Tesla stock price",
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "exec_command:1",
+				"name":      "exec_command",
+				"arguments": `{"cmd":"pwd"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "exec_command:1",
+				"output":  "/tmp/project",
+			},
+		},
+	}
+
+	chatReq, _, err := adapter.buildChatRequest(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := chatReq["messages"].([]map[string]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	assistantMsg := messages[0]
+	if assistantMsg["reasoning_content"] != "inspect files" {
+		t.Fatalf("assistant reasoning_content = %#v", assistantMsg)
+	}
+	calls, ok := assistantMsg["tool_calls"].([]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("assistant tool calls = %#v", assistantMsg)
+	}
+	toolCall := calls[0].(map[string]any)
+	if toolCall["id"] != "exec_command:1" {
+		t.Fatalf("tool call = %#v", toolCall)
+	}
+	if messages[1]["role"] != "tool" || messages[1]["tool_call_id"] != "exec_command:1" || messages[1]["content"] != "/tmp/project" {
+		t.Fatalf("tool message = %#v", messages[1])
 	}
 	for _, message := range messages {
 		if content, ok := message["content"].(string); ok && strings.Contains(content, "[Responses API item]") {
