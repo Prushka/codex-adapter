@@ -9,6 +9,7 @@ import (
 	"time"
 
 	codexadapter "codex-adapter"
+
 	"go.uber.org/zap"
 )
 
@@ -96,7 +97,7 @@ func main() {
 
 func parseFlags() cliConfig {
 	var cfg cliConfig
-	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:8080", "local listening address for Responses API requests")
+	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:18080", "local listening address for Responses API requests")
 	flag.StringVar(&cfg.providerURL, "provider-url", "", "OpenAI-compatible upstream provider base URL or /v1 URL")
 	flag.StringVar(&cfg.model, "model", "", "upstream chat_completions model to force into every request")
 	flag.StringVar(&cfg.reasoningEffort, "reasoning-effort", "medium", "reasoning_effort value to force into every upstream request")

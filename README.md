@@ -22,7 +22,7 @@ Run the adapter:
 
 ```sh
 go run ./cmd/codex-adapter \
-  -listen 127.0.0.1:8080 \
+  -listen 127.0.0.1:18080 \
   -provider-url http://localhost:1234/v1 \
   -model your-chat-model \
   -reasoning-effort medium \
@@ -39,7 +39,7 @@ model_catalog_json = "~/.codex/models.json" # replace with the latest version fr
 
 [model_providers.codex-adapter]
 name = "codex-adapter"
-base_url = "http://127.0.0.1:8080/v1"
+base_url = "http://127.0.0.1:18080/v1"
 wire_api = "responses"
 supports_websockets = false
 
@@ -62,21 +62,21 @@ Set `-disable-upstream-streaming` to make `/responses` buffer the upstream Chat 
 
 ## Options
 
-| Flag                          | Default          | Description                                                                                       |
-|-------------------------------|------------------|---------------------------------------------------------------------------------------------------|
-| `-listen`                     | `127.0.0.1:8080` | Local listening address for Codex requests.                                                       |
-| `-provider-url`               | required         | Upstream OpenAI-compatible base URL, `/v1` URL, or direct Chat Completions URL.                   |
-| `-model`                      | required         | Upstream model forced into every Chat Completions request.                                        |
-| `-reasoning-effort`           | `medium`         | `reasoning_effort` forced into every upstream request.                                            |
-| `-reasoning-history`          | `auto`           | Historical Responses reasoning translation: `auto`, `drop`, `reasoning-content`, or `assistant-content`. |
-| `-api-key-env`                | unset            | Environment variable containing the upstream provider API key.                                    |
-| `-api-key`                    | unset            | Upstream provider API key supplied directly on the command line. Prefer `-api-key-env`.           |
-| `-disable-upstream-streaming` | `false`          | Buffer upstream Chat Completions responses instead of requesting SSE chunks.                       |
-| `-search-provider`            | `duckduckgo`     | Local web search backend: `auto`, `duckduckgo`, `duckduckgo-lite`, `bing`, `yahoo`, or `searxng`. |
-| `-search-url`                 | unset            | Backend URL for providers that need one. Required for `searxng`.                                  |
-| `-debug`                      | `false`          | Write translated requests, responses, SSE events, and search activity as ordered JSON files.      |
-| `-debug-dir`                  | `debug`          | Directory for debug JSON files.                                                                   |
-| `-timeout`                    | `10m`            | Timeout for upstream and local search HTTP requests.                                              |
+| Flag                          | Default           | Description                                                                                       |
+|-------------------------------|-------------------|---------------------------------------------------------------------------------------------------|
+| `-listen`                     | `127.0.0.1:18080` | Local listening address for Codex requests.                                                       |
+| `-provider-url`               | required          | Upstream OpenAI-compatible base URL, `/v1` URL, or direct Chat Completions URL.                   |
+| `-model`                      | required          | Upstream model forced into every Chat Completions request.                                        |
+| `-reasoning-effort`           | `medium`          | `reasoning_effort` forced into every upstream request.                                            |
+| `-reasoning-history`          | `auto`            | Historical Responses reasoning translation: `auto`, `drop`, `reasoning-content`, or `assistant-content`. |
+| `-api-key-env`                | unset             | Environment variable containing the upstream provider API key.                                    |
+| `-api-key`                    | unset             | Upstream provider API key supplied directly on the command line. Prefer `-api-key-env`.           |
+| `-disable-upstream-streaming` | `false`           | Buffer upstream Chat Completions responses instead of requesting SSE chunks.                       |
+| `-search-provider`            | `duckduckgo`      | Local web search backend: `auto`, `duckduckgo`, `duckduckgo-lite`, `bing`, `yahoo`, or `searxng`. |
+| `-search-url`                 | unset             | Backend URL for providers that need one. Required for `searxng`.                                  |
+| `-debug`                      | `false`           | Write translated requests, responses, SSE events, and search activity as ordered JSON files.      |
+| `-debug-dir`                  | `debug`           | Directory for debug JSON files.                                                                   |
+| `-timeout`                    | `10m`             | Timeout for upstream and local search HTTP requests.                                              |
 
 `-api-key` and `-api-key-env` are mutually exclusive. If neither is set, the adapter forwards the inbound `Authorization` header sent by Codex. If either adapter-owned key source is set, it overrides Codex's inbound authorization and is sent upstream as `Authorization: Bearer <key>`. Values that already include an authorization scheme, such as `Bearer sk-...`, are forwarded as-is.
 
@@ -103,7 +103,7 @@ Example SearXNG setup:
 
 ```sh
 go run ./cmd/codex-adapter \
-  -listen 127.0.0.1:8080 \
+  -listen 127.0.0.1:18080 \
   -provider-url http://localhost:1234/v1 \
   -model your-chat-model \
   -reasoning-effort medium \
