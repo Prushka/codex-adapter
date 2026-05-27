@@ -16,12 +16,20 @@ import (
 )
 
 const (
-	maxWebSearchFollowUps        = 50
-	maxWebSearchResults          = 30
-	maxWebSearchPageBytes        = 2 << 24
-	maxWebSearchExcerptBytes     = 6 << 16
-	maxSearchResultExcerptBytes  = 14000
-	searchResultPageFetchTimeout = 10 * time.Second
+	maxWebSearchFollowUps = 50
+	maxWebSearchPageBytes = 2 << 24
+
+	webSearchLowResultLimit       = 5
+	webSearchMediumResultLimit    = 10
+	webSearchHighResultLimit      = 20
+	webSearchMediumExcerptResults = 5
+	webSearchHighExcerptResults   = 8
+	webSearchMediumExcerptBytes   = 12 << 10
+	webSearchHighExcerptBytes     = 24 << 10
+	webSearchLowOpenPageBytes     = 32 << 10
+	webSearchMediumOpenPageBytes  = 128 << 10
+	webSearchHighOpenPageBytes    = 256 << 10
+	searchResultPageFetchTimeout  = 10 * time.Second
 )
 
 type searchResult struct {
@@ -88,7 +96,7 @@ func (a *Adapter) handleGeneration(
 
 	webSearchResults := make([]string, 0, len(calls))
 	for _, call := range calls {
-		webSearchText, err := a.executeWebSearch(inbound.Context(), call)
+		webSearchText, err := a.executeWebSearch(inbound.Context(), call, ctx)
 		if err != nil {
 			return fmt.Errorf("web search follow-up failed: %w", err)
 		}
@@ -142,33 +150,40 @@ func (a *Adapter) handleGeneration(
 	return a.handleGeneration(inbound, followUpReq, gen2, ctx, sse, respID, webSearchDepth+1)
 }
 
-func (a *Adapter) executeWebSearch(ctx context.Context, call *chatToolCall) (string, error) {
+func (a *Adapter) executeWebSearch(ctx context.Context, call *chatToolCall, tx *translationContext) (string, error) {
 	action := webSearchActionFromArguments(call.Arguments.String())
+	var defaults map[string]any
+	if tx != nil {
+		defaults = tx.webSearchDefaults
+	}
+	executionAction := webSearchExecutionActionFromArguments(call.Arguments.String(), defaults)
 	search := a.search
 	if search == nil {
 		search = newGenericWebSearcher(a.client, a.logger, false)
 	}
 	a.debug.SaveJSON("web search request", map[string]any{
-		"call_id":  call.ID,
-		"name":     call.Name,
-		"action":   action,
-		"raw_args": call.Arguments.String(),
-		"backend":  search.Name(),
+		"call_id":          call.ID,
+		"name":             call.Name,
+		"action":           action,
+		"execution_action": executionAction,
+		"raw_args":         call.Arguments.String(),
+		"backend":          search.Name(),
 	})
 
-	result, err := a.executeWebSearchAction(ctx, action)
+	result, err := a.executeWebSearchAction(ctx, executionAction)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		msg := limitWebSearchText(err.Error(), 1200)
-		result = formatWebSearchActionFailure(action, msg)
+		result = formatWebSearchActionFailure(executionAction, msg)
 		a.debug.SaveJSON("web search action error", map[string]any{
-			"call_id": call.ID,
-			"name":    call.Name,
-			"action":  action,
-			"error":   msg,
-			"backend": search.Name(),
+			"call_id":          call.ID,
+			"name":             call.Name,
+			"action":           action,
+			"execution_action": executionAction,
+			"error":            msg,
+			"backend":          search.Name(),
 		})
 		a.logger.Warn("web search action failed",
 			zap.String("backend", search.Name()),
@@ -177,11 +192,12 @@ func (a *Adapter) executeWebSearch(ctx context.Context, call *chatToolCall) (str
 		)
 	}
 	a.debug.SaveJSON("web search response", map[string]any{
-		"call_id": call.ID,
-		"name":    call.Name,
-		"action":  action,
-		"result":  result,
-		"backend": search.Name(),
+		"call_id":          call.ID,
+		"name":             call.Name,
+		"action":           action,
+		"execution_action": executionAction,
+		"result":           result,
+		"backend":          search.Name(),
 	})
 	return result, nil
 }
@@ -189,9 +205,9 @@ func (a *Adapter) executeWebSearch(ctx context.Context, call *chatToolCall) (str
 func (a *Adapter) executeWebSearchAction(ctx context.Context, action map[string]any) (string, error) {
 	switch strings.TrimSpace(stringField(action, "type")) {
 	case "open_page":
-		return a.executeOpenPage(ctx, stringField(action, "url"))
+		return a.executeOpenPage(ctx, stringField(action, "url"), webSearchOpenPageByteLimit(action))
 	case "find_in_page":
-		return a.executeFindInPage(ctx, stringField(action, "url"), stringField(action, "pattern"))
+		return a.executeFindInPage(ctx, stringField(action, "url"), stringField(action, "pattern"), webSearchOpenPageByteLimit(action))
 	default:
 		return a.executeSearch(ctx, action)
 	}
@@ -261,7 +277,7 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 		}
 	}
 	if searcherAllowsPageExcerptEnrichment(search) {
-		groups = a.enrichSearchResultGroups(ctx, groups, webSearchPageExcerptResultLimit(action))
+		groups = a.enrichSearchResultGroups(ctx, groups, webSearchPageExcerptResultLimit(action), webSearchPageExcerptByteLimit(action))
 	}
 
 	if resultCount == 0 && len(searchErrors) > 0 {
@@ -270,16 +286,16 @@ func (a *Adapter) executeSearch(ctx context.Context, action map[string]any) (str
 	return formatWebSearchResults(queries, groups), nil
 }
 
-func (a *Adapter) executeOpenPage(ctx context.Context, rawURL string) (string, error) {
-	page, err := a.fetchPageText(ctx, rawURL)
+func (a *Adapter) executeOpenPage(ctx context.Context, rawURL string, limit int) (string, error) {
+	page, err := a.fetchPageText(ctx, rawURL, limit)
 	if err != nil {
 		return "", err
 	}
 	return page, nil
 }
 
-func (a *Adapter) executeFindInPage(ctx context.Context, rawURL, pattern string) (string, error) {
-	page, err := a.fetchPageText(ctx, rawURL)
+func (a *Adapter) executeFindInPage(ctx context.Context, rawURL, pattern string, limit int) (string, error) {
+	page, err := a.fetchPageText(ctx, rawURL, limit)
 	if err != nil {
 		return "", err
 	}
@@ -293,7 +309,7 @@ func (a *Adapter) executeFindInPage(ctx context.Context, rawURL, pattern string)
 	return fmt.Sprintf("Matches for %q on %s:\n\n%s", pattern, rawURL, strings.Join(excerpts, "\n\n---\n\n")), nil
 }
 
-func (a *Adapter) fetchPageText(ctx context.Context, rawURL string) (string, error) {
+func (a *Adapter) fetchPageText(ctx context.Context, rawURL string, limit int) (string, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return "", fmt.Errorf("web search page url is empty")
@@ -333,7 +349,7 @@ func (a *Adapter) fetchPageText(ctx context.Context, rawURL string) (string, err
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("page fetch returned HTTP %d: %s", resp.StatusCode, collapseSearchWhitespace(string(body)))
 	}
-	title, text, err := extractPageText(body, resp.Header.Get("Content-Type"), u.String())
+	title, text, err := extractPageText(body, resp.Header.Get("Content-Type"), u.String(), limit)
 	if err != nil {
 		return "", err
 	}
@@ -472,18 +488,29 @@ func searcherAllowsPageExcerptEnrichment(search WebSearcher) bool {
 }
 
 func webSearchPageExcerptResultLimit(action map[string]any) int {
-	switch strings.ToLower(strings.TrimSpace(stringField(action, "search_context_size"))) {
+	switch webSearchContextSize(action) {
 	case "low":
 		return 0
 	case "high":
-		return 5
+		return webSearchHighExcerptResults
 	default:
-		return 3
+		return webSearchMediumExcerptResults
 	}
 }
 
-func (a *Adapter) enrichSearchResultGroups(ctx context.Context, groups []querySearchResults, perQueryLimit int) []querySearchResults {
-	if perQueryLimit <= 0 || len(groups) == 0 {
+func webSearchPageExcerptByteLimit(action map[string]any) int {
+	switch webSearchContextSize(action) {
+	case "low":
+		return 0
+	case "high":
+		return webSearchHighExcerptBytes
+	default:
+		return webSearchMediumExcerptBytes
+	}
+}
+
+func (a *Adapter) enrichSearchResultGroups(ctx context.Context, groups []querySearchResults, perQueryLimit, excerptLimit int) []querySearchResults {
+	if perQueryLimit <= 0 || excerptLimit <= 0 || len(groups) == 0 {
 		return groups
 	}
 	cache := map[string]string{}
@@ -501,7 +528,7 @@ func (a *Adapter) enrichSearchResultGroups(ctx context.Context, groups []querySe
 			excerpt, ok := cache[key]
 			if !ok {
 				var err error
-				excerpt, err = a.fetchSearchResultPageExcerpt(ctx, result.URL, maxSearchResultExcerptBytes)
+				excerpt, err = a.fetchSearchResultPageExcerpt(ctx, result.URL, excerptLimit)
 				if err != nil {
 					if a.logger != nil {
 						a.logger.Debug("failed to enrich search result page",
@@ -586,7 +613,7 @@ func (a *Adapter) fetchSearchResultPageExcerpt(ctx context.Context, rawURL strin
 	if contentType != "" && !strings.Contains(contentType, "html") && !strings.Contains(contentType, "xml") && !strings.Contains(contentType, "text/plain") {
 		return "", fmt.Errorf("unsupported page content type %q", resp.Header.Get("Content-Type"))
 	}
-	_, text, err := extractPageText(body, resp.Header.Get("Content-Type"), u.String())
+	_, text, err := extractPageText(body, resp.Header.Get("Content-Type"), u.String(), limit)
 	if err != nil {
 		return "", err
 	}
@@ -614,14 +641,61 @@ func mergeSearchResultSnippet(snippet, excerpt string) string {
 }
 
 func webSearchResultLimit(action map[string]any) int {
-	switch strings.ToLower(strings.TrimSpace(stringField(action, "search_context_size"))) {
-	case "low":
-		return 3
-	case "high":
-		return 8
-	default:
-		return maxWebSearchResults
+	if limit := positiveIntField(action, "limit", "max_results"); limit > 0 {
+		if limit > webSearchHighResultLimit {
+			return webSearchHighResultLimit
+		}
+		return limit
 	}
+	switch webSearchContextSize(action) {
+	case "low":
+		return webSearchLowResultLimit
+	case "high":
+		return webSearchHighResultLimit
+	default:
+		return webSearchMediumResultLimit
+	}
+}
+
+func webSearchOpenPageByteLimit(action map[string]any) int {
+	switch webSearchContextSize(action) {
+	case "low":
+		return webSearchLowOpenPageBytes
+	case "high":
+		return webSearchHighOpenPageBytes
+	default:
+		return webSearchMediumOpenPageBytes
+	}
+}
+
+func webSearchContextSize(action map[string]any) string {
+	size := strings.ToLower(strings.TrimSpace(stringField(action, "search_context_size")))
+	switch size {
+	case "low", "medium", "high":
+		return size
+	default:
+		return "high"
+	}
+}
+
+func positiveIntField(obj map[string]any, keys ...string) int {
+	for _, key := range keys {
+		switch v := obj[key].(type) {
+		case int:
+			if v > 0 {
+				return v
+			}
+		case int64:
+			if v > 0 {
+				return int(v)
+			}
+		case float64:
+			if v > 0 {
+				return int(v)
+			}
+		}
+	}
+	return 0
 }
 
 func dedupeStrings(values []string) []string {
@@ -729,9 +803,12 @@ func collapseSearchWhitespace(value string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
 }
 
-func extractPageText(body []byte, contentType, fallbackTitle string) (string, string, error) {
+func extractPageText(body []byte, contentType, fallbackTitle string, limit int) (string, string, error) {
+	if limit <= 0 {
+		limit = webSearchMediumOpenPageBytes
+	}
 	if !looksLikeHTML(contentType, body) {
-		text := limitWebSearchText(string(body), maxWebSearchExcerptBytes)
+		text := limitWebSearchText(string(body), limit)
 		return fallbackTitle, text, nil
 	}
 
@@ -750,7 +827,7 @@ func extractPageText(body []byte, contentType, fallbackTitle string) (string, st
 	if text == "" {
 		text = collapseSearchWhitespace(doc.Text())
 	}
-	text = limitWebSearchText(text, maxWebSearchExcerptBytes)
+	text = limitWebSearchText(text, limit)
 	return title, text, nil
 }
 

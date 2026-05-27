@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1968,11 +1969,130 @@ func TestWebSearchToolSchemaAcceptsCodexQueryShapes(t *testing.T) {
 	if _, ok := props["queries"]; !ok {
 		t.Fatalf("web_search chat schema missing queries: %#v", props)
 	}
+	if _, ok := props["search_context_size"]; !ok {
+		t.Fatalf("web_search chat schema missing search_context_size: %#v", props)
+	}
+	if _, ok := props["limit"]; !ok {
+		t.Fatalf("web_search chat schema missing limit: %#v", props)
+	}
 	if got := schema["additionalProperties"]; got != true {
 		t.Fatalf("additionalProperties = %#v", got)
 	}
 	if !strings.Contains(webSearchToolDescription, "query") || !strings.Contains(webSearchToolDescription, "multiple web_search tool calls") {
 		t.Fatalf("web search description does not describe query shapes: %q", webSearchToolDescription)
+	}
+}
+
+func TestWebSearchContextSizeBudgetsMatchLargeContextModel(t *testing.T) {
+	cases := []struct {
+		name           string
+		action         map[string]any
+		results        int
+		excerptResults int
+		excerptBytes   int
+		openPageBytes  int
+	}{
+		{
+			name:           "default medium",
+			action:         map[string]any{},
+			results:        webSearchMediumResultLimit,
+			excerptResults: webSearchMediumExcerptResults,
+			excerptBytes:   webSearchMediumExcerptBytes,
+			openPageBytes:  webSearchMediumOpenPageBytes,
+		},
+		{
+			name:           "low",
+			action:         map[string]any{"search_context_size": "low"},
+			results:        webSearchLowResultLimit,
+			excerptResults: 0,
+			excerptBytes:   0,
+			openPageBytes:  webSearchLowOpenPageBytes,
+		},
+		{
+			name:           "high",
+			action:         map[string]any{"search_context_size": "high"},
+			results:        webSearchHighResultLimit,
+			excerptResults: webSearchHighExcerptResults,
+			excerptBytes:   webSearchHighExcerptBytes,
+			openPageBytes:  webSearchHighOpenPageBytes,
+		},
+		{
+			name:           "explicit limit capped",
+			action:         map[string]any{"search_context_size": "high", "limit": float64(999)},
+			results:        webSearchHighResultLimit,
+			excerptResults: webSearchHighExcerptResults,
+			excerptBytes:   webSearchHighExcerptBytes,
+			openPageBytes:  webSearchHighOpenPageBytes,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := webSearchResultLimit(tc.action); got != tc.results {
+				t.Fatalf("result limit = %d, want %d", got, tc.results)
+			}
+			if got := webSearchPageExcerptResultLimit(tc.action); got != tc.excerptResults {
+				t.Fatalf("excerpt result limit = %d, want %d", got, tc.excerptResults)
+			}
+			if got := webSearchPageExcerptByteLimit(tc.action); got != tc.excerptBytes {
+				t.Fatalf("excerpt byte limit = %d, want %d", got, tc.excerptBytes)
+			}
+			if got := webSearchOpenPageByteLimit(tc.action); got != tc.openPageBytes {
+				t.Fatalf("open_page byte limit = %d, want %d", got, tc.openPageBytes)
+			}
+		})
+	}
+}
+
+func TestWebSearchExecutionActionMergesToolDefaultsAndCallArguments(t *testing.T) {
+	defaults := webSearchDefaultsFromTool(map[string]any{
+		"search_context_size": "medium",
+		"filters": map[string]any{
+			"allowed_domains": []any{"example.com"},
+		},
+	})
+	action := webSearchExecutionActionFromArguments(`{"query":"api docs","search_context_size":"high","limit":7}`, defaults)
+	if action["type"] != "search" || action["query"] != "api docs" {
+		t.Fatalf("bad execution action: %#v", action)
+	}
+	if action["search_context_size"] != "high" || action["limit"].(float64) != 7 {
+		t.Fatalf("call arguments did not override defaults: %#v", action)
+	}
+	if domains := action["domains"].([]any); len(domains) != 1 || domains[0] != "example.com" {
+		t.Fatalf("default allowed domains not copied: %#v", action)
+	}
+	publicAction := webSearchActionFromArguments(`{"query":"api docs","search_context_size":"high","limit":7}`)
+	if _, ok := publicAction["search_context_size"]; ok {
+		t.Fatalf("public Responses action leaked execution-only fields: %#v", publicAction)
+	}
+	if _, ok := publicAction["limit"]; ok {
+		t.Fatalf("public Responses action leaked limit: %#v", publicAction)
+	}
+}
+
+func TestWebSearchUsesToolConfigDefaultsForExecution(t *testing.T) {
+	results := make([]searchResult, webSearchHighResultLimit+5)
+	for i := range results {
+		results[i] = searchResult{
+			Title:   fmt.Sprintf("Result %02d", i+1),
+			URL:     fmt.Sprintf("https://example.com/%02d", i+1),
+			Snippet: "Result snippet.",
+		}
+	}
+	searcher := &mockWebSearcher{results: results}
+	adapter := testAdapterWithClientAndSearcher(t, "http://example.test/v1", nil, http.DefaultClient, searcher)
+	call := &chatToolCall{ID: "call-web", Name: "web_search"}
+	call.Arguments.WriteString(`{"query":"large context search"}`)
+	tx := &translationContext{webSearchDefaults: map[string]any{"search_context_size": "high"}}
+
+	text, err := adapter.executeWebSearch(context.Background(), call, tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(searcher.limits) != 1 || searcher.limits[0] != webSearchHighResultLimit {
+		t.Fatalf("search limits = %#v", searcher.limits)
+	}
+	if !strings.Contains(text, "Result 20") || strings.Contains(text, "Result 21") {
+		t.Fatalf("unexpected result count in text:\n%s", text)
 	}
 }
 
@@ -3037,6 +3157,7 @@ func testAdapterWithClientAndSearcher(t *testing.T, providerURL string, debug *D
 type mockWebSearcher struct {
 	results []searchResult
 	queries []string
+	limits  []int
 	err     error
 }
 
@@ -3046,6 +3167,7 @@ func (m *mockWebSearcher) Name() string {
 
 func (m *mockWebSearcher) Search(_ context.Context, query string, limit int) ([]searchResult, error) {
 	m.queries = append(m.queries, query)
+	m.limits = append(m.limits, limit)
 	if m.err != nil {
 		return nil, m.err
 	}

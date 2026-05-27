@@ -97,6 +97,8 @@ Supported search actions:
 
 Domain filters from `domains` or `filters.allowed_domains` are applied after search results are normalized. The default backend filters obvious ad/click-tracking results, tries DuckDuckGo first, then Bing and Yahoo if the primary backend is blocked or returns no parseable results. `duckduckgo-lite` starts with DuckDuckGo Lite before using the same fallbacks. For built-in search backends, medium and high context searches also add short page excerpts from the top organic results.
 
+The adapter applies the inbound Responses `web_search` tool config as defaults for synthetic Chat Completions tool calls. `search_context_size` is tuned for large-context models: `low` returns up to 5 concise results, `medium` returns up to 10 results and enriches the top 5 pages, and `high` returns up to 20 results and enriches the top 8 pages with larger excerpts. `open_page` and `find_in_page` also scale their extracted text budget with the same setting.
+
 Example SearXNG setup:
 
 ```sh

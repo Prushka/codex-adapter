@@ -831,13 +831,15 @@ type requestBuilder struct {
 	reasoningHistory     string
 	messageOccurrences   map[string]int
 	webSearchOccurrences map[string]int
+	webSearchDefaults    map[string]any
 	lookupExtraContent   func(callID string) any
 	lookupMessageExtra   func(key string, occurrence int) any
 	lookupWebSearch      func(key string, occurrence int) *webSearchHistoryEntry
 }
 
 type translationContext struct {
-	byChat map[string]toolMapping
+	byChat            map[string]toolMapping
+	webSearchDefaults map[string]any
 }
 
 type toolMapping struct {
@@ -913,7 +915,10 @@ func (b *requestBuilder) context() *translationContext {
 	for k, v := range b.byChat {
 		byChat[k] = v
 	}
-	return &translationContext{byChat: byChat}
+	return &translationContext{
+		byChat:            byChat,
+		webSearchDefaults: cloneStringAnyMap(b.webSearchDefaults),
+	}
 }
 
 func (b *requestBuilder) translateTools(value any) []any {
@@ -945,6 +950,9 @@ func (b *requestBuilder) translateTools(value any) []any {
 		case "tool_search":
 			out = append(out, b.hostedFunctionTool("tool_search", "tool_search", stringField(tool, "description"), schemaOrDefault(tool["parameters"])))
 		case "web_search":
+			if defaults := webSearchDefaultsFromTool(tool); len(defaults) > 0 {
+				b.webSearchDefaults = defaults
+			}
 			out = append(out, b.hostedFunctionTool("web_search", "web_search", webSearchToolDescription, webSearchSchema()))
 		case "image_generation":
 			out = append(out, b.hostedFunctionTool("image_generation", "image_generation", "Request image generation. If the provider cannot return base64 image data in result, Codex will receive a failed image_generation_call item.", imageGenerationSchema()))
@@ -1763,6 +1771,7 @@ func webSearchSchema() map[string]any {
 			"action":              map[string]any{"type": "string", "enum": []any{"search", "open_page", "find_in_page"}},
 			"query":               map[string]any{"type": "string"},
 			"queries":             map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"limit":               map[string]any{"type": "number", "description": "Optional number of search results to return; capped by the adapter."},
 			"domains":             map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"external_web_access": map[string]any{"type": "boolean"},
 			"filters": map[string]any{
@@ -1772,7 +1781,7 @@ func webSearchSchema() map[string]any {
 				},
 				"additionalProperties": true,
 			},
-			"search_context_size":  map[string]any{"type": "string", "enum": []any{"low", "medium", "high"}},
+			"search_context_size":  map[string]any{"type": "string", "enum": []any{"low", "medium", "high"}, "description": "Controls local result volume and page-excerpt depth. Use high by default; use high for research-heavy searches."},
 			"search_content_types": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 			"user_location": map[string]any{
 				"type":                 "object",
@@ -1785,7 +1794,7 @@ func webSearchSchema() map[string]any {
 	}
 }
 
-const webSearchToolDescription = "Request a web search action. Use query for one search, or queries for a single hosted web_search action with multiple searches. When explicitly asked for parallel tool calls, issue multiple web_search tool calls in the same assistant turn."
+const webSearchToolDescription = "Request a web search action. Use query for one search, or queries for a single hosted web_search action with multiple searches. search_context_size controls local result volume and page-excerpt depth: low is brief, medium is the default, high is for research-heavy searches. When explicitly asked for parallel tool calls, issue multiple web_search tool calls in the same assistant turn."
 
 func imageGenerationSchema() map[string]any {
 	return map[string]any{
@@ -2870,6 +2879,53 @@ func webSearchActionFromArguments(arguments string) map[string]any {
 	return out
 }
 
+func webSearchExecutionActionFromArguments(arguments string, defaults map[string]any) map[string]any {
+	out := cloneStringAnyMap(defaults)
+	if out == nil {
+		out = map[string]any{}
+	}
+	obj := jsonObject(arguments)
+	for _, key := range []string{
+		"search_context_size",
+		"search_content_types",
+		"external_web_access",
+		"user_location",
+		"filters",
+		"domains",
+		"limit",
+		"max_results",
+	} {
+		if value, ok := obj[key]; ok {
+			out[key] = cloneJSONValue(value)
+		}
+	}
+	for key, value := range webSearchActionFromArguments(arguments) {
+		out[key] = value
+	}
+	return out
+}
+
+func webSearchDefaultsFromTool(tool map[string]any) map[string]any {
+	out := map[string]any{}
+	for _, key := range []string{
+		"search_context_size",
+		"search_content_types",
+		"external_web_access",
+		"user_location",
+		"filters",
+	} {
+		if value, ok := tool[key]; ok {
+			out[key] = cloneJSONValue(value)
+		}
+	}
+	if filters, ok := tool["filters"].(map[string]any); ok {
+		if domains, ok := filters["allowed_domains"]; ok {
+			out["domains"] = cloneJSONValue(domains)
+		}
+	}
+	return out
+}
+
 func webSearchHistoryKey(action any) string {
 	if action == nil {
 		return ""
@@ -2922,6 +2978,17 @@ func jsonObject(raw string) map[string]any {
 		return map[string]any{}
 	}
 	return value
+}
+
+func cloneStringAnyMap(value map[string]any) map[string]any {
+	if len(value) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(value))
+	for key, item := range value {
+		out[key] = cloneJSONValue(item)
+	}
+	return out
 }
 
 func cloneJSONValue(value any) any {
