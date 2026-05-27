@@ -80,6 +80,20 @@ Set `-disable-upstream-streaming` to make `/responses` buffer the upstream Chat 
 
 `-api-key` and `-api-key-env` are mutually exclusive. If neither is set, the adapter forwards the inbound `Authorization` header sent by Codex. If either adapter-owned key source is set, it overrides Codex's inbound authorization and is sent upstream as `Authorization: Bearer <key>`. Values that already include an authorization scheme, such as `Bearer sk-...`, are forwarded as-is.
 
+## Key Rotation Proxy
+
+`cmd/key-rotation` is a small Chat Completions pass-through proxy. It forwards `POST /chat/completions` and `POST /v1/chat/completions` request bodies and headers to the upstream Chat Completions endpoint, overriding only `Authorization`. If an upstream attempt fails with a request error or non-2xx HTTP response, it rotates to the next configured key and retries the same request. If every key fails with an HTTP response, the last upstream error response is returned unchanged.
+
+```sh
+go run ./cmd/key-rotation \
+  -listen 127.0.0.1:18081 \
+  -provider-url https://api.example.com/v1 \
+  -api-key sk-first \
+  -api-key sk-second
+```
+
+For environment-based setup, set `-api-keys-env` to a variable containing comma- or newline-separated keys.
+
 ## Local Web Search
 
 Chat Completions has no standard hosted `web_search` tool, so the adapter exposes `web_search` to the upstream model as a synthetic function. When the upstream model makes a single `web_search` call, the adapter:
