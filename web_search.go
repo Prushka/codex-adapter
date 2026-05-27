@@ -147,6 +147,7 @@ func (a *Adapter) handleGeneration(
 	if err != nil {
 		return fmt.Errorf("failed to translate web search follow-up response: %w", err)
 	}
+	a.logUpstreamUsage("web_search_follow_up", respID, gen2.usage)
 	return a.handleGeneration(inbound, followUpReq, gen2, ctx, sse, respID, webSearchDepth+1)
 }
 

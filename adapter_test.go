@@ -575,6 +575,72 @@ func TestUpstreamHTTPErrorIncludesProviderDetailsInLogsAndResponse(t *testing.T)
 	}
 }
 
+func TestUpstreamUsageLoggedForNonStreamingResponse(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"usage": map[string]any{
+				"prompt_tokens":     11,
+				"completion_tokens": 13,
+				"total_tokens":      24,
+				"completion_tokens_details": map[string]any{
+					"reasoning_tokens": 5,
+				},
+			},
+			"choices": []any{
+				map[string]any{
+					"finish_reason": "stop",
+					"message":       map[string]any{"role": "assistant", "content": "answer"},
+				},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:     upstream.URL,
+		Model:           "forced-model",
+		ReasoningEffort: "low",
+		HTTPClient:      http.DefaultClient,
+		Logger:          zap.New(core),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = callResponses(t, adapter, responsesRequestWithTools(nil))
+
+	entries := logs.FilterMessage("upstream response usage").All()
+	if len(entries) != 1 {
+		t.Fatalf("usage log entries = %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["stage"] != "chat" || fields["usage_present"] != true {
+		t.Fatalf("bad usage fields = %#v", fields)
+	}
+	if fields["input_tokens"] != int64(11) || fields["output_tokens"] != int64(13) || fields["reasoning_tokens"] != int64(5) || fields["total_tokens"] != int64(24) {
+		t.Fatalf("bad token fields = %#v", fields)
+	}
+	if fields["response_id"] == "" {
+		t.Fatalf("missing response_id field = %#v", fields)
+	}
+}
+
+func TestUpstreamUsageCountsAcceptProviderAliases(t *testing.T) {
+	counts := upstreamUsageCountsFromUsage(map[string]any{
+		"input_tokens":  "260",
+		"output_tokens": float64(40),
+		"output_tokens_details": map[string]any{
+			"reasoning": json.Number("17"),
+		},
+	})
+
+	if counts.inputTokens != 260 || counts.outputTokens != 40 || counts.reasoningTokens != 17 || counts.totalTokens != 300 {
+		t.Fatalf("counts = %#v", counts)
+	}
+}
+
 func TestStreamingFunctionCallToResponsesFunctionCall(t *testing.T) {
 	var upstreamReq map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1737,6 +1803,7 @@ func TestMalformedHistoricalToolCallIsNotForwardedAsChatToolCall(t *testing.T) {
 }
 
 func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hit := upstreamHits.Add(1)
@@ -1795,7 +1862,17 @@ func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 		},
 	}
 
-	adapter := testAdapterWithClientAndSearcher(t, upstream.URL, nil, http.DefaultClient, searcher)
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:     upstream.URL,
+		Model:           "forced-model",
+		ReasoningEffort: "low",
+		WebSearcher:     searcher,
+		HTTPClient:      http.DefaultClient,
+		Logger:          zap.New(core),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	body := responsesRequestWithTools([]any{
 		map[string]any{
 			"type":                   "web_search",
@@ -1810,6 +1887,22 @@ func TestWebSearchCallTriggersSearchFollowUpAndFinalAnswer(t *testing.T) {
 	item := firstDoneItem(t, events, "web_search_call")
 	if item["status"] != "completed" {
 		t.Fatalf("web search status = %v", item["status"])
+	}
+	usageLogs := logs.FilterMessage("upstream response usage").All()
+	if len(usageLogs) != 2 {
+		t.Fatalf("usage log entries = %d", len(usageLogs))
+	}
+	usageByStage := map[string]map[string]any{}
+	for _, entry := range usageLogs {
+		fields := entry.ContextMap()
+		stage, _ := fields["stage"].(string)
+		usageByStage[stage] = fields
+	}
+	if fields := usageByStage["chat_stream"]; fields["input_tokens"] != int64(4) || fields["output_tokens"] != int64(5) || fields["total_tokens"] != int64(9) {
+		t.Fatalf("bad initial usage log = %#v", fields)
+	}
+	if fields := usageByStage["web_search_follow_up_stream"]; fields["input_tokens"] != int64(10) || fields["output_tokens"] != int64(12) || fields["total_tokens"] != int64(22) {
+		t.Fatalf("bad follow-up usage log = %#v", fields)
 	}
 	action := item["action"].(map[string]any)
 	if action["type"] != "search" || action["query"] != "Tesla stock price" {
@@ -1993,12 +2086,12 @@ func TestWebSearchContextSizeBudgetsMatchLargeContextModel(t *testing.T) {
 		openPageBytes  int
 	}{
 		{
-			name:           "default medium",
+			name:           "default high",
 			action:         map[string]any{},
-			results:        webSearchMediumResultLimit,
-			excerptResults: webSearchMediumExcerptResults,
-			excerptBytes:   webSearchMediumExcerptBytes,
-			openPageBytes:  webSearchMediumOpenPageBytes,
+			results:        webSearchHighResultLimit,
+			excerptResults: webSearchHighExcerptResults,
+			excerptBytes:   webSearchHighExcerptBytes,
+			openPageBytes:  webSearchHighOpenPageBytes,
 		},
 		{
 			name:           "low",
@@ -3040,6 +3133,7 @@ func TestSearxngSearchBackendParsesJSONResults(t *testing.T) {
 }
 
 func TestCompactEndpointReturnsResponsesOutputItems(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -3062,7 +3156,16 @@ func TestCompactEndpointReturnsResponsesOutputItems(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	adapter := testAdapter(t, upstream.URL, nil)
+	adapter, err := NewAdapter(AdapterConfig{
+		ProviderURL:     upstream.URL,
+		Model:           "forced-model",
+		ReasoningEffort: "low",
+		HTTPClient:      http.DefaultClient,
+		Logger:          zap.New(core),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	raw, _ := json.Marshal(responsesRequestWithTools(nil))
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(raw))
 	rec := httptest.NewRecorder()
@@ -3081,6 +3184,14 @@ func TestCompactEndpointReturnsResponsesOutputItems(t *testing.T) {
 	item := output[0].(map[string]any)
 	if item["type"] != "message" || item["role"] != "assistant" {
 		t.Fatalf("bad compact item: %#v", item)
+	}
+	entries := logs.FilterMessage("upstream response usage").All()
+	if len(entries) != 1 {
+		t.Fatalf("usage log entries = %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["stage"] != "compact" || fields["input_tokens"] != int64(1) || fields["output_tokens"] != int64(2) || fields["total_tokens"] != int64(3) {
+		t.Fatalf("bad compact usage log = %#v", fields)
 	}
 }
 

@@ -285,6 +285,7 @@ func (a *Adapter) handleResponses(w http.ResponseWriter, r *http.Request) {
 		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "response_translation_error", err.Error()))
 		return
 	}
+	a.logUpstreamUsage("chat", respID, gen.usage)
 	if err := a.handleGeneration(r, chatReq, gen, ctx, sse, respID, 0); err != nil {
 		a.logger.Error("failed to handle upstream chat response", zap.String("response_id", respID), zap.Error(err))
 		_ = sse.Event("response.failed", failedResponse(respID, "server_error", "response_handling_error", err.Error()))
@@ -358,6 +359,7 @@ func (a *Adapter) handleCompact(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadGateway, "response_translation_error", err.Error())
 		return
 	}
+	a.logUpstreamUsage("compact", "", gen.usage)
 	a.rememberToolExtraContent(gen)
 	a.rememberMessageExtraContent(gen)
 	out := map[string]any{"output": gen.outputItems()}
@@ -1912,6 +1914,11 @@ func (a *Adapter) translateChatStream(
 	if err := process(); err != nil {
 		return err
 	}
+	stage := "chat_stream"
+	if webSearchDepth > 0 {
+		stage = "web_search_follow_up_stream"
+	}
+	a.logUpstreamUsage(stage, respID, gen.usage)
 	return a.handleGeneration(inbound, upstreamReq, gen, ctx, sse, respID, webSearchDepth)
 }
 
@@ -2727,27 +2734,76 @@ func incompleteReasonFromFinishReason(reason string) (string, bool) {
 	}
 }
 
+type upstreamUsageCounts struct {
+	inputTokens     int64
+	outputTokens    int64
+	reasoningTokens int64
+	totalTokens     int64
+}
+
+func (a *Adapter) logUpstreamUsage(stage, respID string, usage map[string]any) {
+	counts := upstreamUsageCountsFromUsage(usage)
+	fields := []zap.Field{
+		zap.String("stage", stage),
+		zap.Bool("usage_present", len(usage) > 0),
+		zap.Int64("input_tokens", counts.inputTokens),
+		zap.Int64("output_tokens", counts.outputTokens),
+		zap.Int64("reasoning_tokens", counts.reasoningTokens),
+		zap.Int64("total_tokens", counts.totalTokens),
+	}
+	if respID != "" {
+		fields = append(fields, zap.String("response_id", respID))
+	}
+	a.logger.Info("upstream response usage", fields...)
+}
+
+func upstreamUsageCountsFromUsage(usage map[string]any) upstreamUsageCounts {
+	var counts upstreamUsageCounts
+	input, hasInput := firstInt64Field(usage, "prompt_tokens", "input_tokens")
+	output, hasOutput := firstInt64Field(usage, "completion_tokens", "output_tokens")
+	total, hasTotal := firstInt64Field(usage, "total_tokens")
+	reasoning, _ := reasoningTokensFromUsage(usage)
+	if hasInput {
+		counts.inputTokens = input
+	}
+	if hasOutput {
+		counts.outputTokens = output
+	}
+	if hasTotal {
+		counts.totalTokens = total
+	} else if hasInput || hasOutput {
+		counts.totalTokens = counts.inputTokens + counts.outputTokens
+	}
+	counts.reasoningTokens = reasoning
+	return counts
+}
+
+func reasoningTokensFromUsage(usage map[string]any) (int64, bool) {
+	if tokens, ok := firstInt64Field(usage, "reasoning_tokens"); ok {
+		return tokens, true
+	}
+	for _, key := range []string{"completion_tokens_details", "output_tokens_details"} {
+		if details, ok := usage[key].(map[string]any); ok {
+			if tokens, ok := firstInt64Field(details, "reasoning_tokens", "reasoning"); ok {
+				return tokens, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func responsesUsage(usage map[string]any) map[string]any {
-	input := int64FromAny(usage["prompt_tokens"])
-	output := int64FromAny(usage["completion_tokens"])
-	total := int64FromAny(usage["total_tokens"])
-	if total == 0 {
-		total = input + output
-	}
-	reasoningTokens := int64(0)
-	if details, ok := usage["completion_tokens_details"].(map[string]any); ok {
-		reasoningTokens = int64FromAny(details["reasoning_tokens"])
-	}
+	counts := upstreamUsageCountsFromUsage(usage)
 	var outputDetails any
-	if reasoningTokens > 0 {
-		outputDetails = map[string]any{"reasoning_tokens": reasoningTokens}
+	if counts.reasoningTokens > 0 {
+		outputDetails = map[string]any{"reasoning_tokens": counts.reasoningTokens}
 	}
 	return map[string]any{
-		"input_tokens":          input,
+		"input_tokens":          counts.inputTokens,
 		"input_tokens_details":  nil,
-		"output_tokens":         output,
+		"output_tokens":         counts.outputTokens,
 		"output_tokens_details": outputDetails,
-		"total_tokens":          total,
+		"total_tokens":          counts.totalTokens,
 	}
 }
 
@@ -3094,19 +3150,68 @@ func intFieldOK(m map[string]any, key string) (int, bool) {
 	}
 }
 
+func firstInt64Field(m map[string]any, keys ...string) (int64, bool) {
+	if m == nil {
+		return 0, false
+	}
+	for _, key := range keys {
+		if n, ok := int64FromAnyOK(m[key]); ok {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
 func int64FromAny(value any) int64 {
+	n, _ := int64FromAnyOK(value)
+	return n
+}
+
+func int64FromAnyOK(value any) (int64, bool) {
 	switch v := value.(type) {
 	case float64:
-		return int64(v)
+		return int64(v), true
+	case float32:
+		return int64(v), true
 	case int64:
-		return v
+		return v, true
+	case int32:
+		return int64(v), true
 	case int:
-		return int64(v)
+		return int64(v), true
+	case uint64:
+		if v > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(v), true
+	case uint32:
+		return int64(v), true
+	case uint:
+		if uint64(v) > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(v), true
 	case json.Number:
-		n, _ := v.Int64()
-		return n
+		if n, err := v.Int64(); err == nil {
+			return n, true
+		}
+		if f, err := strconv.ParseFloat(v.String(), 64); err == nil {
+			return int64(f), true
+		}
+		return 0, false
+	case string:
+		if v == "" {
+			return 0, false
+		}
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n, true
+		}
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return int64(f), true
+		}
+		return 0, false
 	default:
-		return 0
+		return 0, false
 	}
 }
 
