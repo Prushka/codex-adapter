@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,11 +21,9 @@ import (
 const maxRequestBodyBytes = 128 << 20
 
 type cliConfig struct {
-	listenAddr  string
-	providerURL string
-	apiKeys     keyList
-	apiKeysEnv  string
-	timeout     time.Duration
+	listenAddr string
+	providers  providerList
+	timeout    time.Duration
 }
 
 func main() {
@@ -38,33 +38,27 @@ func main() {
 	if err := cfg.validate(); err != nil {
 		exitWithError(logger, err.Error())
 	}
-	keys, err := cfg.resolveAPIKeys()
-	if err != nil {
-		exitWithError(logger, err.Error(), zap.String("env", cfg.apiKeysEnv))
-	}
-
-	chatURL, err := normalizeChatCompletionsURL(cfg.providerURL)
-	if err != nil {
-		exitWithError(logger, "invalid provider URL", zap.Error(err))
-	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DisableCompression = true
+	client := &http.Client{
+		Timeout:   cfg.timeout,
+		Transport: transport,
+	}
 
-	handler := newProxy(proxyConfig{
-		ChatURL: chatURL,
-		Keys:    keys,
-		Client: &http.Client{
-			Timeout:   cfg.timeout,
-			Transport: transport,
-		},
-		Logger: logger,
+	handler, err := newProxy(proxyConfig{
+		Providers: cfg.providers,
+		Client:    client,
+		Logger:    logger,
 	})
+	if err != nil {
+		exitWithError(logger, "failed to create load balancer", zap.Error(err))
+	}
 
-	logger.Info("key-rotation proxy listening",
+	logger.Info("chat completions load balancer listening",
 		zap.String("listen", cfg.listenAddr),
-		zap.String("upstream_chat_completions_url", chatURL),
-		zap.Int("keys", len(keys)),
+		zap.Int("providers", len(handler.pool.providers)),
+		zap.Int("models", len(handler.pool.modelProviders)),
 	)
 
 	server := &http.Server{
@@ -80,9 +74,7 @@ func main() {
 func parseFlags() cliConfig {
 	var cfg cliConfig
 	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:18081", "local listening address for Chat Completions requests")
-	flag.StringVar(&cfg.providerURL, "provider-url", "", "OpenAI-compatible upstream provider base URL, /v1 URL, or direct /chat/completions URL")
-	flag.Var(&cfg.apiKeys, "api-key", "upstream provider API key; may be repeated and overrides inbound Authorization")
-	flag.StringVar(&cfg.apiKeysEnv, "api-keys-env", "", "environment variable containing upstream API keys separated by commas or newlines")
+	flag.Var(&cfg.providers, "provider", "upstream provider tuple id,url,key; may be repeated")
 	flag.DurationVar(&cfg.timeout, "timeout", 10*time.Minute, "upstream request timeout")
 	flag.Parse()
 	return cfg
@@ -90,64 +82,79 @@ func parseFlags() cliConfig {
 
 func (c cliConfig) validate() error {
 	switch {
-	case c.providerURL == "":
-		return errors.New("missing required flag: -provider-url")
-	case len(c.apiKeys) > 0 && c.apiKeysEnv != "":
-		return errors.New("only one API key source may be set: repeated -api-key or -api-keys-env")
+	case len(c.providers) == 0:
+		return errors.New("missing required flag: -provider")
 	default:
+		seen := map[string]struct{}{}
+		for _, provider := range c.providers {
+			if _, ok := seen[provider.ID]; ok {
+				return fmt.Errorf("duplicate provider id %q", provider.ID)
+			}
+			seen[provider.ID] = struct{}{}
+		}
 		return nil
 	}
 }
 
-func (c cliConfig) resolveAPIKeys() ([]string, error) {
-	var keys []string
-	if c.apiKeysEnv != "" {
-		value := strings.TrimSpace(os.Getenv(c.apiKeysEnv))
-		if value == "" {
-			return nil, errors.New("API keys environment variable is unset or empty")
-		}
-		keys = splitAPIKeys(value)
-	} else {
-		for _, raw := range c.apiKeys {
-			keys = append(keys, splitAPIKeys(raw)...)
-		}
-	}
-	keys = compactStrings(keys)
-	if len(keys) == 0 {
-		return nil, errors.New("at least one upstream API key is required")
-	}
-	return keys, nil
-}
+type providerList []providerConfig
 
-type keyList []string
-
-func (k *keyList) String() string {
-	if k == nil {
+func (p *providerList) String() string {
+	if p == nil {
 		return ""
 	}
-	return strings.Join(*k, ",")
+	parts := make([]string, 0, len(*p))
+	for _, provider := range *p {
+		parts = append(parts, provider.ID+","+provider.ProviderURL+",<redacted>")
+	}
+	return strings.Join(parts, ";")
 }
 
-func (k *keyList) Set(value string) error {
-	*k = append(*k, value)
+func (p *providerList) Set(value string) error {
+	provider, err := parseProviderConfig(value)
+	if err != nil {
+		return err
+	}
+	*p = append(*p, provider)
 	return nil
 }
 
+func parseProviderConfig(value string) (providerConfig, error) {
+	parts := strings.SplitN(value, ",", 3)
+	if len(parts) != 3 {
+		return providerConfig{}, fmt.Errorf("invalid provider %q: expected id,url,key", value)
+	}
+	cfg := providerConfig{
+		ID:          strings.TrimSpace(parts[0]),
+		ProviderURL: strings.TrimSpace(parts[1]),
+		APIKey:      strings.TrimSpace(parts[2]),
+	}
+	switch {
+	case cfg.ID == "":
+		return providerConfig{}, fmt.Errorf("invalid provider %q: id is required", value)
+	case strings.ContainsAny(cfg.ID, " \t\r\n,"):
+		return providerConfig{}, fmt.Errorf("invalid provider id %q: id must not contain whitespace or commas", cfg.ID)
+	case cfg.ProviderURL == "":
+		return providerConfig{}, fmt.Errorf("invalid provider %q: url is required", value)
+	case cfg.APIKey == "":
+		return providerConfig{}, fmt.Errorf("invalid provider %q: key is required", value)
+	default:
+		return cfg, nil
+	}
+}
+
 type proxyConfig struct {
-	ChatURL string
-	Keys    []string
-	Client  *http.Client
-	Logger  *zap.Logger
+	Providers []providerConfig
+	Client    *http.Client
+	Logger    *zap.Logger
 }
 
 type proxy struct {
-	chatURL string
-	keys    *keyRing
-	client  *http.Client
-	logger  *zap.Logger
+	pool   *providerPool
+	client *http.Client
+	logger *zap.Logger
 }
 
-func newProxy(cfg proxyConfig) *proxy {
+func newProxy(cfg proxyConfig) (*proxy, error) {
 	client := cfg.Client
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
@@ -156,12 +163,229 @@ func newProxy(cfg proxyConfig) *proxy {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &proxy{
-		chatURL: cfg.ChatURL,
-		keys:    newKeyRing(cfg.Keys),
-		client:  client,
-		logger:  logger,
+	pool, err := newProviderPool(context.Background(), cfg.Providers, client, logger)
+	if err != nil {
+		return nil, err
 	}
+	return &proxy{
+		pool:   pool,
+		client: client,
+		logger: logger,
+	}, nil
+}
+
+type providerConfig struct {
+	ID          string
+	ProviderURL string
+	APIKey      string
+}
+
+type provider struct {
+	id        string
+	chatURL   string
+	modelsURL string
+	apiKey    string
+	models    map[string]struct{}
+	busy      int
+}
+
+type providerPool struct {
+	mu             sync.Mutex
+	providers      []provider
+	modelProviders map[string][]int
+	current        int
+}
+
+func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Client, logger *zap.Logger) (*providerPool, error) {
+	if len(cfgs) == 0 {
+		return nil, errors.New("at least one upstream provider is required")
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+
+	providers := make([]provider, 0, len(cfgs))
+	modelProviders := map[string][]int{}
+	for i, cfg := range cfgs {
+		chatURL, err := normalizeChatCompletionsURL(cfg.ProviderURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid provider %q URL %q: %w", cfg.ID, cfg.ProviderURL, err)
+		}
+		modelsURL, err := normalizeModelsURL(cfg.ProviderURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid provider %q models URL %q: %w", cfg.ID, cfg.ProviderURL, err)
+		}
+		models, err := fetchProviderModels(ctx, client, modelsURL, cfg.APIKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch models for provider %q (%s): %w", cfg.ID, modelsURL, err)
+		}
+		if len(models) == 0 {
+			return nil, fmt.Errorf("provider %q (%s) returned no models", cfg.ID, modelsURL)
+		}
+		providers = append(providers, provider{
+			id:        cfg.ID,
+			chatURL:   chatURL,
+			modelsURL: modelsURL,
+			apiKey:    cfg.APIKey,
+			models:    models,
+		})
+		for model := range models {
+			modelProviders[model] = append(modelProviders[model], i)
+		}
+		logger.Info("loaded provider models",
+			zap.Int("provider_index", i),
+			zap.String("provider_id", cfg.ID),
+			zap.String("models_url", modelsURL),
+			zap.Int("models", len(models)),
+		)
+	}
+
+	return &providerPool{
+		providers:      providers,
+		modelProviders: modelProviders,
+	}, nil
+}
+
+func (p *providerPool) provider(index int) provider {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.providers[index]
+}
+
+func (p *providerPool) candidatesForModel(model string) ([]int, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, errors.New("chat completions request must include a model")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	candidates := append([]int(nil), p.modelProviders[model]...)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("model %q is not available on any configured provider", model)
+	}
+	return candidates, nil
+}
+
+func (p *providerPool) acquire(candidates []int, tried map[int]struct{}) (int, bool, func(), error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(candidates) == 0 {
+		return 0, false, nil, errors.New("no provider candidates")
+	}
+
+	ordered := rotateCandidates(candidates, p.current)
+	for _, providerIndex := range ordered {
+		if _, ok := tried[providerIndex]; ok {
+			continue
+		}
+		if p.providers[providerIndex].busy == 0 {
+			p.providers[providerIndex].busy++
+			p.current = nextProviderPosition(candidates, providerIndex)
+			return providerIndex, false, p.releaseFunc(providerIndex), nil
+		}
+	}
+
+	for _, providerIndex := range candidates {
+		if _, ok := tried[providerIndex]; ok {
+			continue
+		}
+		p.providers[providerIndex].busy++
+		p.current = nextProviderPosition(candidates, providerIndex)
+		return providerIndex, true, p.releaseFunc(providerIndex), nil
+	}
+
+	return 0, false, nil, errors.New("no untried provider candidates")
+}
+
+func rotateCandidates(candidates []int, current int) []int {
+	if len(candidates) < 2 {
+		return append([]int(nil), candidates...)
+	}
+	start := 0
+	for i, candidate := range candidates {
+		if candidate == current {
+			start = i
+			break
+		}
+	}
+	ordered := make([]int, 0, len(candidates))
+	ordered = append(ordered, candidates[start:]...)
+	ordered = append(ordered, candidates[:start]...)
+	return ordered
+}
+
+func (p *providerPool) releaseFunc(index int) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if index >= 0 && index < len(p.providers) && p.providers[index].busy > 0 {
+				p.providers[index].busy--
+			}
+		})
+	}
+}
+
+func nextProviderPosition(candidates []int, providerIndex int) int {
+	for i, candidate := range candidates {
+		if candidate == providerIndex {
+			return candidates[(i+1)%len(candidates)]
+		}
+	}
+	return providerIndex
+}
+
+func requestedModel(body []byte) string {
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(req.Model)
+}
+
+type modelsResponse struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}
+
+func fetchProviderModels(ctx context.Context, client *http.Client, modelsURL, apiKey string) (map[string]struct{}, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", authorizationHeader(apiKey))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer closeBody(zap.NewNop(), resp.Body)
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("models endpoint returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var payload modelsResponse
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	models := map[string]struct{}{}
+	for _, model := range payload.Data {
+		id := strings.TrimSpace(model.ID)
+		if id != "" {
+			models[id] = struct{}{}
+		}
+	}
+	return models, nil
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -192,38 +416,52 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	order := p.keys.order()
-	if len(order) == 0 {
-		writeJSONError(w, http.StatusBadGateway, "missing_api_keys", "no upstream API keys are configured")
+	model := requestedModel(body)
+	candidates, err := p.pool.candidatesForModel(model)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "model_not_available", err.Error())
 		return
 	}
 
 	var lastHTTP *bufferedResponse
 	var lastErr error
-	for attempt, keyIndex := range order {
-		resp, err := p.postChat(r, body, keyIndex)
+	tried := make(map[int]struct{}, len(candidates))
+	for attempt := 0; attempt < len(candidates); attempt++ {
+		providerIndex, busyFallback, release, err := p.pool.acquire(candidates, tried)
+		if err != nil {
+			break
+		}
+		tried[providerIndex] = struct{}{}
+
+		resp, err := p.postChat(r, body, providerIndex)
 		if err != nil {
 			if r.Context().Err() != nil {
 				p.logger.Info("downstream canceled chat completions request", zap.Error(err))
+				release()
 				return
 			}
+			provider := p.pool.provider(providerIndex)
 			lastErr = err
-			p.keys.advanceFrom(keyIndex)
+			release()
 			p.logger.Warn("upstream chat completions request failed",
 				zap.Int("attempt", attempt+1),
-				zap.Int("key_index", keyIndex),
+				zap.Int("provider_index", providerIndex),
+				zap.String("provider_id", provider.id),
+				zap.Bool("busy_fallback", busyFallback),
 				zap.Error(err),
 			)
 			continue
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			defer release()
 			defer closeBody(p.logger, resp.Body)
 			copyResponseHeaders(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
 			if err := copyResponseBody(w, resp.Body); err != nil {
 				p.logger.Warn("failed to copy upstream chat completions response",
 					zap.Int("status", resp.StatusCode),
+					zap.Int("provider_index", providerIndex),
 					zap.Error(err),
 				)
 			}
@@ -231,11 +469,15 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		failure, readErr := bufferResponse(resp)
+		provider := p.pool.provider(providerIndex)
+		release()
 		if readErr != nil {
 			lastErr = readErr
 			p.logger.Warn("failed to read upstream chat completions error response",
 				zap.Int("attempt", attempt+1),
-				zap.Int("key_index", keyIndex),
+				zap.Int("provider_index", providerIndex),
+				zap.String("provider_id", provider.id),
+				zap.Bool("busy_fallback", busyFallback),
 				zap.Int("status", resp.StatusCode),
 				zap.Error(readErr),
 			)
@@ -244,11 +486,12 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			lastErr = nil
 			p.logger.Warn("upstream chat completions returned failure",
 				zap.Int("attempt", attempt+1),
-				zap.Int("key_index", keyIndex),
+				zap.Int("provider_index", providerIndex),
+				zap.String("provider_id", provider.id),
+				zap.Bool("busy_fallback", busyFallback),
 				zap.Int("status", resp.StatusCode),
 			)
 		}
-		p.keys.advanceFrom(keyIndex)
 	}
 
 	if lastHTTP != nil {
@@ -257,65 +500,23 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(lastHTTP.body)
 		return
 	}
-	msg := "all upstream API keys failed"
+	msg := "all matching upstream providers failed"
 	if lastErr != nil {
 		msg = lastErr.Error()
 	}
 	writeJSONError(w, http.StatusBadGateway, "upstream_request_error", msg)
 }
 
-func (p *proxy) postChat(inbound *http.Request, body []byte, keyIndex int) (*http.Response, error) {
-	targetURL := urlWithRawQuery(p.chatURL, inbound.URL.RawQuery)
+func (p *proxy) postChat(inbound *http.Request, body []byte, providerIndex int) (*http.Response, error) {
+	provider := p.pool.provider(providerIndex)
+	targetURL := urlWithRawQuery(provider.chatURL, inbound.URL.RawQuery)
 	req, err := http.NewRequestWithContext(inbound.Context(), http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	copyForwardHeaders(req.Header, inbound.Header)
-	req.Header.Set("Authorization", authorizationHeader(p.keys.key(keyIndex)))
+	req.Header.Set("Authorization", authorizationHeader(provider.apiKey))
 	return p.client.Do(req)
-}
-
-type keyRing struct {
-	mu      sync.Mutex
-	keys    []string
-	current int
-}
-
-func newKeyRing(keys []string) *keyRing {
-	return &keyRing{keys: append([]string(nil), keys...)}
-}
-
-func (r *keyRing) key(index int) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.keys) == 0 || index < 0 || index >= len(r.keys) {
-		return ""
-	}
-	return r.keys[index]
-}
-
-func (r *keyRing) order() []int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.keys) == 0 {
-		return nil
-	}
-	order := make([]int, 0, len(r.keys))
-	for i := range r.keys {
-		order = append(order, (r.current+i)%len(r.keys))
-	}
-	return order
-}
-
-func (r *keyRing) advanceFrom(index int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.keys) == 0 {
-		return
-	}
-	if r.current == index {
-		r.current = (r.current + 1) % len(r.keys)
-	}
 }
 
 type bufferedResponse struct {
@@ -375,6 +576,32 @@ func normalizeChatCompletionsURL(raw string) (string, error) {
 	default:
 		u.Path = path + "/chat/completions"
 	}
+	return u.String(), nil
+}
+
+func normalizeModelsURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("provider URL must include scheme and host: %s", raw)
+	}
+	path := strings.TrimRight(u.Path, "/")
+	switch {
+	case strings.HasSuffix(path, "/chat/completions"):
+		path = strings.TrimRight(strings.TrimSuffix(path, "/chat/completions"), "/")
+		u.Path = path + "/models"
+	case strings.HasSuffix(path, "/models"):
+		u.Path = path
+	case path == "":
+		u.Path = "/v1/models"
+	case strings.HasSuffix(path, "/v1"):
+		u.Path = path + "/models"
+	default:
+		u.Path = path + "/models"
+	}
+	u.RawQuery = ""
 	return u.String(), nil
 }
 
@@ -465,23 +692,6 @@ func closeBody(logger *zap.Logger, body io.Closer) {
 	if err := body.Close(); err != nil {
 		logger.Warn("failed to close body", zap.Error(err))
 	}
-}
-
-func splitAPIKeys(raw string) []string {
-	return strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == '\n' || r == '\r' || r == '\t'
-	})
-}
-
-func compactStrings(values []string) []string {
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			out = append(out, value)
-		}
-	}
-	return out
 }
 
 func newLogger() (*zap.Logger, error) {
