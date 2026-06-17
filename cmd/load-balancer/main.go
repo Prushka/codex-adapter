@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -232,11 +233,13 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 		for model := range models {
 			modelProviders[model] = append(modelProviders[model], i)
 		}
+		modelIDs := sortedModelIDs(models)
 		logger.Info("loaded provider models",
 			zap.Int("provider_index", i),
 			zap.String("provider_id", cfg.ID),
 			zap.String("models_url", modelsURL),
 			zap.Int("models", len(models)),
+			zap.Strings("model_ids", modelIDs),
 		)
 	}
 
@@ -265,6 +268,15 @@ func (p *providerPool) candidatesForModel(model string) ([]int, error) {
 		return nil, fmt.Errorf("model %q is not available on any configured provider", model)
 	}
 	return candidates, nil
+}
+
+func sortedModelIDs(models map[string]struct{}) []string {
+	modelIDs := make([]string, 0, len(models))
+	for model := range models {
+		modelIDs = append(modelIDs, model)
+	}
+	sort.Strings(modelIDs)
+	return modelIDs
 }
 
 func (p *providerPool) acquire(candidates []int, tried map[int]struct{}) (int, bool, func(), error) {
