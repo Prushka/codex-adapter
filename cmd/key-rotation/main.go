@@ -281,7 +281,7 @@ func (p *providerPool) acquire(candidates []int, tried map[int]struct{}) (int, b
 		}
 		if p.providers[providerIndex].busy == 0 {
 			p.providers[providerIndex].busy++
-			p.current = nextProviderPosition(candidates, providerIndex)
+			p.current = nextProviderPosition(len(p.providers), providerIndex)
 			return providerIndex, false, p.releaseFunc(providerIndex), nil
 		}
 	}
@@ -291,7 +291,7 @@ func (p *providerPool) acquire(candidates []int, tried map[int]struct{}) (int, b
 			continue
 		}
 		p.providers[providerIndex].busy++
-		p.current = nextProviderPosition(candidates, providerIndex)
+		p.current = nextProviderPosition(len(p.providers), providerIndex)
 		return providerIndex, true, p.releaseFunc(providerIndex), nil
 	}
 
@@ -304,7 +304,7 @@ func rotateCandidates(candidates []int, current int) []int {
 	}
 	start := 0
 	for i, candidate := range candidates {
-		if candidate == current {
+		if candidate >= current {
 			start = i
 			break
 		}
@@ -328,23 +328,25 @@ func (p *providerPool) releaseFunc(index int) func() {
 	}
 }
 
-func nextProviderPosition(candidates []int, providerIndex int) int {
-	for i, candidate := range candidates {
-		if candidate == providerIndex {
-			return candidates[(i+1)%len(candidates)]
-		}
+func nextProviderPosition(providerCount int, providerIndex int) int {
+	if providerCount <= 0 {
+		return 0
 	}
-	return providerIndex
+	return (providerIndex + 1) % providerCount
 }
 
-func requestedModel(body []byte) string {
+func requestedModel(body []byte) (string, error) {
 	var req struct {
 		Model string `json:"model"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		return ""
+		return "", fmt.Errorf("invalid JSON request body: %w", err)
 	}
-	return strings.TrimSpace(req.Model)
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		return "", errors.New("chat completions request must include a model")
+	}
+	return model, nil
 }
 
 type modelsResponse struct {
@@ -416,7 +418,11 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := requestedModel(body)
+	model, err := requestedModel(body)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	candidates, err := p.pool.candidatesForModel(model)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "model_not_available", err.Error())

@@ -180,6 +180,43 @@ func TestProxyOnlyUsesProvidersWithRequestedModel(t *testing.T) {
 	}
 }
 
+func TestProxyModelRoutingUsesGlobalProviderOrder(t *testing.T) {
+	const requestBody = `{"model":"b","stream":false}`
+
+	first := newMockProvider(t, []string{"a"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("provider without model should not receive chat request")
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"b"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"two"}`))
+	})
+	defer second.Close()
+	third := newMockProvider(t, []string{"b"}, "key-3", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"three"}`))
+	})
+	defer third.Close()
+
+	proxy := newTestProxy(t, first.providerConfig(), second.providerConfig(), third.providerConfig())
+	for i := 0; i < 4; i++ {
+		rec := serveChat(proxy, requestBody)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d body = %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	if got := first.chatCount(); got != 0 {
+		t.Fatalf("first chat count = %d", got)
+	}
+	if got := second.chatCount(); got != 2 {
+		t.Fatalf("second chat count = %d", got)
+	}
+	if got := third.chatCount(); got != 2 {
+		t.Fatalf("third chat count = %d", got)
+	}
+	if got := strings.Join(append(second.bodies(), third.bodies()...), ","); got == "" {
+		t.Fatal("expected forwarded requests")
+	}
+}
+
 func TestProxyReturnsModelErrorWhenUnavailable(t *testing.T) {
 	provider := newMockProvider(t, []string{"a"}, "key", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("chat request should not be forwarded")
@@ -192,6 +229,38 @@ func TestProxyReturnsModelErrorWhenUnavailable(t *testing.T) {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "model_not_available") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestProxyReturnsInvalidRequestWhenModelIsMissing(t *testing.T) {
+	provider := newMockProvider(t, []string{"a"}, "key", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("chat request should not be forwarded")
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveChat(proxy, `{"stream":false}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_request_error") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestProxyReturnsInvalidRequestWhenBodyIsMalformed(t *testing.T) {
+	provider := newMockProvider(t, []string{"a"}, "key", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("chat request should not be forwarded")
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveChat(proxy, `{"model":`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_request_error") {
 		t.Fatalf("body = %s", rec.Body.String())
 	}
 }
@@ -290,8 +359,24 @@ func TestNormalizeModelsURL(t *testing.T) {
 
 func TestRequestedModel(t *testing.T) {
 	body := []byte(`{"model":"gpt-x"}`)
-	if got := requestedModel(body); got != "gpt-x" {
+	got, err := requestedModel(body)
+	if err != nil {
+		t.Fatalf("requestedModel: %v", err)
+	}
+	if got != "gpt-x" {
 		t.Fatalf("requestedModel = %q", got)
+	}
+}
+
+func TestRequestedModelRejectsMissingModel(t *testing.T) {
+	if _, err := requestedModel([]byte(`{"stream":false}`)); err == nil {
+		t.Fatal("expected missing model error")
+	}
+}
+
+func TestRequestedModelRejectsMalformedJSON(t *testing.T) {
+	if _, err := requestedModel([]byte(`{"model":`)); err == nil {
+		t.Fatal("expected malformed JSON error")
 	}
 }
 
