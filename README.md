@@ -93,12 +93,12 @@ Set `-disable-upstream-streaming` to make `/responses` buffer the upstream Chat 
 
 ## Chat Completions Load Balancer
 
-`cmd/key-rotation` is a small Chat Completions pass-through load balancer. It forwards `POST /chat/completions` and `POST /v1/chat/completions` request bodies and headers to configured upstream Chat Completions providers, overriding only `Authorization`. On startup it fetches each provider's `/models` list and only forwards a request to providers that advertise the requested `model`. If no configured provider supports the model, the proxy returns a JSON `model_not_available` error.
+`cmd/load-balancer` is a small Chat Completions pass-through load balancer. It forwards `POST /chat/completions` and `POST /v1/chat/completions` request bodies and headers to configured upstream Chat Completions providers, overriding only `Authorization`. On startup it fetches each provider's `/models` list and only forwards a request to providers that advertise the requested `model`. If no configured provider supports the model, the proxy returns a JSON `model_not_available` error.
 
 Requests are assigned from a provider pool. If the next matching provider is already processing a request, the proxy uses the next idle matching provider. If every matching provider is busy, it wraps around and sends to the next matching provider in pool order. Existing fallback behavior is preserved: if an upstream attempt fails with a request error or non-2xx HTTP response, the same request body is retried against the next matching provider; if every matching provider returns an HTTP failure, the last upstream error response is returned unchanged.
 
 ```sh
-go run ./cmd/key-rotation \
+go run ./cmd/load-balancer \
   -listen 127.0.0.1:18081 \
   -provider p1,https://provider-one.example.com/v1,sk-provider-one \
   -provider p2,https://provider-two.example.com/v1,sk-provider-two
