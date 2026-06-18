@@ -1,7 +1,6 @@
 services:
   load-balancer:
     image: meinya/llm-lb:latest
-    platform: linux/amd64
     restart: unless-stopped
     ports:
       - "18081:18081"
@@ -13,7 +12,7 @@ services:
       - -delay
       - 1m
       - -timeout
-      - 10m
+      - 20m
       - -provider
       - p1,https://provider-one.example.com/v1,sk-provider-one
       - -provider
