@@ -12,7 +12,7 @@ services:
       - -delay
       - 1m
       - -timeout
-      - 20m
+      - 30m
       - -provider
       - p1,https://provider-one.example.com/v1,sk-provider-one
       - -provider

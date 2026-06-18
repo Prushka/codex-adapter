@@ -23,6 +23,7 @@ const (
 	maxRequestBodyBytes = 128 << 20
 	defaultAttempts     = 5
 	defaultAttemptDelay = time.Minute
+	defaultTimeout      = 30 * time.Minute
 )
 
 type cliConfig struct {
@@ -86,7 +87,7 @@ func parseFlags() cliConfig {
 	var cfg cliConfig
 	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:18081", "local listening address for Chat Completions requests")
 	flag.Var(&cfg.providers, "provider", "upstream provider tuple id,url,key; may be repeated")
-	flag.DurationVar(&cfg.timeout, "timeout", 10*time.Minute, "upstream request timeout")
+	flag.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "upstream request timeout")
 	flag.IntVar(&cfg.attempts, "attempts", defaultAttempts, "number of full provider-pool passes before returning failure")
 	flag.DurationVar(&cfg.delay, "delay", defaultAttemptDelay, "delay between full provider-pool attempts; first attempt has no delay")
 	flag.Parse()
@@ -178,7 +179,7 @@ type proxy struct {
 func newProxy(cfg proxyConfig) (*proxy, error) {
 	client := cfg.Client
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Minute}
+		return nil, errors.New("http client is required")
 	}
 	logger := cfg.Logger
 	if logger == nil {
