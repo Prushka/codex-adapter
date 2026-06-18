@@ -1,11 +1,5 @@
 services:
   load-balancer:
-    build:
-      context: .
-      target: load-balancer
-      args:
-        GIT_COMMIT: unknown
-        GIT_VERSION: unknown
     image: meinya/llm-lb:latest
     platform: linux/amd64
     restart: unless-stopped
