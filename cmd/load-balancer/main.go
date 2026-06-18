@@ -474,6 +474,7 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	requestStarted := time.Now()
 	body, err := readRequestBody(r, maxRequestBodyBytes)
 	if err != nil {
 		p.logger.Warn("failed to read downstream request",
@@ -487,13 +488,33 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 
 	model, err := requestedModel(body)
 	if err != nil {
+		p.logger.Warn("invalid downstream request",
+			zap.String("api", string(endpoint)),
+			zap.String("path", r.URL.Path),
+			zap.Int("request_bytes", len(body)),
+			zap.Error(err),
+		)
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	candidates, err := p.pool.candidatesForModel(model)
 	if err != nil {
+		p.logger.Warn("requested model is not available",
+			zap.String("api", string(endpoint)),
+			zap.String("path", r.URL.Path),
+			zap.String("model", model),
+			zap.Int("request_bytes", len(body)),
+			zap.Error(err),
+		)
 		writeJSONError(w, http.StatusBadRequest, "model_not_available", err.Error())
 		return
+	}
+	requestFields := []zap.Field{
+		zap.String("api", string(endpoint)),
+		zap.String("path", r.URL.Path),
+		zap.String("model", model),
+		zap.Int("request_bytes", len(body)),
+		zap.Int("candidate_providers", len(candidates)),
 	}
 
 	var lastHTTP *bufferedResponse
@@ -507,8 +528,11 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 		if pass > 0 && p.delay > 0 {
 			if err := sleepWithContext(r.Context(), p.delay); err != nil {
 				p.logger.Info("downstream canceled request during retry delay",
-					zap.String("api", string(endpoint)),
-					zap.Error(err),
+					appendRequestFields(requestFields,
+						zap.Int("attempt_pass", pass+1),
+						zap.Duration("elapsed", time.Since(requestStarted)),
+						zap.Error(err),
+					)...,
 				)
 				return
 			}
@@ -522,12 +546,20 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 			tried[providerIndex] = struct{}{}
 			attempt++
 
+			attemptStarted := time.Now()
 			resp, err := p.postUpstream(r, body, providerIndex, endpoint)
 			if err != nil {
 				if r.Context().Err() != nil {
 					p.logger.Info("downstream canceled request",
-						zap.String("api", string(endpoint)),
-						zap.Error(err),
+						appendRequestFields(requestFields,
+							zap.Int("attempt", attempt),
+							zap.Int("attempt_pass", pass+1),
+							zap.Int("provider_index", providerIndex),
+							zap.Bool("busy_fallback", busyFallback),
+							zap.Duration("attempt_elapsed", time.Since(attemptStarted)),
+							zap.Duration("elapsed", time.Since(requestStarted)),
+							zap.Error(err),
+						)...,
 					)
 					release()
 					return
@@ -536,65 +568,103 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 				lastErr = err
 				release()
 				p.logger.Warn("upstream request failed",
-					zap.String("api", string(endpoint)),
-					zap.Int("attempt", attempt),
-					zap.Int("attempt_pass", pass+1),
-					zap.Int("provider_index", providerIndex),
-					zap.String("provider_id", provider.id),
-					zap.Bool("busy_fallback", busyFallback),
-					zap.Error(err),
+					appendRequestFields(requestFields,
+						zap.Int("attempt", attempt),
+						zap.Int("attempt_pass", pass+1),
+						zap.Int("provider_index", providerIndex),
+						zap.String("provider_id", provider.id),
+						zap.Bool("busy_fallback", busyFallback),
+						zap.Duration("attempt_elapsed", time.Since(attemptStarted)),
+						zap.Error(err),
+					)...,
 				)
 				continue
 			}
 
+			provider := p.pool.provider(providerIndex)
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				defer release()
 				defer closeBody(p.logger, resp.Body)
 				copyResponseHeaders(w.Header(), resp.Header)
 				w.WriteHeader(resp.StatusCode)
-				if err := copyResponseBody(w, resp.Body); err != nil {
+				responseBytes, err := copyResponseBody(w, resp.Body)
+				if err != nil {
 					p.logger.Warn("failed to copy upstream response",
-						zap.String("api", string(endpoint)),
-						zap.Int("status", resp.StatusCode),
-						zap.Int("provider_index", providerIndex),
-						zap.Error(err),
+						appendRequestFields(requestFields,
+							zap.Int("attempt", attempt),
+							zap.Int("attempt_pass", pass+1),
+							zap.Int("provider_index", providerIndex),
+							zap.String("provider_id", provider.id),
+							zap.Bool("busy_fallback", busyFallback),
+							zap.Int("status", resp.StatusCode),
+							zap.Int64("response_bytes", responseBytes),
+							zap.Duration("attempt_elapsed", time.Since(attemptStarted)),
+							zap.Duration("elapsed", time.Since(requestStarted)),
+							zap.Error(err),
+						)...,
 					)
+					return
 				}
+				p.logger.Info("upstream request succeeded",
+					appendRequestFields(requestFields,
+						zap.Int("attempt", attempt),
+						zap.Int("attempt_pass", pass+1),
+						zap.Int("provider_index", providerIndex),
+						zap.String("provider_id", provider.id),
+						zap.Bool("busy_fallback", busyFallback),
+						zap.Int("status", resp.StatusCode),
+						zap.Int64("response_bytes", responseBytes),
+						zap.Duration("attempt_elapsed", time.Since(attemptStarted)),
+						zap.Duration("elapsed", time.Since(requestStarted)),
+					)...,
+				)
 				return
 			}
 
 			failure, readErr := bufferResponse(resp)
-			provider := p.pool.provider(providerIndex)
 			release()
 			if readErr != nil {
 				lastErr = readErr
 				p.logger.Warn("failed to read upstream error response",
-					zap.String("api", string(endpoint)),
-					zap.Int("attempt", attempt),
-					zap.Int("attempt_pass", pass+1),
-					zap.Int("provider_index", providerIndex),
-					zap.String("provider_id", provider.id),
-					zap.Bool("busy_fallback", busyFallback),
-					zap.Int("status", resp.StatusCode),
-					zap.Error(readErr),
+					appendRequestFields(requestFields,
+						zap.Int("attempt", attempt),
+						zap.Int("attempt_pass", pass+1),
+						zap.Int("provider_index", providerIndex),
+						zap.String("provider_id", provider.id),
+						zap.Bool("busy_fallback", busyFallback),
+						zap.Int("status", resp.StatusCode),
+						zap.Duration("attempt_elapsed", time.Since(attemptStarted)),
+						zap.Error(readErr),
+					)...,
 				)
 			} else {
 				lastHTTP = failure
 				lastErr = nil
 				p.logger.Warn("upstream returned failure",
-					zap.String("api", string(endpoint)),
-					zap.Int("attempt", attempt),
-					zap.Int("attempt_pass", pass+1),
-					zap.Int("provider_index", providerIndex),
-					zap.String("provider_id", provider.id),
-					zap.Bool("busy_fallback", busyFallback),
-					zap.Int("status", resp.StatusCode),
+					appendRequestFields(requestFields,
+						zap.Int("attempt", attempt),
+						zap.Int("attempt_pass", pass+1),
+						zap.Int("provider_index", providerIndex),
+						zap.String("provider_id", provider.id),
+						zap.Bool("busy_fallback", busyFallback),
+						zap.Int("status", resp.StatusCode),
+						zap.Int("response_bytes", len(failure.body)),
+						zap.Duration("attempt_elapsed", time.Since(attemptStarted)),
+					)...,
 				)
 			}
 		}
 	}
 
 	if lastHTTP != nil {
+		p.logger.Warn("returning last upstream failure",
+			appendRequestFields(requestFields,
+				zap.Int("attempts", attempt),
+				zap.Int("status", lastHTTP.statusCode),
+				zap.Int("response_bytes", len(lastHTTP.body)),
+				zap.Duration("elapsed", time.Since(requestStarted)),
+			)...,
+		)
 		copyResponseHeaders(w.Header(), lastHTTP.header)
 		w.WriteHeader(lastHTTP.statusCode)
 		_, _ = w.Write(lastHTTP.body)
@@ -604,7 +674,21 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 	if lastErr != nil {
 		msg = lastErr.Error()
 	}
+	p.logger.Warn("all matching upstream providers failed",
+		appendRequestFields(requestFields,
+			zap.Int("attempts", attempt),
+			zap.Duration("elapsed", time.Since(requestStarted)),
+			zap.Error(lastErr),
+		)...,
+	)
 	writeJSONError(w, http.StatusBadGateway, "upstream_request_error", msg)
+}
+
+func appendRequestFields(base []zap.Field, fields ...zap.Field) []zap.Field {
+	out := make([]zap.Field, 0, len(base)+len(fields))
+	out = append(out, base...)
+	out = append(out, fields...)
+	return out
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {
@@ -799,27 +883,29 @@ func isHopByHopHeader(lower string) bool {
 	}
 }
 
-func copyResponseBody(w http.ResponseWriter, body io.Reader) error {
+func copyResponseBody(w http.ResponseWriter, body io.Reader) (int64, error) {
 	if flusher, ok := w.(http.Flusher); ok {
 		buf := make([]byte, 32<<10)
+		var copied int64
 		for {
 			n, readErr := body.Read(buf)
 			if n > 0 {
-				if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-					return writeErr
+				written, writeErr := w.Write(buf[:n])
+				copied += int64(written)
+				if writeErr != nil {
+					return copied, writeErr
 				}
 				flusher.Flush()
 			}
 			if readErr != nil {
 				if errors.Is(readErr, io.EOF) {
-					return nil
+					return copied, nil
 				}
-				return readErr
+				return copied, readErr
 			}
 		}
 	}
-	_, err := io.Copy(w, body)
-	return err
+	return io.Copy(w, body)
 }
 
 func closeBody(logger *zap.Logger, body io.Closer) {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestProxySkipsBusyProviderAndFallsBack(t *testing.T) {
@@ -283,6 +284,40 @@ func TestProxyModelRoutingUsesGlobalProviderOrder(t *testing.T) {
 	if got := strings.Join(append(second.bodies(), third.bodies()...), ","); got == "" {
 		t.Fatal("expected forwarded requests")
 	}
+}
+
+func TestProxyLogsSuccessfulRequestWithoutBodies(t *testing.T) {
+	const requestBody = `{"model":"m","messages":[{"role":"user","content":"secret-input"}],"stream":false}`
+	const responseBody = `{"id":"secret-output"}`
+
+	core, logs := observer.New(zap.InfoLevel)
+	provider := newMockProvider(t, []string{"m"}, "key", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(responseBody))
+	})
+	defer provider.Close()
+
+	proxy := newTestProxyWithLogger(t, zap.New(core), provider.providerConfig())
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	entries := logs.FilterMessage("upstream request succeeded").All()
+	if len(entries) != 1 {
+		t.Fatalf("success log entries = %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["api"] != string(endpointChatCompletions) || fields["path"] != "/v1/chat/completions" || fields["model"] != "m" {
+		t.Fatalf("bad request fields = %#v", fields)
+	}
+	if fields["provider_id"] != "key" || fields["status"] != int64(http.StatusOK) || fields["request_bytes"] != int64(len(requestBody)) {
+		t.Fatalf("bad upstream fields = %#v", fields)
+	}
+	if fields["response_bytes"] != int64(len(responseBody)) {
+		t.Fatalf("response_bytes = %#v", fields["response_bytes"])
+	}
+	assertLogFieldsDoNotContain(t, fields, "secret-input", "secret-output")
 }
 
 func TestProxyForwardsResponsesRequest(t *testing.T) {
@@ -813,6 +848,12 @@ func newTestProxyWithRetryConfig(t *testing.T, attempts int, delay time.Duration
 	return &proxy{pool: pool, client: http.DefaultClient, logger: newTestLogger(), attempts: attempts, delay: delay}
 }
 
+func newTestProxyWithLogger(t *testing.T, logger *zap.Logger, providers ...providerConfig) *proxy {
+	t.Helper()
+	pool := newTestPool(t, providers...)
+	return &proxy{pool: pool, client: http.DefaultClient, logger: logger, attempts: 1}
+}
+
 func newTestPool(t *testing.T, providers ...providerConfig) *providerPool {
 	t.Helper()
 	pool, err := newProviderPool(context.Background(), providers, http.DefaultClient, newTestLogger())
@@ -869,4 +910,14 @@ func waitStatus(t *testing.T, ch <-chan int) int {
 
 func newTestLogger() *zap.Logger {
 	return zap.NewNop()
+}
+
+func assertLogFieldsDoNotContain(t *testing.T, fields map[string]any, forbidden ...string) {
+	t.Helper()
+	got := fmt.Sprint(fields)
+	for _, value := range forbidden {
+		if strings.Contains(got, value) {
+			t.Fatalf("log fields leaked %q: %#v", value, fields)
+		}
+	}
 }
