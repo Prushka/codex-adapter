@@ -19,12 +19,18 @@ import (
 	"go.uber.org/zap"
 )
 
-const maxRequestBodyBytes = 128 << 20
+const (
+	maxRequestBodyBytes = 128 << 20
+	defaultAttempts     = 5
+	defaultAttemptDelay = time.Minute
+)
 
 type cliConfig struct {
 	listenAddr string
 	providers  providerList
 	timeout    time.Duration
+	attempts   int
+	delay      time.Duration
 }
 
 func main() {
@@ -51,6 +57,8 @@ func main() {
 		Providers: cfg.providers,
 		Client:    client,
 		Logger:    logger,
+		Attempts:  cfg.attempts,
+		Delay:     cfg.delay,
 	})
 	if err != nil {
 		exitWithError(logger, "failed to create load balancer", zap.Error(err))
@@ -60,6 +68,8 @@ func main() {
 		zap.String("listen", cfg.listenAddr),
 		zap.Int("providers", len(handler.pool.providers)),
 		zap.Int("models", len(handler.pool.modelProviders)),
+		zap.Int("attempts", handler.attempts),
+		zap.Duration("delay", handler.delay),
 	)
 
 	server := &http.Server{
@@ -77,6 +87,8 @@ func parseFlags() cliConfig {
 	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:18081", "local listening address for Chat Completions requests")
 	flag.Var(&cfg.providers, "provider", "upstream provider tuple id,url,key; may be repeated")
 	flag.DurationVar(&cfg.timeout, "timeout", 10*time.Minute, "upstream request timeout")
+	flag.IntVar(&cfg.attempts, "attempts", defaultAttempts, "number of full provider-pool passes before returning failure")
+	flag.DurationVar(&cfg.delay, "delay", defaultAttemptDelay, "delay between full provider-pool attempts; first attempt has no delay")
 	flag.Parse()
 	return cfg
 }
@@ -85,6 +97,10 @@ func (c cliConfig) validate() error {
 	switch {
 	case len(c.providers) == 0:
 		return errors.New("missing required flag: -provider")
+	case c.attempts < 1:
+		return errors.New("attempts must be at least 1")
+	case c.delay < 0:
+		return errors.New("delay must not be negative")
 	default:
 		seen := map[string]struct{}{}
 		for _, provider := range c.providers {
@@ -147,12 +163,16 @@ type proxyConfig struct {
 	Providers []providerConfig
 	Client    *http.Client
 	Logger    *zap.Logger
+	Attempts  int
+	Delay     time.Duration
 }
 
 type proxy struct {
-	pool   *providerPool
-	client *http.Client
-	logger *zap.Logger
+	pool     *providerPool
+	client   *http.Client
+	logger   *zap.Logger
+	attempts int
+	delay    time.Duration
 }
 
 func newProxy(cfg proxyConfig) (*proxy, error) {
@@ -164,14 +184,20 @@ func newProxy(cfg proxyConfig) (*proxy, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	attempts := cfg.Attempts
+	if attempts < 1 {
+		attempts = defaultAttempts
+	}
 	pool, err := newProviderPool(context.Background(), cfg.Providers, client, logger)
 	if err != nil {
 		return nil, err
 	}
 	return &proxy{
-		pool:   pool,
-		client: client,
-		logger: logger,
+		pool:     pool,
+		client:   client,
+		logger:   logger,
+		attempts: attempts,
+		delay:    cfg.Delay,
 	}, nil
 }
 
@@ -443,72 +469,89 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	var lastHTTP *bufferedResponse
 	var lastErr error
-	tried := make(map[int]struct{}, len(candidates))
-	for attempt := 0; attempt < len(candidates); attempt++ {
-		providerIndex, busyFallback, release, err := p.pool.acquire(candidates, tried)
-		if err != nil {
-			break
-		}
-		tried[providerIndex] = struct{}{}
-
-		resp, err := p.postChat(r, body, providerIndex)
-		if err != nil {
-			if r.Context().Err() != nil {
-				p.logger.Info("downstream canceled chat completions request", zap.Error(err))
-				release()
+	attempt := 0
+	attemptPasses := p.attempts
+	if attemptPasses < 1 {
+		attemptPasses = defaultAttempts
+	}
+	for pass := 0; pass < attemptPasses; pass++ {
+		if pass > 0 && p.delay > 0 {
+			if err := sleepWithContext(r.Context(), p.delay); err != nil {
+				p.logger.Info("downstream canceled chat completions request during retry delay", zap.Error(err))
 				return
 			}
-			provider := p.pool.provider(providerIndex)
-			lastErr = err
-			release()
-			p.logger.Warn("upstream chat completions request failed",
-				zap.Int("attempt", attempt+1),
-				zap.Int("provider_index", providerIndex),
-				zap.String("provider_id", provider.id),
-				zap.Bool("busy_fallback", busyFallback),
-				zap.Error(err),
-			)
-			continue
 		}
+		tried := make(map[int]struct{}, len(candidates))
+		for passAttempt := 0; passAttempt < len(candidates); passAttempt++ {
+			providerIndex, busyFallback, release, err := p.pool.acquire(candidates, tried)
+			if err != nil {
+				break
+			}
+			tried[providerIndex] = struct{}{}
+			attempt++
 
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			defer release()
-			defer closeBody(p.logger, resp.Body)
-			copyResponseHeaders(w.Header(), resp.Header)
-			w.WriteHeader(resp.StatusCode)
-			if err := copyResponseBody(w, resp.Body); err != nil {
-				p.logger.Warn("failed to copy upstream chat completions response",
-					zap.Int("status", resp.StatusCode),
+			resp, err := p.postChat(r, body, providerIndex)
+			if err != nil {
+				if r.Context().Err() != nil {
+					p.logger.Info("downstream canceled chat completions request", zap.Error(err))
+					release()
+					return
+				}
+				provider := p.pool.provider(providerIndex)
+				lastErr = err
+				release()
+				p.logger.Warn("upstream chat completions request failed",
+					zap.Int("attempt", attempt),
+					zap.Int("attempt_pass", pass+1),
 					zap.Int("provider_index", providerIndex),
+					zap.String("provider_id", provider.id),
+					zap.Bool("busy_fallback", busyFallback),
 					zap.Error(err),
 				)
+				continue
 			}
-			return
-		}
 
-		failure, readErr := bufferResponse(resp)
-		provider := p.pool.provider(providerIndex)
-		release()
-		if readErr != nil {
-			lastErr = readErr
-			p.logger.Warn("failed to read upstream chat completions error response",
-				zap.Int("attempt", attempt+1),
-				zap.Int("provider_index", providerIndex),
-				zap.String("provider_id", provider.id),
-				zap.Bool("busy_fallback", busyFallback),
-				zap.Int("status", resp.StatusCode),
-				zap.Error(readErr),
-			)
-		} else {
-			lastHTTP = failure
-			lastErr = nil
-			p.logger.Warn("upstream chat completions returned failure",
-				zap.Int("attempt", attempt+1),
-				zap.Int("provider_index", providerIndex),
-				zap.String("provider_id", provider.id),
-				zap.Bool("busy_fallback", busyFallback),
-				zap.Int("status", resp.StatusCode),
-			)
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				defer release()
+				defer closeBody(p.logger, resp.Body)
+				copyResponseHeaders(w.Header(), resp.Header)
+				w.WriteHeader(resp.StatusCode)
+				if err := copyResponseBody(w, resp.Body); err != nil {
+					p.logger.Warn("failed to copy upstream chat completions response",
+						zap.Int("status", resp.StatusCode),
+						zap.Int("provider_index", providerIndex),
+						zap.Error(err),
+					)
+				}
+				return
+			}
+
+			failure, readErr := bufferResponse(resp)
+			provider := p.pool.provider(providerIndex)
+			release()
+			if readErr != nil {
+				lastErr = readErr
+				p.logger.Warn("failed to read upstream chat completions error response",
+					zap.Int("attempt", attempt),
+					zap.Int("attempt_pass", pass+1),
+					zap.Int("provider_index", providerIndex),
+					zap.String("provider_id", provider.id),
+					zap.Bool("busy_fallback", busyFallback),
+					zap.Int("status", resp.StatusCode),
+					zap.Error(readErr),
+				)
+			} else {
+				lastHTTP = failure
+				lastErr = nil
+				p.logger.Warn("upstream chat completions returned failure",
+					zap.Int("attempt", attempt),
+					zap.Int("attempt_pass", pass+1),
+					zap.Int("provider_index", providerIndex),
+					zap.String("provider_id", provider.id),
+					zap.Bool("busy_fallback", busyFallback),
+					zap.Int("status", resp.StatusCode),
+				)
+			}
 		}
 	}
 
@@ -523,6 +566,17 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		msg = lastErr.Error()
 	}
 	writeJSONError(w, http.StatusBadGateway, "upstream_request_error", msg)
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (p *proxy) postChat(inbound *http.Request, body []byte, providerIndex int) (*http.Response, error) {

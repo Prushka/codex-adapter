@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -152,6 +153,73 @@ func TestProxyKeepsFallbackResponseFromLastProvider(t *testing.T) {
 	}
 	if res.Header.Get("X-Upstream-Error") != "second" {
 		t.Fatalf("missing last upstream error header: %#v", res.Header)
+	}
+}
+
+func TestProxyRepeatsProviderPoolWhenAttemptsIsGreaterThanOne(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	first := newMockProvider(t, []string{"m"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"first"}}`))
+	})
+	defer first.Close()
+	var secondMu sync.Mutex
+	secondAttempts := 0
+	second := newMockProvider(t, []string{"m"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		secondMu.Lock()
+		secondAttempts++
+		attempt := secondAttempts
+		secondMu.Unlock()
+		w.Header().Set("X-Provider-Attempt", fmt.Sprint(attempt))
+		if attempt == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"second failed"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"second succeeded"}`))
+	})
+	defer second.Close()
+
+	proxy := newTestProxyWithAttempts(t, 2, first.providerConfig(), second.providerConfig())
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := first.chatCount(); got != 2 {
+		t.Fatalf("first chat count = %d", got)
+	}
+	if got := second.chatCount(); got != 2 {
+		t.Fatalf("second chat count = %d", got)
+	}
+	if got := rec.Body.String(); got != `{"id":"second succeeded"}` {
+		t.Fatalf("body = %s", got)
+	}
+	if got := rec.Header().Get("X-Provider-Attempt"); got != "2" {
+		t.Fatalf("X-Provider-Attempt = %q", got)
+	}
+}
+
+func TestProxyDelaysBetweenAttemptPasses(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	provider := newMockProvider(t, []string{"m"}, "key", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"try again"}}`))
+	})
+	defer provider.Close()
+
+	proxy := newTestProxyWithRetryConfig(t, 2, 20*time.Millisecond, provider.providerConfig())
+	start := time.Now()
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := provider.chatCount(); got != 2 {
+		t.Fatalf("chat count = %d", got)
+	}
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond {
+		t.Fatalf("expected retry delay, elapsed = %s", elapsed)
 	}
 }
 
@@ -314,9 +382,27 @@ func TestValidateRejectsDuplicateProviderIDs(t *testing.T) {
 	cfg := cliConfig{providers: providerList{
 		{ID: "same", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
 		{ID: "same", ProviderURL: "https://two.test/v1", APIKey: "key-two"},
-	}}
+	}, attempts: 1, delay: time.Minute}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected duplicate provider id error")
+	}
+}
+
+func TestValidateRejectsInvalidAttempts(t *testing.T) {
+	cfg := cliConfig{providers: providerList{
+		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
+	}}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected attempts error")
+	}
+}
+
+func TestValidateRejectsNegativeDelay(t *testing.T) {
+	cfg := cliConfig{providers: providerList{
+		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
+	}, attempts: 1, delay: -time.Second}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected delay error")
 	}
 }
 
@@ -489,8 +575,18 @@ func (p *mockProvider) bodies() []string {
 
 func newTestProxy(t *testing.T, providers ...providerConfig) *proxy {
 	t.Helper()
+	return newTestProxyWithAttempts(t, 1, providers...)
+}
+
+func newTestProxyWithAttempts(t *testing.T, attempts int, providers ...providerConfig) *proxy {
+	t.Helper()
+	return newTestProxyWithRetryConfig(t, attempts, 0, providers...)
+}
+
+func newTestProxyWithRetryConfig(t *testing.T, attempts int, delay time.Duration, providers ...providerConfig) *proxy {
+	t.Helper()
 	pool := newTestPool(t, providers...)
-	return &proxy{pool: pool, client: http.DefaultClient, logger: newTestLogger()}
+	return &proxy{pool: pool, client: http.DefaultClient, logger: newTestLogger(), attempts: attempts, delay: delay}
 }
 
 func newTestPool(t *testing.T, providers ...providerConfig) *providerPool {
