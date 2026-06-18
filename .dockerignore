@@ -1,0 +1,7 @@
+.git
+.idea
+.DS_Store
+cmd/.DS_Store
+debug
+lb.log
+*.log
