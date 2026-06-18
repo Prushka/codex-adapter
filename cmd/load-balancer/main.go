@@ -65,7 +65,7 @@ func main() {
 		exitWithError(logger, "failed to create load balancer", zap.Error(err))
 	}
 
-	logger.Info("chat completions load balancer listening",
+	logger.Info("OpenAI-compatible load balancer listening",
 		zap.String("listen", cfg.listenAddr),
 		zap.Int("providers", len(handler.pool.providers)),
 		zap.Int("models", len(handler.pool.modelProviders)),
@@ -85,7 +85,7 @@ func main() {
 
 func parseFlags() cliConfig {
 	var cfg cliConfig
-	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:18081", "local listening address for Chat Completions requests")
+	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:18081", "local listening address for Chat Completions and Responses requests")
 	flag.Var(&cfg.providers, "provider", "upstream provider tuple id,url,key; may be repeated")
 	flag.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "upstream request timeout")
 	flag.IntVar(&cfg.attempts, "attempts", defaultAttempts, "number of full provider-pool passes before returning failure")
@@ -209,12 +209,13 @@ type providerConfig struct {
 }
 
 type provider struct {
-	id        string
-	chatURL   string
-	modelsURL string
-	apiKey    string
-	models    map[string]struct{}
-	busy      int
+	id           string
+	chatURL      string
+	responsesURL string
+	modelsURL    string
+	apiKey       string
+	models       map[string]struct{}
+	busy         int
 }
 
 type providerPool struct {
@@ -239,6 +240,10 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 		if err != nil {
 			return nil, fmt.Errorf("invalid provider %q URL %q: %w", cfg.ID, cfg.ProviderURL, err)
 		}
+		responsesURL, err := normalizeResponsesURL(cfg.ProviderURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid provider %q responses URL %q: %w", cfg.ID, cfg.ProviderURL, err)
+		}
 		modelsURL, err := normalizeModelsURL(cfg.ProviderURL)
 		if err != nil {
 			return nil, fmt.Errorf("invalid provider %q models URL %q: %w", cfg.ID, cfg.ProviderURL, err)
@@ -251,11 +256,12 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 			return nil, fmt.Errorf("provider %q (%s) returned no models", cfg.ID, modelsURL)
 		}
 		providers = append(providers, provider{
-			id:        cfg.ID,
-			chatURL:   chatURL,
-			modelsURL: modelsURL,
-			apiKey:    cfg.APIKey,
-			models:    models,
+			id:           cfg.ID,
+			chatURL:      chatURL,
+			responsesURL: responsesURL,
+			modelsURL:    modelsURL,
+			apiKey:       cfg.APIKey,
+			models:       models,
 		})
 		for model := range models {
 			modelProviders[model] = append(modelProviders[model], i)
@@ -285,7 +291,7 @@ func (p *providerPool) provider(index int) provider {
 func (p *providerPool) candidatesForModel(model string) ([]int, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return nil, errors.New("chat completions request must include a model")
+		return nil, errors.New("request must include a model")
 	}
 
 	p.mu.Lock()
@@ -439,20 +445,42 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	case "/chat/completions", "/v1/chat/completions":
-		p.handleChatCompletions(w, r)
+		p.handleAPIRequest(w, r, endpointChatCompletions)
+	case "/responses", "/v1/responses":
+		p.handleAPIRequest(w, r, endpointResponses)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+type upstreamEndpoint string
+
+const (
+	endpointChatCompletions upstreamEndpoint = "chat completions"
+	endpointResponses       upstreamEndpoint = "responses"
+)
+
+func (e upstreamEndpoint) url(provider provider) string {
+	switch e {
+	case endpointResponses:
+		return provider.responsesURL
+	default:
+		return provider.chatURL
+	}
+}
+
+func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoint upstreamEndpoint) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	body, err := readRequestBody(r, maxRequestBodyBytes)
 	if err != nil {
-		p.logger.Warn("failed to read chat completions request", zap.String("path", r.URL.Path), zap.Error(err))
+		p.logger.Warn("failed to read downstream request",
+			zap.String("api", string(endpoint)),
+			zap.String("path", r.URL.Path),
+			zap.Error(err),
+		)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -478,7 +506,10 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	for pass := 0; pass < attemptPasses; pass++ {
 		if pass > 0 && p.delay > 0 {
 			if err := sleepWithContext(r.Context(), p.delay); err != nil {
-				p.logger.Info("downstream canceled chat completions request during retry delay", zap.Error(err))
+				p.logger.Info("downstream canceled request during retry delay",
+					zap.String("api", string(endpoint)),
+					zap.Error(err),
+				)
 				return
 			}
 		}
@@ -491,17 +522,21 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			tried[providerIndex] = struct{}{}
 			attempt++
 
-			resp, err := p.postChat(r, body, providerIndex)
+			resp, err := p.postUpstream(r, body, providerIndex, endpoint)
 			if err != nil {
 				if r.Context().Err() != nil {
-					p.logger.Info("downstream canceled chat completions request", zap.Error(err))
+					p.logger.Info("downstream canceled request",
+						zap.String("api", string(endpoint)),
+						zap.Error(err),
+					)
 					release()
 					return
 				}
 				provider := p.pool.provider(providerIndex)
 				lastErr = err
 				release()
-				p.logger.Warn("upstream chat completions request failed",
+				p.logger.Warn("upstream request failed",
+					zap.String("api", string(endpoint)),
 					zap.Int("attempt", attempt),
 					zap.Int("attempt_pass", pass+1),
 					zap.Int("provider_index", providerIndex),
@@ -518,7 +553,8 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				copyResponseHeaders(w.Header(), resp.Header)
 				w.WriteHeader(resp.StatusCode)
 				if err := copyResponseBody(w, resp.Body); err != nil {
-					p.logger.Warn("failed to copy upstream chat completions response",
+					p.logger.Warn("failed to copy upstream response",
+						zap.String("api", string(endpoint)),
 						zap.Int("status", resp.StatusCode),
 						zap.Int("provider_index", providerIndex),
 						zap.Error(err),
@@ -532,7 +568,8 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			release()
 			if readErr != nil {
 				lastErr = readErr
-				p.logger.Warn("failed to read upstream chat completions error response",
+				p.logger.Warn("failed to read upstream error response",
+					zap.String("api", string(endpoint)),
 					zap.Int("attempt", attempt),
 					zap.Int("attempt_pass", pass+1),
 					zap.Int("provider_index", providerIndex),
@@ -544,7 +581,8 @@ func (p *proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else {
 				lastHTTP = failure
 				lastErr = nil
-				p.logger.Warn("upstream chat completions returned failure",
+				p.logger.Warn("upstream returned failure",
+					zap.String("api", string(endpoint)),
 					zap.Int("attempt", attempt),
 					zap.Int("attempt_pass", pass+1),
 					zap.Int("provider_index", providerIndex),
@@ -580,9 +618,9 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func (p *proxy) postChat(inbound *http.Request, body []byte, providerIndex int) (*http.Response, error) {
+func (p *proxy) postUpstream(inbound *http.Request, body []byte, providerIndex int, endpoint upstreamEndpoint) (*http.Response, error) {
 	provider := p.pool.provider(providerIndex)
-	targetURL := urlWithRawQuery(provider.chatURL, inbound.URL.RawQuery)
+	targetURL := urlWithRawQuery(endpoint.url(provider), inbound.URL.RawQuery)
 	req, err := http.NewRequestWithContext(inbound.Context(), http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -631,6 +669,14 @@ func writeJSONError(w http.ResponseWriter, status int, code string, message stri
 }
 
 func normalizeChatCompletionsURL(raw string) (string, error) {
+	return normalizeProviderEndpointURL(raw, "/chat/completions")
+}
+
+func normalizeResponsesURL(raw string) (string, error) {
+	return normalizeProviderEndpointURL(raw, "/responses")
+}
+
+func normalizeProviderEndpointURL(raw string, endpointPath string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", err
@@ -639,15 +685,17 @@ func normalizeChatCompletionsURL(raw string) (string, error) {
 		return "", fmt.Errorf("provider URL must include scheme and host: %s", raw)
 	}
 	path := strings.TrimRight(u.Path, "/")
+	if basePath, ok := stripKnownProviderEndpoint(path); ok {
+		u.Path = joinEndpointPath(basePath, endpointPath)
+		return u.String(), nil
+	}
 	switch {
-	case strings.HasSuffix(path, "/chat/completions"):
-		u.Path = path
 	case path == "":
-		u.Path = "/v1/chat/completions"
+		u.Path = "/v1" + endpointPath
 	case strings.HasSuffix(path, "/v1"):
-		u.Path = path + "/chat/completions"
+		u.Path = path + endpointPath
 	default:
-		u.Path = path + "/chat/completions"
+		u.Path = path + endpointPath
 	}
 	return u.String(), nil
 }
@@ -661,12 +709,12 @@ func normalizeModelsURL(raw string) (string, error) {
 		return "", fmt.Errorf("provider URL must include scheme and host: %s", raw)
 	}
 	path := strings.TrimRight(u.Path, "/")
+	if basePath, ok := stripKnownProviderEndpoint(path); ok {
+		u.Path = joinEndpointPath(basePath, "/models")
+		u.RawQuery = ""
+		return u.String(), nil
+	}
 	switch {
-	case strings.HasSuffix(path, "/chat/completions"):
-		path = strings.TrimRight(strings.TrimSuffix(path, "/chat/completions"), "/")
-		u.Path = path + "/models"
-	case strings.HasSuffix(path, "/models"):
-		u.Path = path
 	case path == "":
 		u.Path = "/v1/models"
 	case strings.HasSuffix(path, "/v1"):
@@ -676,6 +724,22 @@ func normalizeModelsURL(raw string) (string, error) {
 	}
 	u.RawQuery = ""
 	return u.String(), nil
+}
+
+func stripKnownProviderEndpoint(path string) (string, bool) {
+	for _, suffix := range []string{"/chat/completions", "/responses", "/models"} {
+		if strings.HasSuffix(path, suffix) {
+			return strings.TrimRight(strings.TrimSuffix(path, suffix), "/"), true
+		}
+	}
+	return "", false
+}
+
+func joinEndpointPath(basePath string, endpointPath string) string {
+	if basePath == "" {
+		return endpointPath
+	}
+	return basePath + endpointPath
 }
 
 func urlWithRawQuery(rawURL, rawQuery string) string {

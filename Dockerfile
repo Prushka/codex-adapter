@@ -29,7 +29,7 @@ ARG GIT_COMMIT=unknown
 ARG GIT_VERSION=unknown
 
 LABEL org.opencontainers.image.title="meinya/llm-lb" \
-    org.opencontainers.image.description="Chat Completions pass-through load balancer for codex-adapter" \
+    org.opencontainers.image.description="Chat Completions and Responses pass-through load balancer for codex-adapter" \
     org.opencontainers.image.ref.name="meinya/llm-lb" \
     org.opencontainers.image.revision=$GIT_COMMIT \
     org.opencontainers.image.version=$GIT_VERSION

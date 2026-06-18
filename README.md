@@ -13,7 +13,7 @@ It accepts Codex requests on `/v1/responses`, translates them to `/v1/chat/compl
 - Executes hosted-style `web_search` locally with DuckDuckGo, Bing, Yahoo, or SearXNG backends, including `search`, `open_page`, and `find_in_page`.
 - Handles pure web-search turns, parallel web-search turns, and mixed `web_search` plus client-tool turns while replaying search history in the correct tool-call order.
 - Preserves provider compatibility metadata, including Gemini `extra_content.google.thought_signature` and Kimi `reasoning_content` history where supported.
-- Supports streaming and non-streaming upstream Chat Completions responses, `/responses/compact`, debug trace output, and an optional Chat Completions load-balancer proxy.
+- Supports streaming and non-streaming upstream Chat Completions responses, `/responses/compact`, debug trace output, and an optional Chat Completions and Responses load-balancer proxy.
 
 ## Requirements
 
@@ -91,11 +91,13 @@ Set `-disable-upstream-streaming` to make `/responses` buffer the upstream Chat 
 
 `-api-key` and `-api-key-env` are mutually exclusive. If neither is set, the adapter forwards the inbound `Authorization` header sent by Codex. If either adapter-owned key source is set, it overrides Codex's inbound authorization and is sent upstream as `Authorization: Bearer <key>`. Values that already include an authorization scheme, such as `Bearer sk-...`, are forwarded as-is.
 
-## Chat Completions Load Balancer
+## Chat Completions and Responses Load Balancer
 
-`cmd/load-balancer` is a small Chat Completions pass-through load balancer. It forwards `POST /chat/completions` and `POST /v1/chat/completions` request bodies and headers to configured upstream Chat Completions providers, overriding only `Authorization`. On startup it fetches each provider's `/models` list and only forwards a request to providers that advertise the requested `model`. If no configured provider supports the model, the proxy returns a JSON `model_not_available` error.
+`cmd/load-balancer` is a small pass-through load balancer for OpenAI-compatible Chat Completions and Responses create requests. It forwards `POST /chat/completions`, `POST /v1/chat/completions`, `POST /responses`, and `POST /v1/responses` request bodies and headers to configured upstream providers, overriding only `Authorization`. On startup it fetches each provider's `/models` list and only forwards a request to providers that advertise the requested `model`. If no configured provider supports the model, the proxy returns a JSON `model_not_available` error.
 
 Requests are assigned from a provider pool. If the next matching provider is already processing a request, the proxy uses the next idle matching provider. If every matching provider is busy, it wraps around and sends to the next matching provider in pool order. If an upstream attempt fails with a request error or non-2xx HTTP response, the same request body is retried against the next matching provider. By default, `-attempts 5` repeats the full matching provider pool up to five times, with `-delay 1m` between full-pool attempts. The first attempt has no delay. If every configured attempt returns an HTTP failure, the last upstream error response is returned unchanged.
+
+The load balancer does not translate between API formats. Use the Chat Completions routes only with upstream providers that support Chat Completions, and use the Responses routes only with upstream providers that support Responses.
 
 ```sh
 go run ./cmd/load-balancer \
@@ -104,7 +106,7 @@ go run ./cmd/load-balancer \
   -provider p2,https://provider-two.example.com/v1,sk-provider-two
 ```
 
-Each `-provider` value is `id,url,key`. The `id` is only for logs and error messages, but it must be unique. The `url` may be a base URL, a `/v1` URL, or a direct `/chat/completions` URL.
+Each `-provider` value is `id,url,key`. The `id` is only for logs and error messages, but it must be unique. The `url` may be a base URL, a `/v1` URL, or a direct `/chat/completions`, `/responses`, or `/models` URL. Direct endpoint URLs are treated as siblings, so `https://provider.example/v1/responses` also implies `https://provider.example/v1/chat/completions` and `https://provider.example/v1/models`.
 
 ## Local Web Search
 

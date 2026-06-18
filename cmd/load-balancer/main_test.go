@@ -285,6 +285,150 @@ func TestProxyModelRoutingUsesGlobalProviderOrder(t *testing.T) {
 	}
 }
 
+func TestProxyForwardsResponsesRequest(t *testing.T) {
+	const requestBody = `{"model":"m","input":"hi","stream":false}`
+
+	provider := newMockProviderWithResponses(t, []string{"m"}, "key", nil, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.RawQuery; got != "trace=1" {
+			t.Fatalf("raw query = %q", got)
+		}
+		if got := r.Header.Get("X-Req"); got != "responses" {
+			t.Fatalf("X-Req = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer key" {
+			t.Fatalf("authorization = %q", got)
+		}
+		w.Header().Set("X-Upstream", "responses")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1"}`))
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveResponsesWithPathAndHeader(proxy, "/v1/responses?trace=1", requestBody, "X-Req", "responses")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != `{"id":"resp_1"}` {
+		t.Fatalf("body = %s", got)
+	}
+	if got := rec.Header().Get("X-Upstream"); got != "responses" {
+		t.Fatalf("X-Upstream = %q", got)
+	}
+	if got := provider.chatCount(); got != 0 {
+		t.Fatalf("chat count = %d", got)
+	}
+	if got := provider.responsesCount(); got != 1 {
+		t.Fatalf("responses count = %d", got)
+	}
+	if got := provider.joinResponseAuthorizations(); got != "Bearer key" {
+		t.Fatalf("response authorizations = %q", got)
+	}
+	if got := strings.Join(provider.responsesBodies(), ","); got != requestBody {
+		t.Fatalf("response bodies = %s", got)
+	}
+}
+
+func TestProxyForwardsResponsesShortPath(t *testing.T) {
+	const requestBody = `{"model":"m","input":"hi"}`
+
+	provider := newMockProviderWithResponses(t, []string{"m"}, "key", nil, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp_short"}`))
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveResponsesWithPath(proxy, "/responses", requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := provider.responsesCount(); got != 1 {
+		t.Fatalf("responses count = %d", got)
+	}
+}
+
+func TestProxyResponsesUsesSiblingURLWhenProviderURLIsChatCompletions(t *testing.T) {
+	const requestBody = `{"model":"m","input":"hi"}`
+
+	provider := newMockProviderWithResponses(t, []string{"m"}, "key", nil, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp_from_sibling"}`))
+	})
+	defer provider.Close()
+
+	cfg := provider.providerConfig()
+	cfg.ProviderURL = provider.URL + "/v1/chat/completions"
+	proxy := newTestProxy(t, cfg)
+	rec := serveResponses(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != `{"id":"resp_from_sibling"}` {
+		t.Fatalf("body = %s", got)
+	}
+	if got := provider.responsesCount(); got != 1 {
+		t.Fatalf("responses count = %d", got)
+	}
+}
+
+func TestProxyResponsesRetriesNextProviderOnFailure(t *testing.T) {
+	const requestBody = `{"model":"m","input":"hi","stream":false}`
+
+	first := newMockProviderWithResponses(t, []string{"m"}, "key-1", nil, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Upstream-Error", "first")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"first"}}`))
+	})
+	defer first.Close()
+	second := newMockProviderWithResponses(t, []string{"m"}, "key-2", nil, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Upstream", "second")
+		_, _ = w.Write([]byte(`{"id":"resp_second"}`))
+	})
+	defer second.Close()
+
+	proxy := newTestProxy(t, first.providerConfig(), second.providerConfig())
+	rec := serveResponses(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != `{"id":"resp_second"}` {
+		t.Fatalf("body = %s", got)
+	}
+	if got := rec.Header().Get("X-Upstream"); got != "second" {
+		t.Fatalf("X-Upstream = %q", got)
+	}
+	if got := first.responsesCount(); got != 1 {
+		t.Fatalf("first responses count = %d", got)
+	}
+	if got := second.responsesCount(); got != 1 {
+		t.Fatalf("second responses count = %d", got)
+	}
+}
+
+func TestProxyResponsesOnlyUsesProvidersWithRequestedModel(t *testing.T) {
+	const requestBody = `{"model":"b","input":"hi","stream":false}`
+
+	first := newMockProviderWithResponses(t, []string{"a"}, "key-1", nil, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("provider without model should not receive responses request")
+	})
+	defer first.Close()
+	second := newMockProviderWithResponses(t, []string{"b"}, "key-2", nil, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"two"}`))
+	})
+	defer second.Close()
+
+	proxy := newTestProxy(t, first.providerConfig(), second.providerConfig())
+	rec := serveResponses(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := first.responsesCount(); got != 0 {
+		t.Fatalf("first responses count = %d", got)
+	}
+	if got := second.responsesCount(); got != 1 {
+		t.Fatalf("second responses count = %d", got)
+	}
+}
+
 func TestProxyReturnsModelErrorWhenUnavailable(t *testing.T) {
 	provider := newMockProvider(t, []string{"a"}, "key", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("chat request should not be forwarded")
@@ -412,6 +556,10 @@ func TestNormalizeChatCompletionsURL(t *testing.T) {
 		"https://example.test/v1":                  "https://example.test/v1/chat/completions",
 		"https://example.test/openai":              "https://example.test/openai/chat/completions",
 		"https://example.test/v1/chat/completions": "https://example.test/v1/chat/completions",
+		"https://example.test/v1/models":           "https://example.test/v1/chat/completions",
+		"https://example.test/v1/responses":        "https://example.test/v1/chat/completions",
+		"https://example.test/responses":           "https://example.test/chat/completions",
+		"https://example.test/v1/responses?x=1":    "https://example.test/v1/chat/completions?x=1",
 	}
 	for raw, want := range tests {
 		got, err := normalizeChatCompletionsURL(raw)
@@ -424,13 +572,38 @@ func TestNormalizeChatCompletionsURL(t *testing.T) {
 	}
 }
 
+func TestNormalizeResponsesURL(t *testing.T) {
+	tests := map[string]string{
+		"https://example.test":                         "https://example.test/v1/responses",
+		"https://example.test/v1":                      "https://example.test/v1/responses",
+		"https://example.test/openai":                  "https://example.test/openai/responses",
+		"https://example.test/v1/chat/completions":     "https://example.test/v1/responses",
+		"https://example.test/chat/completions":        "https://example.test/responses",
+		"https://example.test/v1/models":               "https://example.test/v1/responses",
+		"https://example.test/v1/responses":            "https://example.test/v1/responses",
+		"https://example.test/v1/chat/completions?x=1": "https://example.test/v1/responses?x=1",
+	}
+	for raw, want := range tests {
+		got, err := normalizeResponsesURL(raw)
+		if err != nil {
+			t.Fatalf("normalizeResponsesURL(%q): %v", raw, err)
+		}
+		if got != want {
+			t.Fatalf("normalizeResponsesURL(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestNormalizeModelsURL(t *testing.T) {
 	tests := map[string]string{
 		"https://example.test":                     "https://example.test/v1/models",
 		"https://example.test/v1":                  "https://example.test/v1/models",
 		"https://example.test/openai":              "https://example.test/openai/models",
 		"https://example.test/v1/chat/completions": "https://example.test/v1/models",
+		"https://example.test/v1/responses":        "https://example.test/v1/models",
 		"https://example.test/v1/models":           "https://example.test/v1/models",
+		"https://example.test/responses":           "https://example.test/models",
+		"https://example.test/v1/responses?x=1":    "https://example.test/v1/models",
 	}
 	for raw, want := range tests {
 		got, err := normalizeModelsURL(raw)
@@ -490,15 +663,38 @@ type mockProvider struct {
 	apiKey string
 	mu     sync.Mutex
 
-	modelAuthorizations []string
-	authorizations      []string
-	requestBodies       []string
-	chatHandler         http.HandlerFunc
+	modelAuthorizations    []string
+	authorizations         []string
+	requestBodies          []string
+	responseAuthorizations []string
+	responseBodies         []string
+	chatHandler            http.HandlerFunc
+	responsesHandler       http.HandlerFunc
 }
 
 func newMockProvider(t *testing.T, models []string, apiKey string, chatHandler http.HandlerFunc) *mockProvider {
 	t.Helper()
-	p := &mockProvider{t: t, apiKey: apiKey, chatHandler: chatHandler}
+	return newMockProviderWithResponses(t, models, apiKey, chatHandler, nil)
+}
+
+func newMockProviderWithResponses(t *testing.T, models []string, apiKey string, chatHandler http.HandlerFunc, responsesHandler http.HandlerFunc) *mockProvider {
+	t.Helper()
+	if chatHandler == nil {
+		chatHandler = func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("unexpected chat completions request")
+		}
+	}
+	if responsesHandler == nil {
+		responsesHandler = func(w http.ResponseWriter, r *http.Request) {
+			t.Fatal("unexpected responses request")
+		}
+	}
+	p := &mockProvider{
+		t:                t,
+		apiKey:           apiKey,
+		chatHandler:      chatHandler,
+		responsesHandler: responsesHandler,
+	}
 	p.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/models":
@@ -521,6 +717,16 @@ func newMockProvider(t *testing.T, models []string, apiKey string, chatHandler h
 			p.requestBodies = append(p.requestBodies, string(body))
 			p.mu.Unlock()
 			chatHandler(w, r)
+		case "/v1/responses":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.mu.Lock()
+			p.responseAuthorizations = append(p.responseAuthorizations, r.Header.Get("Authorization"))
+			p.responseBodies = append(p.responseBodies, string(body))
+			p.mu.Unlock()
+			responsesHandler(w, r)
 		default:
 			t.Fatalf("unexpected path = %s", r.URL.Path)
 		}
@@ -555,10 +761,22 @@ func (p *mockProvider) chatCount() int {
 	return len(p.authorizations)
 }
 
+func (p *mockProvider) responsesCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.responseAuthorizations)
+}
+
 func (p *mockProvider) joinAuthorizations() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return strings.Join(p.authorizations, ",")
+}
+
+func (p *mockProvider) joinResponseAuthorizations() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return strings.Join(p.responseAuthorizations, ",")
 }
 
 func (p *mockProvider) joinModelAuthorizations() string {
@@ -571,6 +789,12 @@ func (p *mockProvider) bodies() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string(nil), p.requestBodies...)
+}
+
+func (p *mockProvider) responsesBodies() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.responseBodies...)
 }
 
 func newTestProxy(t *testing.T, providers ...providerConfig) *proxy {
@@ -604,6 +828,25 @@ func serveChat(p *proxy, body string) *httptest.ResponseRecorder {
 
 func serveChatWithHeader(p *proxy, body string, headerName string, headerValue string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if headerName != "" {
+		req.Header.Set(headerName, headerValue)
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	return rec
+}
+
+func serveResponses(p *proxy, body string) *httptest.ResponseRecorder {
+	return serveResponsesWithPath(p, "/v1/responses", body)
+}
+
+func serveResponsesWithPath(p *proxy, path string, body string) *httptest.ResponseRecorder {
+	return serveResponsesWithPathAndHeader(p, path, body, "", "")
+}
+
+func serveResponsesWithPathAndHeader(p *proxy, path string, body string, headerName string, headerValue string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if headerName != "" {
 		req.Header.Set(headerName, headerValue)
