@@ -448,6 +448,146 @@ func TestProxyListsProviderModelMap(t *testing.T) {
 	}
 }
 
+func TestProxyProviderStatusReportsBusySuccessAndFailures(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	var modeMu sync.Mutex
+	mode := "block"
+	release := make(chan struct{})
+	provider := newMockProvider(t, []string{"m", "z"}, "key", func(w http.ResponseWriter, r *http.Request) {
+		modeMu.Lock()
+		currentMode := mode
+		modeMu.Unlock()
+		switch currentMode {
+		case "block":
+			<-release
+			_, _ = w.Write([]byte(`{"id":"ok"}`))
+		case "fail":
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+		default:
+			_, _ = w.Write([]byte(`{"id":"ok"}`))
+		}
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	done := make(chan int, 1)
+	go func() {
+		done <- serveChat(proxy, requestBody).Code
+	}()
+	provider.waitForChats(t, 1)
+
+	status := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if len(status.Data) != 1 {
+		t.Fatalf("providers = %#v", status.Data)
+	}
+	got := status.Data[0]
+	if got.ID != "key" || strings.Join(got.Models, ",") != "m,z" || got.BusyCount != 1 {
+		t.Fatalf("busy status = %#v", got)
+	}
+	if got.Cooldown.Active || got.Cooldown.Until != nil || got.Cooldown.RemainingMillis != 0 {
+		t.Fatalf("cooldown = %#v", got.Cooldown)
+	}
+
+	close(release)
+	if code := waitStatus(t, done); code != http.StatusOK {
+		t.Fatalf("blocked status = %d", code)
+	}
+
+	modeMu.Lock()
+	mode = "fail"
+	modeMu.Unlock()
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("failure status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	status = decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers", true))
+	got = status.Data[0]
+	if got.BusyCount != 0 || got.LastSuccessAt == nil || got.LastFailureAt == nil {
+		t.Fatalf("final status = %#v", got)
+	}
+	if got.RecentFailureCount != 1 || len(got.RecentFailures) != 1 {
+		t.Fatalf("recent failures = %#v", got.RecentFailures)
+	}
+	if failure := got.RecentFailures[0]; failure.Endpoint != string(endpointChatCompletions) || failure.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("failure = %#v", failure)
+	}
+	if got.ConsecutiveFailures != 1 {
+		t.Fatalf("consecutive failures = %d", got.ConsecutiveFailures)
+	}
+}
+
+func TestProxySkipsProviderInCooldown(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	first := newMockProvider(t, []string{"m"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"m"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"second"}`))
+	})
+	defer second.Close()
+
+	proxy, err := newProxy(proxyConfig{
+		Providers:            []providerConfig{first.providerConfig(), second.providerConfig()},
+		Client:               http.DefaultClient,
+		Logger:               newTestLogger(),
+		APIKey:               testProxyAPIKey,
+		Attempts:             1,
+		ProviderCooldown:     time.Minute,
+		CooldownFailures:     1,
+		ModelRefreshInterval: 0,
+	})
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	proxy.pool.candidateOrder = stableCandidateOrder
+
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := first.chatCount(); got != 1 {
+		t.Fatalf("first chat count after first request = %d", got)
+	}
+	if got := second.chatCount(); got != 1 {
+		t.Fatalf("second chat count after first request = %d", got)
+	}
+
+	status := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if !status.Data[0].Cooldown.Active || status.Data[0].Cooldown.Until == nil || status.Data[0].Cooldown.RemainingMillis <= 0 {
+		t.Fatalf("cooldown status = %#v", status.Data[0].Cooldown)
+	}
+
+	rec = serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := first.chatCount(); got != 1 {
+		t.Fatalf("first provider should have been skipped during cooldown, got %d requests", got)
+	}
+	if got := second.chatCount(); got != 2 {
+		t.Fatalf("second chat count after second request = %d", got)
+	}
+}
+
+func TestProxyRejectsUnauthorizedProviderStatus(t *testing.T) {
+	provider := newMockProvider(t, []string{"m"}, "provider-key", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unauthorized provider status should not be forwarded")
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveProviderStatus(proxy, "/v1/providers/status", false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestProxyRejectsUnauthorizedModelList(t *testing.T) {
 	provider := newMockProvider(t, []string{"m"}, "provider-key", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("unauthorized model list should not be forwarded")
@@ -675,6 +815,95 @@ func TestProviderPoolLoadsModels(t *testing.T) {
 	}
 }
 
+func TestProviderPoolRefreshModelsUpdatesRouting(t *testing.T) {
+	provider := newMockProvider(t, []string{"a"}, "secret", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	})
+	defer provider.Close()
+
+	pool := newTestPool(t, provider.providerConfig())
+	provider.setModels("b", "c")
+	pool.refreshModels(context.Background(), http.DefaultClient, newTestLogger(), time.Second)
+
+	if _, err := pool.candidatesForModel("a"); err == nil {
+		t.Fatal("expected old model to be removed")
+	}
+	candidates, err := pool.candidatesForModel("b")
+	if err != nil {
+		t.Fatalf("candidatesForModel: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0] != 0 {
+		t.Fatalf("candidates = %#v", candidates)
+	}
+	statuses := pool.providerStatuses(time.Now())
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %#v", statuses)
+	}
+	if got := strings.Join(statuses[0].Models, ","); got != "b,c" {
+		t.Fatalf("status models = %s", got)
+	}
+	if statuses[0].ModelRefresh.LastSuccessAt == nil || statuses[0].ModelRefresh.LastFailureAt != nil || statuses[0].ModelRefresh.LastError != "" {
+		t.Fatalf("model refresh status = %#v", statuses[0].ModelRefresh)
+	}
+}
+
+func TestProviderPoolRefreshModelsKeepsPreviousModelsOnFailure(t *testing.T) {
+	provider := newMockProvider(t, []string{"a"}, "secret", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	})
+	pool := newTestPool(t, provider.providerConfig())
+	provider.Close()
+
+	pool.refreshModels(context.Background(), http.DefaultClient, newTestLogger(), 50*time.Millisecond)
+
+	candidates, err := pool.candidatesForModel("a")
+	if err != nil {
+		t.Fatalf("candidatesForModel: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0] != 0 {
+		t.Fatalf("candidates = %#v", candidates)
+	}
+	statuses := pool.providerStatuses(time.Now())
+	if len(statuses[0].RecentFailures) != 1 {
+		t.Fatalf("recent failures = %#v", statuses[0].RecentFailures)
+	}
+	if failure := statuses[0].RecentFailures[0]; failure.Endpoint != "models" || failure.Error == "" {
+		t.Fatalf("failure = %#v", failure)
+	}
+	if statuses[0].ModelRefresh.LastFailureAt == nil || statuses[0].ModelRefresh.LastError == "" {
+		t.Fatalf("model refresh status = %#v", statuses[0].ModelRefresh)
+	}
+}
+
+func TestProxyRefreshesProviderModelsInBackground(t *testing.T) {
+	provider := newMockProvider(t, []string{"a"}, "secret", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	})
+	defer provider.Close()
+
+	proxy, err := newProxy(proxyConfig{
+		Providers:            []providerConfig{provider.providerConfig()},
+		Client:               http.DefaultClient,
+		Logger:               newTestLogger(),
+		APIKey:               testProxyAPIKey,
+		Attempts:             1,
+		ModelRefreshInterval: 10 * time.Millisecond,
+		ModelRefreshTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	defer proxy.Close()
+
+	provider.setModels("a", "b")
+	waitForModel(t, proxy, "b")
+
+	rec := serveChat(proxy, `{"model":"b","stream":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestProxyUsesShuffledProviderOrder(t *testing.T) {
 	const requestBody = `{"model":"m","stream":false}`
 
@@ -774,6 +1003,42 @@ func TestValidateRejectsNegativeDelay(t *testing.T) {
 	}, attempts: 1, delay: -time.Second}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected delay error")
+	}
+}
+
+func TestValidateRejectsNegativeModelRefreshInterval(t *testing.T) {
+	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
+		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
+	}, attempts: 1, refresh: -time.Second}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected model refresh interval error")
+	}
+}
+
+func TestValidateRejectsNegativeModelRefreshTimeout(t *testing.T) {
+	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
+		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
+	}, attempts: 1, refreshTimeout: -time.Second}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected model refresh timeout error")
+	}
+}
+
+func TestValidateRejectsNegativeProviderCooldown(t *testing.T) {
+	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
+		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
+	}, attempts: 1, cooldown: -time.Second}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected provider cooldown error")
+	}
+}
+
+func TestValidateRejectsNegativeCooldownFailures(t *testing.T) {
+	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
+		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
+	}, attempts: 1, cooldownFailures: -1}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected provider cooldown failures error")
 	}
 }
 
@@ -890,6 +1155,7 @@ type mockProvider struct {
 	apiKey string
 	mu     sync.Mutex
 
+	models                 []string
 	modelAuthorizations    []string
 	authorizations         []string
 	requestBodies          []string
@@ -919,6 +1185,7 @@ func newMockProviderWithResponses(t *testing.T, models []string, apiKey string, 
 	p := &mockProvider{
 		t:                t,
 		apiKey:           apiKey,
+		models:           append([]string(nil), models...),
 		chatHandler:      chatHandler,
 		responsesHandler: responsesHandler,
 	}
@@ -927,6 +1194,7 @@ func newMockProviderWithResponses(t *testing.T, models []string, apiKey string, 
 		case "/v1/models":
 			p.mu.Lock()
 			p.modelAuthorizations = append(p.modelAuthorizations, r.Header.Get("Authorization"))
+			models := append([]string(nil), p.models...)
 			p.mu.Unlock()
 			data := make([]map[string]string, 0, len(models))
 			for _, model := range models {
@@ -959,6 +1227,12 @@ func newMockProviderWithResponses(t *testing.T, models []string, apiKey string, 
 		}
 	}))
 	return p
+}
+
+func (p *mockProvider) setModels(models ...string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.models = append([]string(nil), models...)
 }
 
 func (p *mockProvider) providerConfig() providerConfig {
@@ -1104,6 +1378,49 @@ func serveModelPath(p *proxy, path string, authorized bool) *httptest.ResponseRe
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	return rec
+}
+
+func serveProviderStatus(p *proxy, path string, authorized bool) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if authorized {
+		req.Header.Set("Authorization", authorizationHeader(testProxyAPIKey))
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeProviderStatus(t *testing.T, rec *httptest.ResponseRecorder) providersStatusResponse {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var got providersStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal provider status: %v", err)
+	}
+	if got.Object != "list" {
+		t.Fatalf("object = %q", got.Object)
+	}
+	return got
+}
+
+func waitForModel(t *testing.T, p *proxy, model string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		rec := serveModelPath(p, "/v1/models", true)
+		if rec.Code == http.StatusOK && strings.Contains(rec.Body.String(), `"`+model+`"`) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for model %q", model)
+		case <-ticker.C:
+		}
+	}
 }
 
 func waitStatus(t *testing.T, ch <-chan int) int {

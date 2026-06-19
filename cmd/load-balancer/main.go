@@ -22,19 +22,28 @@ import (
 )
 
 const (
-	maxRequestBodyBytes = 128 << 20
-	defaultAttempts     = 5
-	defaultAttemptDelay = time.Minute
-	defaultTimeout      = 30 * time.Minute
+	maxRequestBodyBytes         = 128 << 20
+	defaultAttempts             = 5
+	defaultAttemptDelay         = time.Minute
+	defaultTimeout              = 30 * time.Minute
+	defaultModelRefreshInterval = 5 * time.Minute
+	defaultModelRefreshTimeout  = 30 * time.Second
+	defaultProviderCooldown     = time.Minute
+	defaultCooldownFailures     = 3
+	maxRecentProviderFailures   = 10
 )
 
 type cliConfig struct {
-	listenAddr string
-	apiKey     string
-	providers  providerList
-	timeout    time.Duration
-	attempts   int
-	delay      time.Duration
+	listenAddr       string
+	apiKey           string
+	providers        providerList
+	timeout          time.Duration
+	attempts         int
+	delay            time.Duration
+	refresh          time.Duration
+	refreshTimeout   time.Duration
+	cooldown         time.Duration
+	cooldownFailures int
 }
 
 func main() {
@@ -58,23 +67,32 @@ func main() {
 	}
 
 	handler, err := newProxy(proxyConfig{
-		Providers: cfg.providers,
-		Client:    client,
-		Logger:    logger,
-		APIKey:    cfg.apiKey,
-		Attempts:  cfg.attempts,
-		Delay:     cfg.delay,
+		Providers:            cfg.providers,
+		Client:               client,
+		Logger:               logger,
+		APIKey:               cfg.apiKey,
+		Attempts:             cfg.attempts,
+		Delay:                cfg.delay,
+		ModelRefreshInterval: cfg.refresh,
+		ModelRefreshTimeout:  cfg.refreshTimeout,
+		ProviderCooldown:     cfg.cooldown,
+		CooldownFailures:     cfg.cooldownFailures,
 	})
 	if err != nil {
 		exitWithError(logger, "failed to create load balancer", zap.Error(err))
 	}
+	defer handler.Close()
 
 	logger.Info("OpenAI-compatible load balancer listening",
 		zap.String("listen", cfg.listenAddr),
-		zap.Int("providers", len(handler.pool.providers)),
-		zap.Int("models", len(handler.pool.modelProviders)),
+		zap.Int("providers", handler.pool.providerCount()),
+		zap.Int("models", handler.pool.modelCount()),
 		zap.Int("attempts", handler.attempts),
 		zap.Duration("delay", handler.delay),
+		zap.Duration("model_refresh_interval", cfg.refresh),
+		zap.Duration("model_refresh_timeout", cfg.refreshTimeout),
+		zap.Duration("provider_cooldown", cfg.cooldown),
+		zap.Int("cooldown_failures", cfg.cooldownFailures),
 	)
 
 	server := &http.Server{
@@ -95,6 +113,10 @@ func parseFlags() cliConfig {
 	flag.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "upstream request timeout")
 	flag.IntVar(&cfg.attempts, "attempts", defaultAttempts, "number of full provider-pool passes before returning failure")
 	flag.DurationVar(&cfg.delay, "delay", defaultAttemptDelay, "delay between full provider-pool attempts; first attempt has no delay")
+	flag.DurationVar(&cfg.refresh, "model-refresh-interval", defaultModelRefreshInterval, "interval for refreshing provider /models lists; set to 0 to disable")
+	flag.DurationVar(&cfg.refreshTimeout, "model-refresh-timeout", defaultModelRefreshTimeout, "timeout for each provider model refresh request; set to 0 to use the HTTP client timeout")
+	flag.DurationVar(&cfg.cooldown, "provider-cooldown", defaultProviderCooldown, "duration to skip a provider after repeated request failures; set to 0 to disable")
+	flag.IntVar(&cfg.cooldownFailures, "provider-cooldown-failures", defaultCooldownFailures, "consecutive request failures before provider cooldown; set to 0 to disable")
 	flag.Parse()
 	return cfg
 }
@@ -109,6 +131,14 @@ func (c cliConfig) validate() error {
 		return errors.New("attempts must be at least 1")
 	case c.delay < 0:
 		return errors.New("delay must not be negative")
+	case c.refresh < 0:
+		return errors.New("model refresh interval must not be negative")
+	case c.refreshTimeout < 0:
+		return errors.New("model refresh timeout must not be negative")
+	case c.cooldown < 0:
+		return errors.New("provider cooldown must not be negative")
+	case c.cooldownFailures < 0:
+		return errors.New("provider cooldown failures must not be negative")
 	default:
 		seen := map[string]struct{}{}
 		for _, provider := range c.providers {
@@ -168,21 +198,28 @@ func parseProviderConfig(value string) (providerConfig, error) {
 }
 
 type proxyConfig struct {
-	Providers []providerConfig
-	Client    *http.Client
-	Logger    *zap.Logger
-	APIKey    string
-	Attempts  int
-	Delay     time.Duration
+	Providers            []providerConfig
+	Client               *http.Client
+	Logger               *zap.Logger
+	APIKey               string
+	Attempts             int
+	Delay                time.Duration
+	ModelRefreshInterval time.Duration
+	ModelRefreshTimeout  time.Duration
+	ProviderCooldown     time.Duration
+	CooldownFailures     int
 }
 
 type proxy struct {
-	pool     *providerPool
-	client   *http.Client
-	logger   *zap.Logger
-	apiKey   string
-	attempts int
-	delay    time.Duration
+	pool          *providerPool
+	client        *http.Client
+	logger        *zap.Logger
+	apiKey        string
+	attempts      int
+	delay         time.Duration
+	closeOnce     sync.Once
+	refreshCancel context.CancelFunc
+	refreshDone   <-chan struct{}
 }
 
 func newProxy(cfg proxyConfig) (*proxy, error) {
@@ -206,14 +243,53 @@ func newProxy(cfg proxyConfig) (*proxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &proxy{
+	pool.setCooldownPolicy(cfg.CooldownFailures, cfg.ProviderCooldown)
+	pr := &proxy{
 		pool:     pool,
 		client:   client,
 		logger:   logger,
 		apiKey:   apiKey,
 		attempts: attempts,
 		delay:    cfg.Delay,
-	}, nil
+	}
+	if cfg.ModelRefreshInterval > 0 {
+		refreshTimeout := cfg.ModelRefreshTimeout
+		if refreshTimeout < 0 {
+			refreshTimeout = defaultModelRefreshTimeout
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		pr.refreshCancel = cancel
+		pr.refreshDone = done
+		go pr.refreshModelsLoop(ctx, cfg.ModelRefreshInterval, refreshTimeout, done)
+	}
+	return pr, nil
+}
+
+func (p *proxy) Close() {
+	p.closeOnce.Do(func() {
+		if p.refreshCancel != nil {
+			p.refreshCancel()
+		}
+		if p.refreshDone != nil {
+			<-p.refreshDone
+		}
+	})
+}
+
+func (p *proxy) refreshModelsLoop(ctx context.Context, interval, timeout time.Duration, done chan<- struct{}) {
+	defer close(done)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			p.pool.refreshModels(ctx, p.client, p.logger, timeout)
+			timer.Reset(interval)
+		}
+	}
 }
 
 type providerConfig struct {
@@ -223,25 +299,86 @@ type providerConfig struct {
 }
 
 type provider struct {
-	id           string
-	chatURL      string
-	responsesURL string
-	modelsURL    string
-	apiKey       string
-	models       map[string]struct{}
-	busy         int
+	id                      string
+	chatURL                 string
+	responsesURL            string
+	modelsURL               string
+	apiKey                  string
+	models                  map[string]struct{}
+	busy                    int
+	recentFailures          []providerFailure
+	consecutiveFailures     int
+	lastSuccess             time.Time
+	lastFailure             time.Time
+	cooldownUntil           time.Time
+	lastModelRefresh        time.Time
+	lastModelRefreshFailure time.Time
+	lastModelRefreshError   string
 }
 
 type providerPool struct {
-	mu             sync.Mutex
-	providers      []provider
-	modelProviders map[string][]int
-	candidateOrder func([]int) []int
+	mu               sync.Mutex
+	providers        []provider
+	modelProviders   map[string][]int
+	candidateOrder   func([]int) []int
+	cooldownFailures int
+	cooldown         time.Duration
+}
+
+type providerFailure struct {
+	at         time.Time
+	endpoint   string
+	statusCode int
+	err        string
+}
+
+type providerModelRefreshTarget struct {
+	index     int
+	id        string
+	modelsURL string
+	apiKey    string
 }
 
 type modelListResponse struct {
 	Object string          `json:"object"`
 	Data   []modelListItem `json:"data"`
+}
+
+type providersStatusResponse struct {
+	Object string           `json:"object"`
+	Data   []providerStatus `json:"data"`
+}
+
+type providerStatus struct {
+	ID                  string                     `json:"id"`
+	Models              []string                   `json:"models"`
+	BusyCount           int                        `json:"busy_count"`
+	RecentFailures      []providerFailureStatus    `json:"recent_failures"`
+	RecentFailureCount  int                        `json:"recent_failure_count"`
+	ConsecutiveFailures int                        `json:"consecutive_failures"`
+	LastSuccessAt       *time.Time                 `json:"last_success_at"`
+	LastFailureAt       *time.Time                 `json:"last_failure_at"`
+	Cooldown            providerCooldownStatus     `json:"cooldown"`
+	ModelRefresh        providerModelRefreshStatus `json:"model_refresh"`
+}
+
+type providerFailureStatus struct {
+	At         time.Time `json:"at"`
+	Endpoint   string    `json:"endpoint"`
+	StatusCode int       `json:"status_code,omitempty"`
+	Error      string    `json:"error,omitempty"`
+}
+
+type providerCooldownStatus struct {
+	Active          bool       `json:"active"`
+	Until           *time.Time `json:"until"`
+	RemainingMillis int64      `json:"remaining_millis"`
+}
+
+type providerModelRefreshStatus struct {
+	LastSuccessAt *time.Time `json:"last_success_at"`
+	LastFailureAt *time.Time `json:"last_failure_at"`
+	LastError     string     `json:"last_error,omitempty"`
 }
 
 type modelListItem struct {
@@ -281,13 +418,15 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 		if len(models) == 0 {
 			return nil, fmt.Errorf("provider %q (%s) returned no models", cfg.ID, modelsURL)
 		}
+		loadedAt := time.Now()
 		providers = append(providers, provider{
-			id:           cfg.ID,
-			chatURL:      chatURL,
-			responsesURL: responsesURL,
-			modelsURL:    modelsURL,
-			apiKey:       cfg.APIKey,
-			models:       models,
+			id:               cfg.ID,
+			chatURL:          chatURL,
+			responsesURL:     responsesURL,
+			modelsURL:        modelsURL,
+			apiKey:           cfg.APIKey,
+			models:           models,
+			lastModelRefresh: loadedAt,
 		})
 		for model := range models {
 			modelProviders[model] = append(modelProviders[model], i)
@@ -307,6 +446,31 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 		modelProviders: modelProviders,
 		candidateOrder: randomCandidateOrder,
 	}, nil
+}
+
+func (p *providerPool) providerCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.providers)
+}
+
+func (p *providerPool) setCooldownPolicy(failures int, cooldown time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if failures < 0 {
+		failures = 0
+	}
+	if cooldown < 0 {
+		cooldown = 0
+	}
+	p.cooldownFailures = failures
+	p.cooldown = cooldown
+}
+
+func (p *providerPool) modelCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.modelProviders)
 }
 
 func (p *providerPool) provider(index int) provider {
@@ -351,6 +515,227 @@ func (p *providerPool) providerModelMap() map[string][]string {
 	return out
 }
 
+func (p *providerPool) providerStatuses(now time.Time) []providerStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.clearExpiredCooldownsLocked(now)
+	out := make([]providerStatus, 0, len(p.providers))
+	for _, provider := range p.providers {
+		failures := make([]providerFailureStatus, 0, len(provider.recentFailures))
+		for _, failure := range provider.recentFailures {
+			failures = append(failures, providerFailureStatus{
+				At:         failure.at.UTC(),
+				Endpoint:   failure.endpoint,
+				StatusCode: failure.statusCode,
+				Error:      failure.err,
+			})
+		}
+
+		var cooldownUntil *time.Time
+		var remainingMillis int64
+		cooldownActive := !provider.cooldownUntil.IsZero() && now.Before(provider.cooldownUntil)
+		if cooldownActive {
+			cooldownUntil = timePtr(provider.cooldownUntil)
+			remainingMillis = provider.cooldownUntil.Sub(now).Milliseconds()
+		}
+
+		out = append(out, providerStatus{
+			ID:                  provider.id,
+			Models:              sortedModelIDs(provider.models),
+			BusyCount:           provider.busy,
+			RecentFailures:      failures,
+			RecentFailureCount:  len(failures),
+			ConsecutiveFailures: provider.consecutiveFailures,
+			LastSuccessAt:       timePtr(provider.lastSuccess),
+			LastFailureAt:       timePtr(provider.lastFailure),
+			Cooldown: providerCooldownStatus{
+				Active:          cooldownActive,
+				Until:           cooldownUntil,
+				RemainingMillis: remainingMillis,
+			},
+			ModelRefresh: providerModelRefreshStatus{
+				LastSuccessAt: timePtr(provider.lastModelRefresh),
+				LastFailureAt: timePtr(provider.lastModelRefreshFailure),
+				LastError:     provider.lastModelRefreshError,
+			},
+		})
+	}
+	return out
+}
+
+func timePtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	utc := t.UTC()
+	return &utc
+}
+
+func (p *providerPool) refreshModels(ctx context.Context, client *http.Client, logger *zap.Logger, timeout time.Duration) {
+	if client == nil {
+		return
+	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	targets := p.modelRefreshTargets()
+	for _, target := range targets {
+		if ctx.Err() != nil {
+			return
+		}
+		fetchCtx := ctx
+		cancel := func() {}
+		if timeout > 0 {
+			fetchCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		models, err := fetchProviderModels(fetchCtx, client, target.modelsURL, target.apiKey)
+		cancel()
+		now := time.Now()
+		if err != nil {
+			p.recordProviderFailureAt(target.index, "models", 0, err, now, false)
+			logger.Warn("failed to refresh provider models",
+				zap.Int("provider_index", target.index),
+				zap.String("provider_id", target.id),
+				zap.String("models_url", target.modelsURL),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		oldModels, newModels, changed, ok := p.replaceProviderModels(target.index, models, now)
+		if !ok {
+			continue
+		}
+		fields := []zap.Field{
+			zap.Int("provider_index", target.index),
+			zap.String("provider_id", target.id),
+			zap.String("models_url", target.modelsURL),
+			zap.Int("models", len(newModels)),
+			zap.Strings("model_ids", newModels),
+		}
+		if changed {
+			fields = append(fields, zap.Strings("previous_model_ids", oldModels))
+			logger.Info("refreshed provider models", fields...)
+		} else {
+			logger.Debug("provider models unchanged", fields...)
+		}
+	}
+}
+
+func (p *providerPool) modelRefreshTargets() []providerModelRefreshTarget {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	targets := make([]providerModelRefreshTarget, 0, len(p.providers))
+	for i, provider := range p.providers {
+		targets = append(targets, providerModelRefreshTarget{
+			index:     i,
+			id:        provider.id,
+			modelsURL: provider.modelsURL,
+			apiKey:    provider.apiKey,
+		})
+	}
+	return targets
+}
+
+func (p *providerPool) replaceProviderModels(index int, models map[string]struct{}, refreshedAt time.Time) ([]string, []string, bool, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if index < 0 || index >= len(p.providers) {
+		return nil, nil, false, false
+	}
+	oldModels := sortedModelIDs(p.providers[index].models)
+	newModels := sortedModelIDs(models)
+	p.providers[index].models = copyModelSet(models)
+	p.providers[index].lastModelRefresh = refreshedAt
+	p.providers[index].lastModelRefreshFailure = time.Time{}
+	p.providers[index].lastModelRefreshError = ""
+	p.rebuildModelProvidersLocked()
+	return oldModels, newModels, !equalStringSlices(oldModels, newModels), true
+}
+
+func (p *providerPool) rebuildModelProvidersLocked() {
+	modelProviders := map[string][]int{}
+	for i, provider := range p.providers {
+		for model := range provider.models {
+			modelProviders[model] = append(modelProviders[model], i)
+		}
+	}
+	p.modelProviders = modelProviders
+}
+
+func copyModelSet(models map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(models))
+	for model := range models {
+		out[model] = struct{}{}
+	}
+	return out
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *providerPool) recordProviderSuccess(index int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if index < 0 || index >= len(p.providers) {
+		return
+	}
+	provider := &p.providers[index]
+	provider.lastSuccess = time.Now()
+	provider.consecutiveFailures = 0
+	provider.cooldownUntil = time.Time{}
+}
+
+func (p *providerPool) recordProviderFailure(index int, endpoint string, statusCode int, err error) {
+	p.recordProviderFailureAt(index, endpoint, statusCode, err, time.Now(), true)
+}
+
+func (p *providerPool) recordProviderFailureAt(index int, endpoint string, statusCode int, err error, at time.Time, requestFailure bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if index < 0 || index >= len(p.providers) {
+		return
+	}
+	message := ""
+	if err != nil {
+		message = err.Error()
+	} else if statusCode != 0 {
+		message = fmt.Sprintf("upstream returned HTTP %d", statusCode)
+	}
+	failure := providerFailure{
+		at:         at,
+		endpoint:   endpoint,
+		statusCode: statusCode,
+		err:        message,
+	}
+	provider := &p.providers[index]
+	provider.lastFailure = at
+	if requestFailure {
+		provider.consecutiveFailures++
+		if p.cooldownFailures > 0 && p.cooldown > 0 && provider.consecutiveFailures >= p.cooldownFailures {
+			provider.cooldownUntil = at.Add(p.cooldown)
+		}
+	}
+	provider.recentFailures = append(provider.recentFailures, failure)
+	if len(provider.recentFailures) > maxRecentProviderFailures {
+		copy(provider.recentFailures, provider.recentFailures[len(provider.recentFailures)-maxRecentProviderFailures:])
+		provider.recentFailures = provider.recentFailures[:maxRecentProviderFailures]
+	}
+	if endpoint == "models" {
+		provider.lastModelRefreshFailure = at
+		provider.lastModelRefreshError = message
+	}
+}
+
 func sortedModelIDs(models map[string]struct{}) []string {
 	modelIDs := make([]string, 0, len(models))
 	for model := range models {
@@ -366,9 +751,14 @@ func (p *providerPool) acquire(orderedCandidates []int, tried map[int]struct{}) 
 	if len(orderedCandidates) == 0 {
 		return 0, false, nil, errors.New("no provider candidates")
 	}
+	now := time.Now()
+	p.clearExpiredCooldownsLocked(now)
 
 	for _, providerIndex := range orderedCandidates {
 		if _, ok := tried[providerIndex]; ok {
+			continue
+		}
+		if p.providerCoolingDownLocked(providerIndex, now) {
 			continue
 		}
 		if p.providers[providerIndex].busy == 0 {
@@ -381,11 +771,30 @@ func (p *providerPool) acquire(orderedCandidates []int, tried map[int]struct{}) 
 		if _, ok := tried[providerIndex]; ok {
 			continue
 		}
+		if p.providerCoolingDownLocked(providerIndex, now) {
+			continue
+		}
 		p.providers[providerIndex].busy++
 		return providerIndex, true, p.releaseFunc(providerIndex), nil
 	}
 
-	return 0, false, nil, errors.New("no untried provider candidates")
+	return 0, false, nil, errors.New("no untried provider candidates outside cooldown")
+}
+
+func (p *providerPool) clearExpiredCooldownsLocked(now time.Time) {
+	for i := range p.providers {
+		if !p.providers[i].cooldownUntil.IsZero() && !now.Before(p.providers[i].cooldownUntil) {
+			p.providers[i].cooldownUntil = time.Time{}
+		}
+	}
+}
+
+func (p *providerPool) providerCoolingDownLocked(index int, now time.Time) bool {
+	if index < 0 || index >= len(p.providers) {
+		return true
+	}
+	cooldownUntil := p.providers[index].cooldownUntil
+	return !cooldownUntil.IsZero() && now.Before(cooldownUntil)
 }
 
 func (p *providerPool) orderedCandidates(candidates []int) []int {
@@ -486,6 +895,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleModels(w, r)
 	case "/models/map", "/v1/models/map":
 		p.handleModelMap(w, r)
+	case "/providers", "/v1/providers", "/providers/status", "/v1/providers/status":
+		p.handleProviderStatus(w, r)
 	case "/chat/completions", "/v1/chat/completions":
 		p.handleAPIRequest(w, r, endpointChatCompletions)
 	case "/responses", "/v1/responses":
@@ -530,6 +941,20 @@ func (p *proxy) handleModelMap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, p.pool.providerModelMap())
+}
+
+func (p *proxy) handleProviderStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !p.authorizeDownstream(w, r, "providers status") {
+		return
+	}
+	writeJSON(w, providersStatusResponse{
+		Object: "list",
+		Data:   p.pool.providerStatuses(time.Now()),
+	})
 }
 
 func (p *proxy) authorizeDownstream(w http.ResponseWriter, r *http.Request, api string) bool {
@@ -637,6 +1062,7 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 		for passAttempt := 0; passAttempt < len(orderedCandidates); passAttempt++ {
 			providerIndex, busyFallback, release, err := p.pool.acquire(orderedCandidates, tried)
 			if err != nil {
+				lastErr = err
 				break
 			}
 			tried[providerIndex] = struct{}{}
@@ -662,6 +1088,7 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 				}
 				provider := p.pool.provider(providerIndex)
 				lastErr = err
+				p.pool.recordProviderFailure(providerIndex, string(endpoint), 0, err)
 				release()
 				p.logger.Warn("upstream request failed",
 					appendRequestFields(requestFields,
@@ -685,6 +1112,9 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 				w.WriteHeader(resp.StatusCode)
 				responseBytes, err := copyResponseBody(w, resp.Body)
 				if err != nil {
+					if r.Context().Err() == nil {
+						p.pool.recordProviderFailure(providerIndex, string(endpoint), resp.StatusCode, err)
+					}
 					p.logger.Warn("failed to copy upstream response",
 						appendRequestFields(requestFields,
 							zap.Int("attempt", attempt),
@@ -701,6 +1131,7 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 					)
 					return
 				}
+				p.pool.recordProviderSuccess(providerIndex)
 				p.logger.Info("upstream request succeeded",
 					appendRequestFields(requestFields,
 						zap.Int("attempt", attempt),
@@ -718,6 +1149,11 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 			}
 
 			failure, readErr := bufferResponse(resp)
+			if readErr != nil {
+				p.pool.recordProviderFailure(providerIndex, string(endpoint), resp.StatusCode, readErr)
+			} else {
+				p.pool.recordProviderFailure(providerIndex, string(endpoint), resp.StatusCode, nil)
+			}
 			release()
 			if readErr != nil {
 				lastErr = readErr
