@@ -102,9 +102,12 @@ The load balancer does not translate between API formats. Use the Chat Completio
 ```sh
 go run ./cmd/load-balancer \
   -listen 127.0.0.1:18081 \
+  -api-key sk-load-balancer \
   -provider p1,https://provider-one.example.com/v1,sk-provider-one \
   -provider p2,https://provider-two.example.com/v1,sk-provider-two
 ```
+
+The load balancer requires `-api-key`. Downstream clients must send it as `Authorization: Bearer <key>`. This key is checked only by the load balancer and is never sent upstream; upstream requests always use the per-provider key from the selected `-provider` tuple.
 
 Each `-provider` value is `id,url,key`. The `id` is only for logs and error messages, but it must be unique. The `url` may be a base URL, a `/v1` URL, or a direct `/chat/completions`, `/responses`, or `/models` URL. Direct endpoint URLs are treated as siblings, so `https://provider.example/v1/responses` also implies `https://provider.example/v1/chat/completions` and `https://provider.example/v1/models`.
 

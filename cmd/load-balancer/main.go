@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -29,6 +30,7 @@ const (
 
 type cliConfig struct {
 	listenAddr string
+	apiKey     string
 	providers  providerList
 	timeout    time.Duration
 	attempts   int
@@ -59,6 +61,7 @@ func main() {
 		Providers: cfg.providers,
 		Client:    client,
 		Logger:    logger,
+		APIKey:    cfg.apiKey,
 		Attempts:  cfg.attempts,
 		Delay:     cfg.delay,
 	})
@@ -87,6 +90,7 @@ func main() {
 func parseFlags() cliConfig {
 	var cfg cliConfig
 	flag.StringVar(&cfg.listenAddr, "listen", "127.0.0.1:18081", "local listening address for Chat Completions and Responses requests")
+	flag.StringVar(&cfg.apiKey, "api-key", "", "load balancer API key required from downstream requests")
 	flag.Var(&cfg.providers, "provider", "upstream provider tuple id,url,key; may be repeated")
 	flag.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "upstream request timeout")
 	flag.IntVar(&cfg.attempts, "attempts", defaultAttempts, "number of full provider-pool passes before returning failure")
@@ -97,6 +101,8 @@ func parseFlags() cliConfig {
 
 func (c cliConfig) validate() error {
 	switch {
+	case strings.TrimSpace(c.apiKey) == "":
+		return errors.New("missing required flag: -api-key")
 	case len(c.providers) == 0:
 		return errors.New("missing required flag: -provider")
 	case c.attempts < 1:
@@ -165,6 +171,7 @@ type proxyConfig struct {
 	Providers []providerConfig
 	Client    *http.Client
 	Logger    *zap.Logger
+	APIKey    string
 	Attempts  int
 	Delay     time.Duration
 }
@@ -173,6 +180,7 @@ type proxy struct {
 	pool     *providerPool
 	client   *http.Client
 	logger   *zap.Logger
+	apiKey   string
 	attempts int
 	delay    time.Duration
 }
@@ -181,6 +189,10 @@ func newProxy(cfg proxyConfig) (*proxy, error) {
 	client := cfg.Client
 	if client == nil {
 		return nil, errors.New("http client is required")
+	}
+	apiKey := strings.TrimSpace(cfg.APIKey)
+	if apiKey == "" {
+		return nil, errors.New("load balancer API key is required")
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -198,6 +210,7 @@ func newProxy(cfg proxyConfig) (*proxy, error) {
 		pool:     pool,
 		client:   client,
 		logger:   logger,
+		apiKey:   apiKey,
 		attempts: attempts,
 		delay:    cfg.Delay,
 	}, nil
@@ -464,6 +477,15 @@ func (e upstreamEndpoint) url(provider provider) string {
 func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoint upstreamEndpoint) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !validAuthorization(r.Header.Get("Authorization"), p.apiKey) {
+		p.logger.Warn("unauthorized downstream request",
+			zap.String("api", string(endpoint)),
+			zap.String("path", r.URL.Path),
+		)
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeJSONError(w, http.StatusUnauthorized, "invalid_api_key", "invalid or missing API key")
 		return
 	}
 	requestStarted := time.Now()
@@ -841,6 +863,11 @@ func authorizationHeader(apiKey string) string {
 		return apiKey
 	}
 	return "Bearer " + apiKey
+}
+
+func validAuthorization(got string, apiKey string) bool {
+	want := authorizationHeader(apiKey)
+	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(got)), []byte(want)) == 1
 }
 
 func copyForwardHeaders(dst, src http.Header) {

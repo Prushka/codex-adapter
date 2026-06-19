@@ -16,6 +16,8 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
+const testProxyAPIKey = "lb-test-key"
+
 func TestProxySkipsBusyProviderAndFallsBack(t *testing.T) {
 	const requestBody = `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}`
 
@@ -334,6 +336,45 @@ func TestProxyLogsSuccessfulRequestWithoutBodies(t *testing.T) {
 	assertLogFieldsDoNotContain(t, fields, "secret-input", "secret-output")
 }
 
+func TestProxyRejectsMissingAPIKey(t *testing.T) {
+	provider := newMockProvider(t, []string{"m"}, "provider-key", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unauthorized request should not be forwarded")
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_api_key") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+	if got := provider.chatCount(); got != 0 {
+		t.Fatalf("chat count = %d", got)
+	}
+}
+
+func TestProxyRejectsWrongAPIKey(t *testing.T) {
+	provider := newMockProvider(t, []string{"m"}, "provider-key", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unauthorized request should not be forwarded")
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveChatWithHeader(proxy, `{"model":"m"}`, "Authorization", "Bearer wrong-key")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := provider.chatCount(); got != 0 {
+		t.Fatalf("chat count = %d", got)
+	}
+}
+
 func TestProxyForwardsResponsesRequest(t *testing.T) {
 	const requestBody = `{"model":"m","input":"hi","stream":false}`
 
@@ -610,8 +651,17 @@ func TestParseProviderConfigRequiresTuple(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsDuplicateProviderIDs(t *testing.T) {
+func TestValidateRejectsMissingAPIKey(t *testing.T) {
 	cfg := cliConfig{providers: providerList{
+		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
+	}, attempts: 1, delay: time.Minute}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("expected api key error")
+	}
+}
+
+func TestValidateRejectsDuplicateProviderIDs(t *testing.T) {
+	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
 		{ID: "same", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
 		{ID: "same", ProviderURL: "https://two.test/v1", APIKey: "key-two"},
 	}, attempts: 1, delay: time.Minute}
@@ -621,7 +671,7 @@ func TestValidateRejectsDuplicateProviderIDs(t *testing.T) {
 }
 
 func TestValidateRejectsInvalidAttempts(t *testing.T) {
-	cfg := cliConfig{providers: providerList{
+	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
 		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
 	}}
 	if err := cfg.validate(); err == nil {
@@ -630,7 +680,7 @@ func TestValidateRejectsInvalidAttempts(t *testing.T) {
 }
 
 func TestValidateRejectsNegativeDelay(t *testing.T) {
-	cfg := cliConfig{providers: providerList{
+	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
 		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
 	}, attempts: 1, delay: -time.Second}
 	if err := cfg.validate(); err == nil {
@@ -898,13 +948,13 @@ func newTestProxyWithAttempts(t *testing.T, attempts int, providers ...providerC
 func newTestProxyWithRetryConfig(t *testing.T, attempts int, delay time.Duration, providers ...providerConfig) *proxy {
 	t.Helper()
 	pool := newTestPool(t, providers...)
-	return &proxy{pool: pool, client: http.DefaultClient, logger: newTestLogger(), attempts: attempts, delay: delay}
+	return &proxy{pool: pool, client: http.DefaultClient, logger: newTestLogger(), apiKey: testProxyAPIKey, attempts: attempts, delay: delay}
 }
 
 func newTestProxyWithLogger(t *testing.T, logger *zap.Logger, providers ...providerConfig) *proxy {
 	t.Helper()
 	pool := newTestPool(t, providers...)
-	return &proxy{pool: pool, client: http.DefaultClient, logger: logger, attempts: 1}
+	return &proxy{pool: pool, client: http.DefaultClient, logger: logger, apiKey: testProxyAPIKey, attempts: 1}
 }
 
 func newTestPool(t *testing.T, providers ...providerConfig) *providerPool {
@@ -928,6 +978,7 @@ func serveChat(p *proxy, body string) *httptest.ResponseRecorder {
 func serveChatWithHeader(p *proxy, body string, headerName string, headerValue string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", authorizationHeader(testProxyAPIKey))
 	if headerName != "" {
 		req.Header.Set(headerName, headerValue)
 	}
@@ -947,6 +998,7 @@ func serveResponsesWithPath(p *proxy, path string, body string) *httptest.Respon
 func serveResponsesWithPathAndHeader(p *proxy, path string, body string, headerName string, headerValue string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", authorizationHeader(testProxyAPIKey))
 	if headerName != "" {
 		req.Header.Set(headerName, headerValue)
 	}
