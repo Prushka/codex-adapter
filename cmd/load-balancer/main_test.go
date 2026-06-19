@@ -847,7 +847,7 @@ func TestProviderPoolRefreshModelsUpdatesRouting(t *testing.T) {
 	}
 }
 
-func TestProviderPoolRefreshModelsKeepsPreviousModelsOnFailure(t *testing.T) {
+func TestProviderPoolRefreshModelsClearsModelsOnFailure(t *testing.T) {
 	provider := newMockProvider(t, []string{"a"}, "secret", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"ok"}`))
 	})
@@ -856,14 +856,13 @@ func TestProviderPoolRefreshModelsKeepsPreviousModelsOnFailure(t *testing.T) {
 
 	pool.refreshModels(context.Background(), http.DefaultClient, newTestLogger(), 50*time.Millisecond)
 
-	candidates, err := pool.candidatesForModel("a")
-	if err != nil {
-		t.Fatalf("candidatesForModel: %v", err)
-	}
-	if len(candidates) != 1 || candidates[0] != 0 {
-		t.Fatalf("candidates = %#v", candidates)
+	if _, err := pool.candidatesForModel("a"); err == nil {
+		t.Fatal("expected provider with failed model refresh to be skipped")
 	}
 	statuses := pool.providerStatuses(time.Now())
+	if got := strings.Join(statuses[0].Models, ","); got != "" {
+		t.Fatalf("status models = %s", got)
+	}
 	if len(statuses[0].RecentFailures) != 1 {
 		t.Fatalf("recent failures = %#v", statuses[0].RecentFailures)
 	}
@@ -872,6 +871,72 @@ func TestProviderPoolRefreshModelsKeepsPreviousModelsOnFailure(t *testing.T) {
 	}
 	if statuses[0].ModelRefresh.LastFailureAt == nil || statuses[0].ModelRefresh.LastError == "" {
 		t.Fatalf("model refresh status = %#v", statuses[0].ModelRefresh)
+	}
+}
+
+func TestProviderPoolStartupModelFailureSkipsUntilRefreshSucceeds(t *testing.T) {
+	var mu sync.Mutex
+	modelsFail := true
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			mu.Lock()
+			fail := modelsFail
+			mu.Unlock()
+			if fail {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(`{"error":{"message":"models unavailable"}}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]string{{"id": "restored"}},
+			})
+		case "/v1/chat/completions":
+			_, _ = w.Write([]byte(`{"id":"ok"}`))
+		default:
+			t.Fatalf("unexpected path = %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	pool, err := newProviderPool(context.Background(), []providerConfig{{
+		ID:          "p1",
+		ProviderURL: upstream.URL + "/v1",
+		APIKey:      "secret",
+	}}, upstream.Client(), newTestLogger())
+	if err != nil {
+		t.Fatalf("newProviderPool: %v", err)
+	}
+	if _, err := pool.candidatesForModel("restored"); err == nil {
+		t.Fatal("expected provider with failed startup model fetch to be skipped")
+	}
+	statuses := pool.providerStatuses(time.Now())
+	if len(statuses) != 1 || len(statuses[0].Models) != 0 {
+		t.Fatalf("startup statuses = %#v", statuses)
+	}
+	if statuses[0].ModelRefresh.LastFailureAt == nil || statuses[0].ModelRefresh.LastError == "" {
+		t.Fatalf("model refresh status = %#v", statuses[0].ModelRefresh)
+	}
+
+	mu.Lock()
+	modelsFail = false
+	mu.Unlock()
+	pool.refreshModels(context.Background(), upstream.Client(), newTestLogger(), time.Second)
+
+	candidates, err := pool.candidatesForModel("restored")
+	if err != nil {
+		t.Fatalf("candidatesForModel: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0] != 0 {
+		t.Fatalf("candidates = %#v", candidates)
+	}
+	statuses = pool.providerStatuses(time.Now())
+	if got := strings.Join(statuses[0].Models, ","); got != "restored" {
+		t.Fatalf("status models = %s", got)
+	}
+	if statuses[0].ModelRefresh.LastSuccessAt == nil || statuses[0].ModelRefresh.LastFailureAt != nil || statuses[0].ModelRefresh.LastError != "" {
+		t.Fatalf("model refresh status after recovery = %#v", statuses[0].ModelRefresh)
 	}
 }
 

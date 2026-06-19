@@ -99,7 +99,7 @@ Requests are assigned from a provider pool. For each selection pass, the proxy v
 
 Repeated request failures temporarily cool down a provider. By default, `-provider-cooldown-failures 3` consecutive Chat Completions or Responses failures put that provider into cooldown for `-provider-cooldown 1m`; set either value to `0` to disable cooldown. Providers in cooldown remain visible in `/v1/providers/status`, but request routing skips them until the cooldown expires. Model-refresh failures are reported in status but do not count toward request cooldown.
 
-Provider model lists refresh in the background every 5 minutes by default. Use `-model-refresh-interval 0` to disable refreshes, or set `-model-refresh-timeout` to control the timeout for each provider's `/models` request. A failed refresh records provider status but keeps the last known good model list.
+Provider model lists refresh in the background every 5 minutes by default. Use `-model-refresh-interval 0` to disable refreshes, or set `-model-refresh-timeout` to control the timeout for each provider's `/models` request. A failed startup fetch or refresh records provider status, clears that provider's model list, and skips the provider for model-routed traffic until a later refresh succeeds.
 
 The load balancer does not translate between API formats. Use the Chat Completions routes only with upstream providers that support Chat Completions, and use the Responses routes only with upstream providers that support Responses.
 

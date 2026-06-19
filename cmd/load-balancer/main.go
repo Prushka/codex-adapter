@@ -411,23 +411,38 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 		if err != nil {
 			return nil, fmt.Errorf("invalid provider %q models URL %q: %w", cfg.ID, cfg.ProviderURL, err)
 		}
+		now := time.Now()
 		models, err := fetchProviderModels(ctx, client, modelsURL, cfg.APIKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch models for provider %q (%s): %w", cfg.ID, modelsURL, err)
+			models = map[string]struct{}{}
 		}
-		if len(models) == 0 {
-			return nil, fmt.Errorf("provider %q (%s) returned no models", cfg.ID, modelsURL)
-		}
-		loadedAt := time.Now()
-		providers = append(providers, provider{
+		upstreamProvider := provider{
 			id:               cfg.ID,
 			chatURL:          chatURL,
 			responsesURL:     responsesURL,
 			modelsURL:        modelsURL,
 			apiKey:           cfg.APIKey,
 			models:           models,
-			lastModelRefresh: loadedAt,
-		})
+			lastModelRefresh: now,
+		}
+		if err != nil {
+			upstreamProvider.lastModelRefresh = time.Time{}
+			upstreamProvider.lastModelRefreshFailure = now
+			upstreamProvider.lastModelRefreshError = err.Error()
+			upstreamProvider.lastFailure = now
+			upstreamProvider.recentFailures = []providerFailure{{
+				at:       now,
+				endpoint: "models",
+				err:      err.Error(),
+			}}
+			logger.Warn("failed to load provider models; provider will be skipped until refresh succeeds",
+				zap.Int("provider_index", i),
+				zap.String("provider_id", cfg.ID),
+				zap.String("models_url", modelsURL),
+				zap.Error(err),
+			)
+		}
+		providers = append(providers, upstreamProvider)
 		for model := range models {
 			modelProviders[model] = append(modelProviders[model], i)
 		}
@@ -592,11 +607,13 @@ func (p *providerPool) refreshModels(ctx context.Context, client *http.Client, l
 		cancel()
 		now := time.Now()
 		if err != nil {
-			p.recordProviderFailureAt(target.index, "models", 0, err, now, false)
+			oldModels, changed, ok := p.markProviderModelsUnavailable(target.index, err, now)
 			logger.Warn("failed to refresh provider models",
 				zap.Int("provider_index", target.index),
 				zap.String("provider_id", target.id),
 				zap.String("models_url", target.modelsURL),
+				zap.Bool("models_cleared", ok && changed),
+				zap.Strings("previous_model_ids", oldModels),
 				zap.Error(err),
 			)
 			continue
@@ -620,6 +637,35 @@ func (p *providerPool) refreshModels(ctx context.Context, client *http.Client, l
 			logger.Debug("provider models unchanged", fields...)
 		}
 	}
+}
+
+func (p *providerPool) markProviderModelsUnavailable(index int, err error, failedAt time.Time) ([]string, bool, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if index < 0 || index >= len(p.providers) {
+		return nil, false, false
+	}
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	oldModels := sortedModelIDs(p.providers[index].models)
+	provider := &p.providers[index]
+	provider.models = map[string]struct{}{}
+	provider.lastFailure = failedAt
+	provider.lastModelRefreshFailure = failedAt
+	provider.lastModelRefreshError = message
+	provider.recentFailures = append(provider.recentFailures, providerFailure{
+		at:       failedAt,
+		endpoint: "models",
+		err:      message,
+	})
+	if len(provider.recentFailures) > maxRecentProviderFailures {
+		copy(provider.recentFailures, provider.recentFailures[len(provider.recentFailures)-maxRecentProviderFailures:])
+		provider.recentFailures = provider.recentFailures[:maxRecentProviderFailures]
+	}
+	p.rebuildModelProvidersLocked()
+	return oldModels, len(oldModels) > 0, true
 }
 
 func (p *providerPool) modelRefreshTargets() []providerModelRefreshTarget {
