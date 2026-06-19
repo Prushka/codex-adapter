@@ -249,7 +249,7 @@ func TestProxyOnlyUsesProvidersWithRequestedModel(t *testing.T) {
 	}
 }
 
-func TestProxyModelRoutingUsesGlobalProviderOrder(t *testing.T) {
+func TestProxyModelRoutingUsesCandidateOrder(t *testing.T) {
 	const requestBody = `{"model":"b","stream":false}`
 
 	first := newMockProvider(t, []string{"a"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
@@ -266,6 +266,20 @@ func TestProxyModelRoutingUsesGlobalProviderOrder(t *testing.T) {
 	defer third.Close()
 
 	proxy := newTestProxy(t, first.providerConfig(), second.providerConfig(), third.providerConfig())
+	var orderMu sync.Mutex
+	orderCalls := 0
+	proxy.pool.candidateOrder = func(candidates []int) []int {
+		if got := fmt.Sprint(candidates); got != "[1 2]" {
+			t.Fatalf("candidates = %s", got)
+		}
+		orderMu.Lock()
+		defer orderMu.Unlock()
+		orderCalls++
+		if orderCalls%2 == 0 {
+			return []int{2, 1}
+		}
+		return []int{1, 2}
+	}
 	for i := 0; i < 4; i++ {
 		rec := serveChat(proxy, requestBody)
 		if rec.Code != http.StatusOK {
@@ -528,6 +542,45 @@ func TestProviderPoolLoadsModels(t *testing.T) {
 	}
 	if got := provider.joinModelAuthorizations(); got != "Bearer secret" {
 		t.Fatalf("model authorizations = %q", got)
+	}
+}
+
+func TestProxyUsesShuffledProviderOrder(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	first := newMockProvider(t, []string{"m"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("first provider should not receive chat request")
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"m"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("second provider should not receive chat request")
+	})
+	defer second.Close()
+	third := newMockProvider(t, []string{"m"}, "key-3", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"three"}`))
+	})
+	defer third.Close()
+
+	proxy := newTestProxy(t, first.providerConfig(), second.providerConfig(), third.providerConfig())
+	proxy.pool.candidateOrder = func(candidates []int) []int {
+		if got := fmt.Sprint(candidates); got != "[0 1 2]" {
+			t.Fatalf("candidates = %s", got)
+		}
+		return []int{2, 0, 1}
+	}
+
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := third.chatCount(); got != 1 {
+		t.Fatalf("third chat count = %d", got)
+	}
+	if got := first.chatCount(); got != 0 {
+		t.Fatalf("first chat count = %d", got)
+	}
+	if got := second.chatCount(); got != 0 {
+		t.Fatalf("second chat count = %d", got)
 	}
 }
 
@@ -860,7 +913,12 @@ func newTestPool(t *testing.T, providers ...providerConfig) *providerPool {
 	if err != nil {
 		t.Fatalf("newProviderPool: %v", err)
 	}
+	pool.candidateOrder = stableCandidateOrder
 	return pool
+}
+
+func stableCandidateOrder(candidates []int) []int {
+	return append([]int(nil), candidates...)
 }
 
 func serveChat(p *proxy, body string) *httptest.ResponseRecorder {

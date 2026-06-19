@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -222,7 +223,7 @@ type providerPool struct {
 	mu             sync.Mutex
 	providers      []provider
 	modelProviders map[string][]int
-	current        int
+	candidateOrder func([]int) []int
 }
 
 func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Client, logger *zap.Logger) (*providerPool, error) {
@@ -279,6 +280,7 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 	return &providerPool{
 		providers:      providers,
 		modelProviders: modelProviders,
+		candidateOrder: randomCandidateOrder,
 	}, nil
 }
 
@@ -312,51 +314,48 @@ func sortedModelIDs(models map[string]struct{}) []string {
 	return modelIDs
 }
 
-func (p *providerPool) acquire(candidates []int, tried map[int]struct{}) (int, bool, func(), error) {
+func (p *providerPool) acquire(orderedCandidates []int, tried map[int]struct{}) (int, bool, func(), error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(candidates) == 0 {
+	if len(orderedCandidates) == 0 {
 		return 0, false, nil, errors.New("no provider candidates")
 	}
 
-	ordered := rotateCandidates(candidates, p.current)
-	for _, providerIndex := range ordered {
+	for _, providerIndex := range orderedCandidates {
 		if _, ok := tried[providerIndex]; ok {
 			continue
 		}
 		if p.providers[providerIndex].busy == 0 {
 			p.providers[providerIndex].busy++
-			p.current = nextProviderPosition(len(p.providers), providerIndex)
 			return providerIndex, false, p.releaseFunc(providerIndex), nil
 		}
 	}
 
-	for _, providerIndex := range candidates {
+	for _, providerIndex := range orderedCandidates {
 		if _, ok := tried[providerIndex]; ok {
 			continue
 		}
 		p.providers[providerIndex].busy++
-		p.current = nextProviderPosition(len(p.providers), providerIndex)
 		return providerIndex, true, p.releaseFunc(providerIndex), nil
 	}
 
 	return 0, false, nil, errors.New("no untried provider candidates")
 }
 
-func rotateCandidates(candidates []int, current int) []int {
-	if len(candidates) < 2 {
+func (p *providerPool) orderedCandidates(candidates []int) []int {
+	if p.candidateOrder == nil {
 		return append([]int(nil), candidates...)
 	}
-	start := 0
-	for i, candidate := range candidates {
-		if candidate >= current {
-			start = i
-			break
-		}
+	return p.candidateOrder(candidates)
+}
+
+func randomCandidateOrder(candidates []int) []int {
+	ordered := append([]int(nil), candidates...)
+	if len(ordered) > 1 {
+		rand.Shuffle(len(ordered), func(i, j int) {
+			ordered[i], ordered[j] = ordered[j], ordered[i]
+		})
 	}
-	ordered := make([]int, 0, len(candidates))
-	ordered = append(ordered, candidates[start:]...)
-	ordered = append(ordered, candidates[:start]...)
 	return ordered
 }
 
@@ -371,13 +370,6 @@ func (p *providerPool) releaseFunc(index int) func() {
 			}
 		})
 	}
-}
-
-func nextProviderPosition(providerCount int, providerIndex int) int {
-	if providerCount <= 0 {
-		return 0
-	}
-	return (providerIndex + 1) % providerCount
 }
 
 func requestedModel(body []byte) (string, error) {
@@ -537,9 +529,10 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 				return
 			}
 		}
-		tried := make(map[int]struct{}, len(candidates))
-		for passAttempt := 0; passAttempt < len(candidates); passAttempt++ {
-			providerIndex, busyFallback, release, err := p.pool.acquire(candidates, tried)
+		orderedCandidates := p.pool.orderedCandidates(candidates)
+		tried := make(map[int]struct{}, len(orderedCandidates))
+		for passAttempt := 0; passAttempt < len(orderedCandidates); passAttempt++ {
+			providerIndex, busyFallback, release, err := p.pool.acquire(orderedCandidates, tried)
 			if err != nil {
 				break
 			}
