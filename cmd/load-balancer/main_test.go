@@ -375,6 +375,95 @@ func TestProxyRejectsWrongAPIKey(t *testing.T) {
 	}
 }
 
+func TestProxyListsAllModels(t *testing.T) {
+	first := newMockProvider(t, []string{"z-model", "a-model"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("models request should not be forwarded as chat")
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"a-model", "b-model"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("models request should not be forwarded as chat")
+	})
+	defer second.Close()
+
+	proxy := newTestProxy(t, first.providerConfig(), second.providerConfig())
+	rec := serveModelPath(proxy, "/v1/models", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	var got modelListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if got.Object != "list" {
+		t.Fatalf("object = %q", got.Object)
+	}
+	if len(got.Data) != 3 {
+		t.Fatalf("data = %#v", got.Data)
+	}
+	var ids []string
+	for _, model := range got.Data {
+		ids = append(ids, model.ID)
+		if model.Object != "model" || model.OwnedBy != "load-balancer" || model.Created == 0 {
+			t.Fatalf("bad model item = %#v", model)
+		}
+	}
+	if strings.Join(ids, ",") != "a-model,b-model,z-model" {
+		t.Fatalf("model ids = %v", ids)
+	}
+}
+
+func TestProxyListsProviderModelMap(t *testing.T) {
+	first := newMockProvider(t, []string{"z-model", "a-model"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("models map request should not be forwarded as chat")
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"b-model"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("models map request should not be forwarded as chat")
+	})
+	defer second.Close()
+
+	firstCfg := first.providerConfig()
+	firstCfg.ID = "p1"
+	secondCfg := second.providerConfig()
+	secondCfg.ID = "p2"
+	proxy := newTestProxy(t, firstCfg, secondCfg)
+	rec := serveModelPath(proxy, "/v1/models/map", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	var got map[string][]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("map = %#v", got)
+	}
+	if strings.Join(got["p1"], ",") != "a-model,z-model" {
+		t.Fatalf("p1 models = %#v", got["p1"])
+	}
+	if strings.Join(got["p2"], ",") != "b-model" {
+		t.Fatalf("p2 models = %#v", got["p2"])
+	}
+}
+
+func TestProxyRejectsUnauthorizedModelList(t *testing.T) {
+	provider := newMockProvider(t, []string{"m"}, "provider-key", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unauthorized model list should not be forwarded")
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveModelPath(proxy, "/v1/models", false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_api_key") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
 func TestProxyForwardsResponsesRequest(t *testing.T) {
 	const requestBody = `{"model":"m","input":"hi","stream":false}`
 
@@ -1001,6 +1090,16 @@ func serveResponsesWithPathAndHeader(p *proxy, path string, body string, headerN
 	req.Header.Set("Authorization", authorizationHeader(testProxyAPIKey))
 	if headerName != "" {
 		req.Header.Set(headerName, headerValue)
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	return rec
+}
+
+func serveModelPath(p *proxy, path string, authorized bool) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if authorized {
+		req.Header.Set("Authorization", authorizationHeader(testProxyAPIKey))
 	}
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)

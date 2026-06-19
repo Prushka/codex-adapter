@@ -239,6 +239,18 @@ type providerPool struct {
 	candidateOrder func([]int) []int
 }
 
+type modelListResponse struct {
+	Object string          `json:"object"`
+	Data   []modelListItem `json:"data"`
+}
+
+type modelListItem struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	OwnedBy string `json:"owned_by"`
+}
+
 func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Client, logger *zap.Logger) (*providerPool, error) {
 	if len(cfgs) == 0 {
 		return nil, errors.New("at least one upstream provider is required")
@@ -316,6 +328,27 @@ func (p *providerPool) candidatesForModel(model string) ([]int, error) {
 		return nil, fmt.Errorf("model %q is not available on any configured provider", model)
 	}
 	return candidates, nil
+}
+
+func (p *providerPool) allModels() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	models := make([]string, 0, len(p.modelProviders))
+	for model := range p.modelProviders {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	return models
+}
+
+func (p *providerPool) providerModelMap() map[string][]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string][]string, len(p.providers))
+	for _, provider := range p.providers {
+		out[provider.id] = sortedModelIDs(provider.models)
+	}
+	return out
 }
 
 func sortedModelIDs(models map[string]struct{}) []string {
@@ -449,6 +482,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/healthz":
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
+	case "/models", "/v1/models":
+		p.handleModels(w, r)
+	case "/models/map", "/v1/models/map":
+		p.handleModelMap(w, r)
 	case "/chat/completions", "/v1/chat/completions":
 		p.handleAPIRequest(w, r, endpointChatCompletions)
 	case "/responses", "/v1/responses":
@@ -456,6 +493,56 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (p *proxy) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !p.authorizeDownstream(w, r, "models") {
+		return
+	}
+
+	models := p.pool.allModels()
+	data := make([]modelListItem, 0, len(models))
+	now := time.Now().Unix()
+	for _, model := range models {
+		data = append(data, modelListItem{
+			ID:      model,
+			Object:  "model",
+			Created: now,
+			OwnedBy: "load-balancer",
+		})
+	}
+	writeJSON(w, modelListResponse{
+		Object: "list",
+		Data:   data,
+	})
+}
+
+func (p *proxy) handleModelMap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !p.authorizeDownstream(w, r, "models map") {
+		return
+	}
+	writeJSON(w, p.pool.providerModelMap())
+}
+
+func (p *proxy) authorizeDownstream(w http.ResponseWriter, r *http.Request, api string) bool {
+	if validAuthorization(r.Header.Get("Authorization"), p.apiKey) {
+		return true
+	}
+	p.logger.Warn("unauthorized downstream request",
+		zap.String("api", api),
+		zap.String("path", r.URL.Path),
+	)
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	writeJSONError(w, http.StatusUnauthorized, "invalid_api_key", "invalid or missing API key")
+	return false
 }
 
 type upstreamEndpoint string
@@ -479,13 +566,7 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !validAuthorization(r.Header.Get("Authorization"), p.apiKey) {
-		p.logger.Warn("unauthorized downstream request",
-			zap.String("api", string(endpoint)),
-			zap.String("path", r.URL.Path),
-		)
-		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeJSONError(w, http.StatusUnauthorized, "invalid_api_key", "invalid or missing API key")
+	if !p.authorizeDownstream(w, r, string(endpoint)) {
 		return
 	}
 	requestStarted := time.Now()
@@ -765,6 +846,11 @@ func writeJSONError(w http.ResponseWriter, status int, code string, message stri
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = fmt.Fprintf(w, `{"error":{"type":"server_error","code":%q,"message":%q}}`, code, message)
+}
+
+func writeJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func normalizeChatCompletionsURL(raw string) (string, error) {
