@@ -26,10 +26,10 @@ const (
 	defaultAttempts             = 5
 	defaultAttemptDelay         = time.Minute
 	defaultTimeout              = 30 * time.Minute
-	defaultModelRefreshInterval = 5 * time.Minute
+	defaultModelRefreshInterval = 30 * time.Minute
 	defaultModelRefreshTimeout  = 30 * time.Second
 	defaultProviderCooldown     = time.Minute
-	defaultCooldownFailures     = 3
+	defaultCooldownFailures     = 5
 	maxRecentProviderFailures   = 10
 )
 
