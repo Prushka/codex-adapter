@@ -904,7 +904,7 @@ func TestProviderPoolStartupModelFailureSkipsUntilRefreshSucceeds(t *testing.T) 
 		ID:          "p1",
 		ProviderURL: upstream.URL + "/v1",
 		APIKey:      "secret",
-	}}, upstream.Client(), newTestLogger())
+	}}, upstream.Client(), newTestLogger(), time.Second)
 	if err != nil {
 		t.Fatalf("newProviderPool: %v", err)
 	}
@@ -937,6 +937,46 @@ func TestProviderPoolStartupModelFailureSkipsUntilRefreshSucceeds(t *testing.T) 
 	}
 	if statuses[0].ModelRefresh.LastSuccessAt == nil || statuses[0].ModelRefresh.LastFailureAt != nil || statuses[0].ModelRefresh.LastError != "" {
 		t.Fatalf("model refresh status after recovery = %#v", statuses[0].ModelRefresh)
+	}
+}
+
+func TestProviderPoolStartupModelFetchUsesRefreshTimeout(t *testing.T) {
+	modelsRelease := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			<-modelsRelease
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]string{{"id": "late"}},
+			})
+		default:
+			t.Fatalf("unexpected path = %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+	defer close(modelsRelease)
+
+	client := upstream.Client()
+	client.Timeout = time.Second
+	start := time.Now()
+	pool, err := newProviderPool(context.Background(), []providerConfig{{
+		ID:          "p1",
+		ProviderURL: upstream.URL + "/v1",
+		APIKey:      "secret",
+	}}, client, newTestLogger(), 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("newProviderPool: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
+		t.Fatalf("startup model fetch did not use short timeout, elapsed = %s", elapsed)
+	}
+	if _, err := pool.candidatesForModel("late"); err == nil {
+		t.Fatal("expected timed-out provider to have empty model list")
+	}
+	statuses := pool.providerStatuses(time.Now())
+	if len(statuses) != 1 || statuses[0].ModelRefresh.LastFailureAt == nil || statuses[0].ModelRefresh.LastError == "" {
+		t.Fatalf("statuses = %#v", statuses)
 	}
 }
 
@@ -1387,7 +1427,7 @@ func newTestProxyWithLogger(t *testing.T, logger *zap.Logger, providers ...provi
 
 func newTestPool(t *testing.T, providers ...providerConfig) *providerPool {
 	t.Helper()
-	pool, err := newProviderPool(context.Background(), providers, http.DefaultClient, newTestLogger())
+	pool, err := newProviderPool(context.Background(), providers, http.DefaultClient, newTestLogger(), time.Second)
 	if err != nil {
 		t.Fatalf("newProviderPool: %v", err)
 	}

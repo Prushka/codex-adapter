@@ -239,7 +239,11 @@ func newProxy(cfg proxyConfig) (*proxy, error) {
 	if attempts < 1 {
 		attempts = defaultAttempts
 	}
-	pool, err := newProviderPool(context.Background(), cfg.Providers, client, logger)
+	modelFetchTimeout := cfg.ModelRefreshTimeout
+	if modelFetchTimeout < 0 {
+		modelFetchTimeout = defaultModelRefreshTimeout
+	}
+	pool, err := newProviderPool(context.Background(), cfg.Providers, client, logger, modelFetchTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -253,15 +257,11 @@ func newProxy(cfg proxyConfig) (*proxy, error) {
 		delay:    cfg.Delay,
 	}
 	if cfg.ModelRefreshInterval > 0 {
-		refreshTimeout := cfg.ModelRefreshTimeout
-		if refreshTimeout < 0 {
-			refreshTimeout = defaultModelRefreshTimeout
-		}
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		pr.refreshCancel = cancel
 		pr.refreshDone = done
-		go pr.refreshModelsLoop(ctx, cfg.ModelRefreshInterval, refreshTimeout, done)
+		go pr.refreshModelsLoop(ctx, cfg.ModelRefreshInterval, modelFetchTimeout, done)
 	}
 	return pr, nil
 }
@@ -388,7 +388,7 @@ type modelListItem struct {
 	OwnedBy string `json:"owned_by"`
 }
 
-func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Client, logger *zap.Logger) (*providerPool, error) {
+func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Client, logger *zap.Logger, modelFetchTimeout time.Duration) (*providerPool, error) {
 	if len(cfgs) == 0 {
 		return nil, errors.New("at least one upstream provider is required")
 	}
@@ -411,8 +411,14 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 		if err != nil {
 			return nil, fmt.Errorf("invalid provider %q models URL %q: %w", cfg.ID, cfg.ProviderURL, err)
 		}
+		fetchCtx := ctx
+		cancel := func() {}
+		if modelFetchTimeout > 0 {
+			fetchCtx, cancel = context.WithTimeout(ctx, modelFetchTimeout)
+		}
+		models, err := fetchProviderModels(fetchCtx, client, modelsURL, cfg.APIKey)
+		cancel()
 		now := time.Now()
-		models, err := fetchProviderModels(ctx, client, modelsURL, cfg.APIKey)
 		if err != nil {
 			models = map[string]struct{}{}
 		}
