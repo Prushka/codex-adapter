@@ -93,13 +93,13 @@ Set `-disable-upstream-streaming` to make `/responses` buffer the upstream Chat 
 
 ## Chat Completions and Responses Load Balancer
 
-`cmd/load-balancer` is a small pass-through load balancer for OpenAI-compatible Chat Completions and Responses create requests. It forwards `POST /chat/completions`, `POST /v1/chat/completions`, `POST /responses`, and `POST /v1/responses` request bodies and headers to configured upstream providers, overriding only `Authorization`. It also serves `GET /models` and `GET /v1/models` as an OpenAI-compatible union of all configured provider models, plus `GET /models/map` and `GET /v1/models/map` as a provider-to-models mapping. `GET /providers`, `GET /v1/providers`, `GET /providers/status`, and `GET /v1/providers/status` return provider status snapshots with provider IDs, advertised models, busy counts, recent failures, last successful request time, cooldown state, and model-refresh state. On startup it fetches each provider's `/models` list and only forwards a request to providers that advertise the requested `model`. If no configured provider supports the model, the proxy returns a JSON `model_not_available` error.
+`cmd/load-balancer` is a small pass-through load balancer for OpenAI-compatible Chat Completions and Responses create requests. It forwards `POST /chat/completions`, `POST /v1/chat/completions`, `POST /responses`, and `POST /v1/responses` request bodies and headers to configured upstream providers, overriding only `Authorization`. It also serves `GET /models` and `GET /v1/models` as an OpenAI-compatible union of all configured provider models, plus `GET /models/map` and `GET /v1/models/map` as a provider-to-models mapping. `GET /providers`, `GET /v1/providers`, `GET /providers/status`, and `GET /v1/providers/status` return provider status snapshots with provider IDs, advertised models, busy counts, recent failures, last successful request time, cooldown state, and model-refresh state. `POST /refresh` and `POST /v1/refresh` reload the provider config and refresh model lists immediately. On startup it fetches each provider's `/models` list and only forwards a request to providers that advertise the requested `model`. If no configured provider supports the model, the proxy returns a JSON `model_not_available` error.
 
 Requests are assigned from a provider pool. For each selection pass, the proxy visits matching providers in random order. If the next matching provider is already processing a request, the proxy uses the next idle matching provider in that randomized order. If every matching provider is busy, it sends to the next matching provider from the same randomized order. If an upstream attempt fails with a request error or non-2xx HTTP response, the same request body is retried against the next untried matching provider. By default, `-attempts 5` repeats the full matching provider pool up to five times, with `-delay 1m` between full-pool attempts. The first attempt has no delay. If every configured attempt returns an HTTP failure, the last upstream error response is returned unchanged.
 
 Repeated request failures temporarily cool down a provider. By default, `-provider-cooldown-failures 3` consecutive Chat Completions or Responses failures put that provider into cooldown for `-provider-cooldown 1m`; set either value to `0` to disable cooldown. Providers in cooldown remain visible in `/v1/providers/status`, but request routing skips them until the cooldown expires. Model-refresh failures are reported in status but do not count toward request cooldown.
 
-Provider model lists refresh in the background every 5 minutes by default. Use `-model-refresh-interval 0` to disable refreshes, or set `-model-refresh-timeout` to control the timeout for each provider's `/models` request. A failed startup fetch or refresh records provider status, clears that provider's model list, and skips the provider for model-routed traffic until a later refresh succeeds.
+Provider model lists refresh in the background every 30 minutes by default. Before each model refresh, the proxy rereads the YAML provider config so providers can be added, removed, or updated without restarting. Use `-model-refresh-interval 0` to disable background refreshes, `-model-refresh-timeout` to control the timeout for each provider's `/models` request, or call `POST /refresh` to refresh immediately. A failed startup fetch or refresh records provider status, clears that provider's model list, and skips the provider for model-routed traffic until a later refresh succeeds.
 
 The load balancer does not translate between API formats. Use the Chat Completions routes only with upstream providers that support Chat Completions, and use the Responses routes only with upstream providers that support Responses.
 
@@ -107,13 +107,24 @@ The load balancer does not translate between API formats. Use the Chat Completio
 go run ./cmd/load-balancer \
   -listen 127.0.0.1:18081 \
   -api-key sk-load-balancer \
-  -provider p1,https://provider-one.example.com/v1,sk-provider-one \
-  -provider p2,https://provider-two.example.com/v1,sk-provider-two
+  -config ./config.yaml
 ```
 
-The load balancer requires `-api-key`. Downstream clients must send it as `Authorization: Bearer <key>`. This key is checked only by the load balancer and is never sent upstream; upstream requests always use the per-provider key from the selected `-provider` tuple.
+The load balancer requires `-api-key`. Downstream clients must send it as `Authorization: Bearer <key>`. This key is checked only by the load balancer and is never sent upstream; upstream requests always use the per-provider key from the selected provider config entry.
 
-Each `-provider` value is `id,url,key`. The `id` is only for logs and error messages, but it must be unique. The `url` may be a base URL, a `/v1` URL, or a direct `/chat/completions`, `/responses`, or `/models` URL. Direct endpoint URLs are treated as siblings, so `https://provider.example/v1/responses` also implies `https://provider.example/v1/chat/completions` and `https://provider.example/v1/models`.
+The provider config is YAML:
+
+```yaml
+providers:
+  - id: p1
+    url: https://provider-one.example.com/v1
+    key: sk-provider-one
+  - id: p2
+    url: https://provider-two.example.com/v1
+    key: sk-provider-two
+```
+
+Each `id` is only for logs and error messages, but it must be unique. The `url` may be a base URL, a `/v1` URL, or a direct `/chat/completions`, `/responses`, or `/models` URL. Direct endpoint URLs are treated as siblings, so `https://provider.example/v1/responses` also implies `https://provider.example/v1/chat/completions` and `https://provider.example/v1/models`. `config.yaml` is ignored by git because it usually contains provider keys; use `config.example.yaml` as a template.
 
 ## Local Web Search
 

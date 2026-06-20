@@ -1,0 +1,7 @@
+providers:
+  - id: p1
+    url: https://provider-one.example.com/v1
+    key: sk-provider-one
+  - id: p2
+    url: https://provider-two.example.com/v1
+    key: sk-provider-two

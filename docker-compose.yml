@@ -4,9 +4,13 @@ services:
     restart: unless-stopped
     ports:
       - "18081:18081"
+    volumes:
+      - ./config.yaml:/etc/load-balancer/config.yaml:ro
     command:
       - -listen
       - 0.0.0.0:18081
+      - -config
+      - /etc/load-balancer/config.yaml
       - -api-key
       - sk-load-balancer
       - -attempts
@@ -15,10 +19,6 @@ services:
       - 1m
       - -timeout
       - 30m
-      - -provider
-      - p1,https://provider-one.example.com/v1,sk-provider-one
-      - -provider
-      - p2,https://provider-two.example.com/v1,sk-provider-two
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:18081/healthz"]
       interval: 30s

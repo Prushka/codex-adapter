@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -270,17 +272,17 @@ func TestProxyModelRoutingUsesCandidateOrder(t *testing.T) {
 	proxy := newTestProxy(t, first.providerConfig(), second.providerConfig(), third.providerConfig())
 	var orderMu sync.Mutex
 	orderCalls := 0
-	proxy.pool.candidateOrder = func(candidates []int) []int {
-		if got := fmt.Sprint(candidates); got != "[1 2]" {
+	proxy.pool.candidateOrder = func(candidates []providerRef) []providerRef {
+		if got := fmt.Sprint(candidates); got != "[key-2 key-3]" {
 			t.Fatalf("candidates = %s", got)
 		}
 		orderMu.Lock()
 		defer orderMu.Unlock()
 		orderCalls++
 		if orderCalls%2 == 0 {
-			return []int{2, 1}
+			return []providerRef{candidates[1], candidates[0]}
 		}
-		return []int{1, 2}
+		return append([]providerRef(nil), candidates...)
 	}
 	for i := 0; i < 4; i++ {
 		rec := serveChat(proxy, requestBody)
@@ -807,7 +809,7 @@ func TestProviderPoolLoadsModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("candidatesForModel: %v", err)
 	}
-	if len(candidates) != 1 || candidates[0] != 0 {
+	if len(candidates) != 1 || candidates[0].id != "secret" {
 		t.Fatalf("candidates = %#v", candidates)
 	}
 	if got := provider.joinModelAuthorizations(); got != "Bearer secret" {
@@ -832,7 +834,7 @@ func TestProviderPoolRefreshModelsUpdatesRouting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("candidatesForModel: %v", err)
 	}
-	if len(candidates) != 1 || candidates[0] != 0 {
+	if len(candidates) != 1 || candidates[0].id != "secret" {
 		t.Fatalf("candidates = %#v", candidates)
 	}
 	statuses := pool.providerStatuses(time.Now())
@@ -928,7 +930,7 @@ func TestProviderPoolStartupModelFailureSkipsUntilRefreshSucceeds(t *testing.T) 
 	if err != nil {
 		t.Fatalf("candidatesForModel: %v", err)
 	}
-	if len(candidates) != 1 || candidates[0] != 0 {
+	if len(candidates) != 1 || candidates[0].id != "p1" {
 		t.Fatalf("candidates = %#v", candidates)
 	}
 	statuses = pool.providerStatuses(time.Now())
@@ -1009,6 +1011,110 @@ func TestProxyRefreshesProviderModelsInBackground(t *testing.T) {
 	}
 }
 
+func TestProxyManualRefreshReloadsProviderConfig(t *testing.T) {
+	first := newMockProvider(t, []string{"a"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"first"}`))
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"b"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"second"}`))
+	})
+	defer second.Close()
+
+	firstCfg := first.providerConfig()
+	firstCfg.ID = "first"
+	secondCfg := second.providerConfig()
+	secondCfg.ID = "second"
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeProviderConfigFile(t, configPath, firstCfg)
+
+	proxy, err := newProxy(proxyConfig{
+		ProviderConfigPath:   configPath,
+		Client:               http.DefaultClient,
+		Logger:               newTestLogger(),
+		APIKey:               testProxyAPIKey,
+		Attempts:             1,
+		ModelRefreshInterval: 0,
+		ModelRefreshTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	proxy.pool.candidateOrder = stableCandidateOrder
+
+	rec := serveChat(proxy, `{"model":"a","stream":false}`)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"id":"first"}` {
+		t.Fatalf("first request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	writeProviderConfigFile(t, configPath, secondCfg)
+	refresh := serveRefresh(proxy, true)
+	if refresh.Code != http.StatusOK {
+		t.Fatalf("refresh status = %d body = %s", refresh.Code, refresh.Body.String())
+	}
+	var refreshResp providerRefreshResponse
+	if err := json.Unmarshal(refresh.Body.Bytes(), &refreshResp); err != nil {
+		t.Fatalf("unmarshal refresh response: %v", err)
+	}
+	if !refreshResp.Refreshed || strings.Join(refreshResp.Summary.Added, ",") != "second" || strings.Join(refreshResp.Summary.Removed, ",") != "first" {
+		t.Fatalf("refresh response = %#v", refreshResp)
+	}
+
+	status := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if len(status.Data) != 1 || status.Data[0].ID != "second" || strings.Join(status.Data[0].Models, ",") != "b" {
+		t.Fatalf("provider status = %#v", status.Data)
+	}
+	rec = serveChat(proxy, `{"model":"b","stream":false}`)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"id":"second"}` {
+		t.Fatalf("second request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	rec = serveChat(proxy, `{"model":"a","stream":false}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_not_available") {
+		t.Fatalf("old model status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProxyBackgroundRefreshReloadsProviderConfig(t *testing.T) {
+	first := newMockProvider(t, []string{"a"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("first provider should be removed before model b request")
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"b"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"second"}`))
+	})
+	defer second.Close()
+
+	firstCfg := first.providerConfig()
+	firstCfg.ID = "first"
+	secondCfg := second.providerConfig()
+	secondCfg.ID = "second"
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeProviderConfigFile(t, configPath, firstCfg)
+
+	proxy, err := newProxy(proxyConfig{
+		ProviderConfigPath:   configPath,
+		Client:               http.DefaultClient,
+		Logger:               newTestLogger(),
+		APIKey:               testProxyAPIKey,
+		Attempts:             1,
+		ModelRefreshInterval: 10 * time.Millisecond,
+		ModelRefreshTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	defer proxy.Close()
+	proxy.pool.candidateOrder = stableCandidateOrder
+
+	writeProviderConfigFile(t, configPath, secondCfg)
+	waitForModel(t, proxy, "b")
+
+	rec := serveChat(proxy, `{"model":"b","stream":false}`)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"id":"second"}` {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestProxyUsesShuffledProviderOrder(t *testing.T) {
 	const requestBody = `{"model":"m","stream":false}`
 
@@ -1026,11 +1132,11 @@ func TestProxyUsesShuffledProviderOrder(t *testing.T) {
 	defer third.Close()
 
 	proxy := newTestProxy(t, first.providerConfig(), second.providerConfig(), third.providerConfig())
-	proxy.pool.candidateOrder = func(candidates []int) []int {
-		if got := fmt.Sprint(candidates); got != "[0 1 2]" {
+	proxy.pool.candidateOrder = func(candidates []providerRef) []providerRef {
+		if got := fmt.Sprint(candidates); got != "[key-1 key-2 key-3]" {
 			t.Fatalf("candidates = %s", got)
 		}
-		return []int{2, 0, 1}
+		return []providerRef{candidates[2], candidates[0], candidates[1]}
 	}
 
 	rec := serveChat(proxy, requestBody)
@@ -1048,100 +1154,101 @@ func TestProxyUsesShuffledProviderOrder(t *testing.T) {
 	}
 }
 
-func TestParseProviderConfig(t *testing.T) {
-	cfg, err := parseProviderConfig("p1,https://example.test/v1,sk-key")
+func TestLoadProviderConfigFileParsesObjectProviders(t *testing.T) {
+	path := writeTempProviderConfig(t, `
+providers:
+  - id: p1
+    url: https://one.test/v1
+    key: key-one
+  - id: p2
+    url: https://two.test/v1
+    key: key-two
+`)
+	cfgs, err := loadProviderConfigFile(path)
 	if err != nil {
-		t.Fatalf("parseProviderConfig: %v", err)
+		t.Fatalf("loadProviderConfigFile: %v", err)
 	}
-	if cfg.ID != "p1" || cfg.ProviderURL != "https://example.test/v1" || cfg.APIKey != "sk-key" {
-		t.Fatalf("provider = %#v", cfg)
+	if len(cfgs) != 2 {
+		t.Fatalf("providers = %#v", cfgs)
+	}
+	if cfgs[0].ID != "p1" || cfgs[0].ProviderURL != "https://one.test/v1" || cfgs[0].APIKey != "key-one" {
+		t.Fatalf("first provider = %#v", cfgs[0])
+	}
+	if cfgs[1].ID != "p2" || cfgs[1].ProviderURL != "https://two.test/v1" || cfgs[1].APIKey != "key-two" {
+		t.Fatalf("second provider = %#v", cfgs[1])
 	}
 }
 
-func TestParseProviderConfigAllowsCommaInKey(t *testing.T) {
-	cfg, err := parseProviderConfig("p1,https://example.test/v1,Bearer key,with,commas")
-	if err != nil {
-		t.Fatalf("parseProviderConfig: %v", err)
-	}
-	if cfg.APIKey != "Bearer key,with,commas" {
-		t.Fatalf("key = %q", cfg.APIKey)
+func TestLoadProviderConfigFileRejectsLegacyTupleProviders(t *testing.T) {
+	path := writeTempProviderConfig(t, `
+providers:
+  - p1,https://one.test/v1,key-one
+`)
+	if _, err := loadProviderConfigFile(path); err == nil {
+		t.Fatal("expected legacy tuple config error")
 	}
 }
 
-func TestParseProviderConfigRequiresTuple(t *testing.T) {
-	if _, err := parseProviderConfig("p1,https://example.test/v1"); err == nil {
-		t.Fatal("expected tuple error")
+func TestValidateProviderConfigsRejectsDuplicateProviderIDs(t *testing.T) {
+	if err := validateProviderConfigs([]providerConfig{
+		{ID: "same", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
+		{ID: "same", ProviderURL: "https://two.test/v1", APIKey: "key-two"},
+	}); err == nil {
+		t.Fatal("expected duplicate provider id error")
 	}
 }
 
 func TestValidateRejectsMissingAPIKey(t *testing.T) {
-	cfg := cliConfig{providers: providerList{
-		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
-	}, attempts: 1, delay: time.Minute}
+	cfg := cliConfig{configPath: "config.yaml", attempts: 1, delay: time.Minute}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected api key error")
 	}
 }
 
-func TestValidateRejectsDuplicateProviderIDs(t *testing.T) {
-	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
-		{ID: "same", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
-		{ID: "same", ProviderURL: "https://two.test/v1", APIKey: "key-two"},
-	}, attempts: 1, delay: time.Minute}
+func TestValidateRejectsMissingConfigPath(t *testing.T) {
+	cfg := cliConfig{apiKey: testProxyAPIKey, attempts: 1, delay: time.Minute}
 	if err := cfg.validate(); err == nil {
-		t.Fatal("expected duplicate provider id error")
+		t.Fatal("expected config path error")
 	}
 }
 
 func TestValidateRejectsInvalidAttempts(t *testing.T) {
-	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
-		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
-	}}
+	cfg := cliConfig{apiKey: testProxyAPIKey, configPath: "config.yaml"}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected attempts error")
 	}
 }
 
 func TestValidateRejectsNegativeDelay(t *testing.T) {
-	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
-		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
-	}, attempts: 1, delay: -time.Second}
+	cfg := cliConfig{apiKey: testProxyAPIKey, configPath: "config.yaml", attempts: 1, delay: -time.Second}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected delay error")
 	}
 }
 
 func TestValidateRejectsNegativeModelRefreshInterval(t *testing.T) {
-	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
-		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
-	}, attempts: 1, refresh: -time.Second}
+	cfg := cliConfig{apiKey: testProxyAPIKey, configPath: "config.yaml", attempts: 1, refresh: -time.Second}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected model refresh interval error")
 	}
 }
 
 func TestValidateRejectsNegativeModelRefreshTimeout(t *testing.T) {
-	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
-		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
-	}, attempts: 1, refreshTimeout: -time.Second}
+	cfg := cliConfig{apiKey: testProxyAPIKey, configPath: "config.yaml", attempts: 1, refreshTimeout: -time.Second}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected model refresh timeout error")
 	}
 }
 
 func TestValidateRejectsNegativeProviderCooldown(t *testing.T) {
-	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
-		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
-	}, attempts: 1, cooldown: -time.Second}
+	cfg := cliConfig{apiKey: testProxyAPIKey, configPath: "config.yaml", attempts: 1, cooldown: -time.Second}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected provider cooldown error")
 	}
 }
 
 func TestValidateRejectsNegativeCooldownFailures(t *testing.T) {
-	cfg := cliConfig{apiKey: testProxyAPIKey, providers: providerList{
-		{ID: "p1", ProviderURL: "https://one.test/v1", APIKey: "key-one"},
-	}, attempts: 1, cooldownFailures: -1}
+	cfg := cliConfig{apiKey: testProxyAPIKey, configPath: "config.yaml", attempts: 1, cooldownFailures: -1}
 	if err := cfg.validate(); err == nil {
 		t.Fatal("expected provider cooldown failures error")
 	}
@@ -1435,8 +1542,8 @@ func newTestPool(t *testing.T, providers ...providerConfig) *providerPool {
 	return pool
 }
 
-func stableCandidateOrder(candidates []int) []int {
-	return append([]int(nil), candidates...)
+func stableCandidateOrder(candidates []providerRef) []providerRef {
+	return append([]providerRef(nil), candidates...)
 }
 
 func serveChat(p *proxy, body string) *httptest.ResponseRecorder {
@@ -1495,6 +1602,16 @@ func serveProviderStatus(p *proxy, path string, authorized bool) *httptest.Respo
 	return rec
 }
 
+func serveRefresh(p *proxy, authorized bool) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/refresh", nil)
+	if authorized {
+		req.Header.Set("Authorization", authorizationHeader(testProxyAPIKey))
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	return rec
+}
+
 func decodeProviderStatus(t *testing.T, rec *httptest.ResponseRecorder) providersStatusResponse {
 	t.Helper()
 	if rec.Code != http.StatusOK {
@@ -1541,6 +1658,33 @@ func waitStatus(t *testing.T, ch <-chan int) int {
 
 func newTestLogger() *zap.Logger {
 	return zap.NewNop()
+}
+
+func writeTempProviderConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(content)+"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
+}
+
+func writeProviderConfigFile(t *testing.T, path string, providers ...providerConfig) {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("providers:\n")
+	for _, provider := range providers {
+		b.WriteString("  - id: ")
+		b.WriteString(provider.ID)
+		b.WriteString("\n    url: ")
+		b.WriteString(provider.ProviderURL)
+		b.WriteString("\n    key: ")
+		b.WriteString(provider.APIKey)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatalf("write provider config: %v", err)
+	}
 }
 
 func assertLogFieldsDoNotContain(t *testing.T, fields map[string]any, forbidden ...string) {
