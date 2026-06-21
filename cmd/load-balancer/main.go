@@ -1312,6 +1312,12 @@ const (
 	endpointResponses       upstreamEndpoint = "responses"
 )
 
+var responsesImageGenerationTypes = map[string]struct{}{
+	"image_generation":         {},
+	"image_generation_call":    {},
+	"image_generation_preview": {},
+}
+
 func (e upstreamEndpoint) url(provider acquiredProvider) string {
 	switch e {
 	case endpointResponses:
@@ -1351,6 +1357,31 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 		)
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
+	}
+	if endpoint == endpointResponses {
+		originalBodyLen := len(body)
+		sanitizedBody, removed, err := stripResponsesImageGeneration(body)
+		if err != nil {
+			p.logger.Warn("invalid downstream request",
+				zap.String("api", string(endpoint)),
+				zap.String("path", r.URL.Path),
+				zap.Int("request_bytes", len(body)),
+				zap.Error(err),
+			)
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		if removed > 0 {
+			p.logger.Info("stripped responses image generation items",
+				zap.String("api", string(endpoint)),
+				zap.String("path", r.URL.Path),
+				zap.String("model", model),
+				zap.Int("removed", removed),
+				zap.Int("request_bytes_before", originalBodyLen),
+				zap.Int("request_bytes_after", len(sanitizedBody)),
+			)
+		}
+		body = sanitizedBody
 	}
 	candidates, err := p.pool.candidatesForModel(model)
 	if err != nil {
@@ -1571,6 +1602,79 @@ func (p *proxy) postUpstream(inbound *http.Request, body []byte, provider acquir
 	copyForwardHeaders(req.Header, inbound.Header)
 	req.Header.Set("Authorization", authorizationHeader(provider.APIKey))
 	return p.client.Do(req)
+}
+
+type stripImageGenerationStats struct {
+	removed int
+}
+
+func stripResponsesImageGeneration(body []byte) ([]byte, int, error) {
+	var payload any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, 0, fmt.Errorf("invalid JSON request body: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return nil, 0, fmt.Errorf("invalid JSON request body: %w", err)
+	}
+
+	stats := &stripImageGenerationStats{}
+	payload = stripImageGenerationValue(payload, stats)
+	if stats.removed == 0 {
+		return body, 0, nil
+	}
+	sanitized, err := json.Marshal(payload)
+	if err != nil {
+		return nil, stats.removed, err
+	}
+	return sanitized, stats.removed, nil
+}
+
+func stripImageGenerationValue(value any, stats *stripImageGenerationStats) any {
+	switch typed := value.(type) {
+	case []any:
+		next := make([]any, 0, len(typed))
+		for _, item := range typed {
+			if shouldStripImageGenerationObject(item) {
+				stats.removed++
+				continue
+			}
+			next = append(next, stripImageGenerationValue(item, stats))
+		}
+		return next
+	case map[string]any:
+		next := make(map[string]any, len(typed))
+		for key, child := range typed {
+			if shouldStripImageGenerationObject(child) {
+				stats.removed++
+				continue
+			}
+			next[key] = stripImageGenerationValue(child, stats)
+		}
+		return next
+	default:
+		return value
+	}
+}
+
+func shouldStripImageGenerationObject(value any) bool {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	if typ, ok := object["type"].(string); ok {
+		if _, drop := responsesImageGenerationTypes[typ]; drop {
+			return true
+		}
+	}
+	if name, ok := object["name"].(string); ok && strings.Contains(strings.ToLower(name), "image_generation") {
+		return true
+	}
+	return false
 }
 
 type bufferedResponse struct {

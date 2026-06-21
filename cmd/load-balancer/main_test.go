@@ -841,6 +841,87 @@ func TestProxyForwardsResponsesRequest(t *testing.T) {
 	}
 }
 
+func TestProxyStripsResponsesImageGenerationItems(t *testing.T) {
+	const requestBody = `{
+		"model":"m",
+		"input":"hi",
+		"tools":[
+			{"type":"function","name":"keep","parameters":{"type":"object"}},
+			{"type":"image_generation"},
+			{"type":"image_generation_call"},
+			{"type":"function","name":"custom_image_generation_renderer"},
+			{"type":"group","children":[
+				{"type":"image_generation_preview"},
+				{"type":"function","name":"child_keep"}
+			]}
+		],
+		"metadata":{
+			"drop":{"name":"codex.image_generation.extra"},
+			"keep":{"name":"regular"}
+		}
+	}`
+
+	provider := newMockProviderWithResponses(t, []string{"m"}, "key", nil, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp_stripped"}`))
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveResponses(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	bodies := provider.responsesBodies()
+	if len(bodies) != 1 {
+		t.Fatalf("response bodies = %#v", bodies)
+	}
+	if strings.Contains(bodies[0], "image_generation") {
+		t.Fatalf("sanitized body still contains image_generation: %s", bodies[0])
+	}
+
+	var forwarded map[string]any
+	if err := json.Unmarshal([]byte(bodies[0]), &forwarded); err != nil {
+		t.Fatalf("unmarshal forwarded body: %v", err)
+	}
+	tools := forwarded["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools = %#v", tools)
+	}
+	if got := tools[0].(map[string]any)["name"]; got != "keep" {
+		t.Fatalf("first tool name = %v", got)
+	}
+	children := tools[1].(map[string]any)["children"].([]any)
+	if len(children) != 1 || children[0].(map[string]any)["name"] != "child_keep" {
+		t.Fatalf("children = %#v", children)
+	}
+	metadata := forwarded["metadata"].(map[string]any)
+	if _, ok := metadata["drop"]; ok {
+		t.Fatalf("metadata drop entry was forwarded: %#v", metadata)
+	}
+	if got := metadata["keep"].(map[string]any)["name"]; got != "regular" {
+		t.Fatalf("metadata keep entry = %#v", metadata["keep"])
+	}
+}
+
+func TestProxyDoesNotStripChatCompletionsImageGenerationItems(t *testing.T) {
+	const requestBody = `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"image_generation"}]}`
+
+	provider := newMockProvider(t, []string{"m"}, "key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"chat_kept"}`))
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := strings.Join(provider.bodies(), ","); got != requestBody {
+		t.Fatalf("chat body = %s", got)
+	}
+}
+
 func TestProxyForwardsResponsesShortPath(t *testing.T) {
 	const requestBody = `{"model":"m","input":"hi"}`
 
