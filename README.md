@@ -101,7 +101,7 @@ Repeated request failures temporarily cool down a provider. By default, `-provid
 
 Provider model lists refresh in the background every 30 minutes by default. Before each model refresh, the proxy rereads the YAML provider config so providers can be added, removed, or updated without restarting. Use `-model-refresh-interval 0` to disable background refreshes, `-model-refresh-timeout` to control the timeout for each provider's `/models` request, or call `POST /refresh` to refresh immediately. A failed startup fetch or refresh records provider status, clears that provider's model list, and skips the provider for model-routed traffic until a later refresh succeeds.
 
-The load balancer does not translate between API formats. Use the Chat Completions routes only with upstream providers that support Chat Completions, and use the Responses routes only with upstream providers that support Responses.
+The load balancer does not translate between API formats. Use the Chat Completions routes only with upstream providers that support Chat Completions, and use the Responses routes only with upstream providers that support Responses. By default, Responses request bodies have `image_generation` items stripped before forwarding; set `-strip-responses-image-generation=false` to pass those items through unchanged.
 
 ```sh
 go run ./cmd/load-balancer \

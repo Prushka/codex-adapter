@@ -45,6 +45,7 @@ type cliConfig struct {
 	refreshTimeout   time.Duration
 	cooldown         time.Duration
 	cooldownFailures int
+	stripImageGen    bool
 }
 
 func main() {
@@ -78,6 +79,7 @@ func main() {
 		ModelRefreshTimeout:  cfg.refreshTimeout,
 		ProviderCooldown:     cfg.cooldown,
 		CooldownFailures:     cfg.cooldownFailures,
+		DisableImageGenStrip: !cfg.stripImageGen,
 	})
 	if err != nil {
 		exitWithError(logger, "failed to create load balancer", zap.Error(err))
@@ -94,6 +96,7 @@ func main() {
 		zap.Duration("model_refresh_timeout", cfg.refreshTimeout),
 		zap.Duration("provider_cooldown", cfg.cooldown),
 		zap.Int("cooldown_failures", cfg.cooldownFailures),
+		zap.Bool("strip_responses_image_generation", cfg.stripImageGen),
 	)
 
 	server := &http.Server{
@@ -118,6 +121,7 @@ func parseFlags() cliConfig {
 	flag.DurationVar(&cfg.refreshTimeout, "model-refresh-timeout", defaultModelRefreshTimeout, "timeout for each provider model refresh request; set to 0 to use the HTTP client timeout")
 	flag.DurationVar(&cfg.cooldown, "provider-cooldown", defaultProviderCooldown, "duration to skip a provider after repeated request failures; set to 0 to disable")
 	flag.IntVar(&cfg.cooldownFailures, "provider-cooldown-failures", defaultCooldownFailures, "consecutive request failures before provider cooldown; set to 0 to disable")
+	flag.BoolVar(&cfg.stripImageGen, "strip-responses-image-generation", true, "strip Responses API image generation items before forwarding upstream")
 	flag.Parse()
 	return cfg
 }
@@ -157,21 +161,23 @@ type proxyConfig struct {
 	ModelRefreshTimeout  time.Duration
 	ProviderCooldown     time.Duration
 	CooldownFailures     int
+	DisableImageGenStrip bool
 }
 
 type proxy struct {
-	pool                *providerPool
-	client              *http.Client
-	logger              *zap.Logger
-	apiKey              string
-	attempts            int
-	delay               time.Duration
-	providerConfigPath  string
-	modelRefreshTimeout time.Duration
-	refreshMu           sync.Mutex
-	closeOnce           sync.Once
-	refreshCancel       context.CancelFunc
-	refreshDone         <-chan struct{}
+	pool                 *providerPool
+	client               *http.Client
+	logger               *zap.Logger
+	apiKey               string
+	attempts             int
+	delay                time.Duration
+	providerConfigPath   string
+	modelRefreshTimeout  time.Duration
+	disableImageGenStrip bool
+	refreshMu            sync.Mutex
+	closeOnce            sync.Once
+	refreshCancel        context.CancelFunc
+	refreshDone          <-chan struct{}
 }
 
 func newProxy(cfg proxyConfig) (*proxy, error) {
@@ -210,14 +216,15 @@ func newProxy(cfg proxyConfig) (*proxy, error) {
 	}
 	pool.setCooldownPolicy(cfg.CooldownFailures, cfg.ProviderCooldown)
 	pr := &proxy{
-		pool:                pool,
-		client:              client,
-		logger:              logger,
-		apiKey:              apiKey,
-		attempts:            attempts,
-		delay:               cfg.Delay,
-		providerConfigPath:  providerConfigPath,
-		modelRefreshTimeout: modelFetchTimeout,
+		pool:                 pool,
+		client:               client,
+		logger:               logger,
+		apiKey:               apiKey,
+		attempts:             attempts,
+		delay:                cfg.Delay,
+		providerConfigPath:   providerConfigPath,
+		modelRefreshTimeout:  modelFetchTimeout,
+		disableImageGenStrip: cfg.DisableImageGenStrip,
 	}
 	if cfg.ModelRefreshInterval > 0 {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1358,7 +1365,7 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	if endpoint == endpointResponses {
+	if endpoint == endpointResponses && !p.disableImageGenStrip {
 		originalBodyLen := len(body)
 		sanitizedBody, removed, err := stripResponsesImageGeneration(body)
 		if err != nil {

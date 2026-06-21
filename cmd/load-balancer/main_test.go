@@ -904,6 +904,24 @@ func TestProxyStripsResponsesImageGenerationItems(t *testing.T) {
 	}
 }
 
+func TestProxyCanDisableResponsesImageGenerationStrip(t *testing.T) {
+	const requestBody = `{"model":"m","input":"hi","tools":[{"type":"image_generation"},{"type":"function","name":"keep"}]}`
+
+	provider := newMockProviderWithResponses(t, []string{"m"}, "key", nil, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp_unstripped"}`))
+	})
+	defer provider.Close()
+
+	proxy := newTestProxyWithImageGenerationStrip(t, false, provider.providerConfig())
+	rec := serveResponses(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := strings.Join(provider.responsesBodies(), ","); got != requestBody {
+		t.Fatalf("response body = %s", got)
+	}
+}
+
 func TestProxyDoesNotStripChatCompletionsImageGenerationItems(t *testing.T) {
 	const requestBody = `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"image_generation"}]}`
 
@@ -1865,8 +1883,18 @@ func newTestProxyWithAttempts(t *testing.T, attempts int, providers ...providerC
 
 func newTestProxyWithRetryConfig(t *testing.T, attempts int, delay time.Duration, providers ...providerConfig) *proxy {
 	t.Helper()
+	return newTestProxyWithRetryConfigAndImageGenerationStrip(t, attempts, delay, true, providers...)
+}
+
+func newTestProxyWithImageGenerationStrip(t *testing.T, stripImageGen bool, providers ...providerConfig) *proxy {
+	t.Helper()
+	return newTestProxyWithRetryConfigAndImageGenerationStrip(t, 1, 0, stripImageGen, providers...)
+}
+
+func newTestProxyWithRetryConfigAndImageGenerationStrip(t *testing.T, attempts int, delay time.Duration, stripImageGen bool, providers ...providerConfig) *proxy {
+	t.Helper()
 	pool := newTestPool(t, providers...)
-	return &proxy{pool: pool, client: http.DefaultClient, logger: newTestLogger(), apiKey: testProxyAPIKey, attempts: attempts, delay: delay}
+	return &proxy{pool: pool, client: http.DefaultClient, logger: newTestLogger(), apiKey: testProxyAPIKey, attempts: attempts, delay: delay, disableImageGenStrip: !stripImageGen}
 }
 
 func newTestProxyWithLogger(t *testing.T, logger *zap.Logger, providers ...providerConfig) *proxy {
