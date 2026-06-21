@@ -95,7 +95,7 @@ Set `-disable-upstream-streaming` to make `/responses` buffer the upstream Chat 
 
 `cmd/load-balancer` is a small pass-through load balancer for OpenAI-compatible Chat Completions and Responses create requests. It forwards `POST /chat/completions`, `POST /v1/chat/completions`, `POST /responses`, and `POST /v1/responses` request bodies and headers to configured upstream providers, overriding only `Authorization`. It also serves `GET /models` and `GET /v1/models` as an OpenAI-compatible union of all configured provider models, plus `GET /models/map` and `GET /v1/models/map` as a provider-to-models mapping. `GET /providers`, `GET /v1/providers`, `GET /providers/status`, and `GET /v1/providers/status` return provider status snapshots with provider IDs, advertised models, busy counts, recent failures, last successful request time, cooldown state, and model-refresh state. `POST /refresh` and `POST /v1/refresh` reload the provider config and refresh model lists immediately. On startup it fetches each provider's `/models` list and only forwards a request to providers that advertise the requested `model`. If no configured provider supports the model, the proxy returns a JSON `model_not_available` error.
 
-Requests are assigned from a provider pool. For each selection pass, the proxy visits matching providers in random order. If the next matching provider is already processing a request, the proxy uses the next idle matching provider in that randomized order. If every matching provider is busy, it sends to the next matching provider from the same randomized order. If an upstream attempt fails with a request error or non-2xx HTTP response, the same request body is retried against the next untried matching provider. By default, `-attempts 5` repeats the full matching provider pool up to five times, with `-delay 1m` between full-pool attempts. The first attempt has no delay. If every configured attempt returns an HTTP failure, the last upstream error response is returned unchanged.
+Requests are assigned from a provider pool. For each downstream request, the proxy builds one provider order by sorting matching providers by ascending `tier`, then randomizing providers within each tier. Within the current tier, the proxy prefers the next idle matching provider; if every untried provider in that tier is busy, it sends to the next provider from that tier before moving to a higher tier. If an upstream attempt fails with a request error or non-2xx HTTP response, the same request body is retried against the next untried matching provider. By default, `-attempts 5` repeats the full matching provider pool up to five times, with `-delay 1m` between full-pool attempts. The first attempt has no delay, and later full-pool attempts reuse the same provider order chosen for the request. If every configured attempt returns an HTTP failure, the last upstream error response is returned unchanged.
 
 Repeated request failures temporarily cool down a provider. By default, `-provider-cooldown-failures 3` consecutive Chat Completions or Responses failures put that provider into cooldown for `-provider-cooldown 1m`; set either value to `0` to disable cooldown. Providers in cooldown remain visible in `/v1/providers/status`, but request routing skips them until the cooldown expires. Model-refresh failures are reported in status but do not count toward request cooldown.
 
@@ -119,12 +119,14 @@ providers:
   - id: p1
     url: https://provider-one.example.com/v1
     key: sk-provider-one
+    tier: 0
   - id: p2
     url: https://provider-two.example.com/v1
     key: sk-provider-two
+    tier: 1
 ```
 
-Each `id` is only for logs and error messages, but it must be unique. The `url` may be a base URL, a `/v1` URL, or a direct `/chat/completions`, `/responses`, or `/models` URL. Direct endpoint URLs are treated as siblings, so `https://provider.example/v1/responses` also implies `https://provider.example/v1/chat/completions` and `https://provider.example/v1/models`. `config.yaml` is ignored by git because it usually contains provider keys; use `config.example.yaml` as a template.
+Each `id` is only for logs and error messages, but it must be unique. The optional `tier` defaults to `0`; lower numeric tiers are tried before higher tiers, while providers with the same tier are randomized per downstream request. The `url` may be a base URL, a `/v1` URL, or a direct `/chat/completions`, `/responses`, or `/models` URL. Direct endpoint URLs are treated as siblings, so `https://provider.example/v1/responses` also implies `https://provider.example/v1/chat/completions` and `https://provider.example/v1/models`. `config.yaml` is ignored by git because it usually contains provider keys; use `config.example.yaml` as a template.
 
 ## Local Web Search
 

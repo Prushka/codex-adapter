@@ -205,6 +205,55 @@ func TestProxyRepeatsProviderPoolWhenAttemptsIsGreaterThanOne(t *testing.T) {
 	}
 }
 
+func TestProxyReusesCandidateOrderAcrossAttemptPasses(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	var sequenceMu sync.Mutex
+	var sequence []string
+	record := func(provider string) {
+		sequenceMu.Lock()
+		defer sequenceMu.Unlock()
+		sequence = append(sequence, provider)
+	}
+
+	first := newMockProvider(t, []string{"m"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		record("first")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"first"}}`))
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"m"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		record("second")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"second"}}`))
+	})
+	defer second.Close()
+
+	proxy := newTestProxyWithAttempts(t, 2, first.providerConfig(), second.providerConfig())
+	orderCalls := 0
+	proxy.pool.candidateOrder = func(candidates []providerRef) []providerRef {
+		orderCalls++
+		if orderCalls == 1 {
+			return append([]providerRef(nil), candidates...)
+		}
+		return []providerRef{candidates[1], candidates[0]}
+	}
+
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if orderCalls != 1 {
+		t.Fatalf("candidate order calls = %d", orderCalls)
+	}
+	sequenceMu.Lock()
+	gotSequence := strings.Join(sequence, ",")
+	sequenceMu.Unlock()
+	if gotSequence != "first,second,first,second" {
+		t.Fatalf("provider sequence = %s", gotSequence)
+	}
+}
+
 func TestProxyDelaysBetweenAttemptPasses(t *testing.T) {
 	const requestBody = `{"model":"m","stream":false}`
 
@@ -301,6 +350,148 @@ func TestProxyModelRoutingUsesCandidateOrder(t *testing.T) {
 	}
 	if got := strings.Join(append(second.bodies(), third.bodies()...), ","); got == "" {
 		t.Fatal("expected forwarded requests")
+	}
+}
+
+func TestProxyRoutesLowerTierBeforeHigherTier(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	high := newMockProvider(t, []string{"m"}, "key-high", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("higher-tier provider should not receive request before lower tiers are exhausted")
+	})
+	defer high.Close()
+	low := newMockProvider(t, []string{"m"}, "key-low", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"low tier failed"}}`))
+	})
+	defer low.Close()
+	mid := newMockProvider(t, []string{"m"}, "key-mid", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"mid"}`))
+	})
+	defer mid.Close()
+
+	highCfg := high.providerConfig()
+	highCfg.ID = "high"
+	highCfg.Tier = 2
+	lowCfg := low.providerConfig()
+	lowCfg.ID = "low"
+	midCfg := mid.providerConfig()
+	midCfg.ID = "mid"
+	midCfg.Tier = 1
+
+	proxy := newTestProxy(t, highCfg, lowCfg, midCfg)
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != `{"id":"mid"}` {
+		t.Fatalf("body = %s", got)
+	}
+	if got := low.chatCount(); got != 1 {
+		t.Fatalf("low chat count = %d", got)
+	}
+	if got := mid.chatCount(); got != 1 {
+		t.Fatalf("mid chat count = %d", got)
+	}
+	if got := high.chatCount(); got != 0 {
+		t.Fatalf("high chat count = %d", got)
+	}
+}
+
+func TestProxyUsesBusyLowerTierBeforeIdleHigherTier(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	release := make(chan struct{})
+	low := newMockProvider(t, []string{"m"}, "key-low", func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		_, _ = w.Write([]byte(`{"id":"low"}`))
+	})
+	defer low.Close()
+	high := newMockProvider(t, []string{"m"}, "key-high", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("higher-tier provider should not receive request while lower tier is still untried")
+	})
+	defer high.Close()
+
+	lowCfg := low.providerConfig()
+	lowCfg.ID = "low"
+	highCfg := high.providerConfig()
+	highCfg.ID = "high"
+	highCfg.Tier = 1
+	proxy := newTestProxy(t, lowCfg, highCfg)
+
+	firstDone := make(chan int, 1)
+	go func() { firstDone <- serveChat(proxy, requestBody).Code }()
+	low.waitForChats(t, 1)
+
+	secondDone := make(chan int, 1)
+	go func() { secondDone <- serveChat(proxy, requestBody).Code }()
+	low.waitForChats(t, 2)
+
+	close(release)
+	if got := waitStatus(t, secondDone); got != http.StatusOK {
+		t.Fatalf("second status = %d", got)
+	}
+	if got := waitStatus(t, firstDone); got != http.StatusOK {
+		t.Fatalf("first status = %d", got)
+	}
+	if got := high.chatCount(); got != 0 {
+		t.Fatalf("high chat count = %d", got)
+	}
+}
+
+func TestProviderPoolOrdersCandidatesByTierAndRandomizesWithinTier(t *testing.T) {
+	first := newMockProvider(t, []string{"m"}, "key-tier-1", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unexpected chat request")
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"m"}, "key-tier-0-a", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unexpected chat request")
+	})
+	defer second.Close()
+	third := newMockProvider(t, []string{"m"}, "key-tier-2", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unexpected chat request")
+	})
+	defer third.Close()
+	fourth := newMockProvider(t, []string{"m"}, "key-tier-0-b", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unexpected chat request")
+	})
+	defer fourth.Close()
+
+	firstCfg := first.providerConfig()
+	firstCfg.ID = "tier-1"
+	firstCfg.Tier = 1
+	secondCfg := second.providerConfig()
+	secondCfg.ID = "tier-0-a"
+	thirdCfg := third.providerConfig()
+	thirdCfg.ID = "tier-2"
+	thirdCfg.Tier = 2
+	fourthCfg := fourth.providerConfig()
+	fourthCfg.ID = "tier-0-b"
+
+	pool := newTestPool(t, firstCfg, secondCfg, thirdCfg, fourthCfg)
+	var groups []string
+	pool.candidateOrder = func(candidates []providerRef) []providerRef {
+		groups = append(groups, fmt.Sprint(candidates))
+		ordered := append([]providerRef(nil), candidates...)
+		for i, j := 0, len(ordered)-1; i < j; i, j = i+1, j-1 {
+			ordered[i], ordered[j] = ordered[j], ordered[i]
+		}
+		return ordered
+	}
+
+	candidates, err := pool.candidatesForModel("m")
+	if err != nil {
+		t.Fatalf("candidatesForModel: %v", err)
+	}
+	if got := fmt.Sprint(candidates); got != "[tier-1 tier-0-a tier-2 tier-0-b]" {
+		t.Fatalf("candidates = %s", got)
+	}
+	ordered := pool.orderedCandidates(candidates)
+	if got := fmt.Sprint(ordered); got != "[tier-0-b tier-0-a tier-1 tier-2]" {
+		t.Fatalf("ordered candidates = %s", got)
+	}
+	if got := strings.Join(groups, "|"); got != "[tier-0-a tier-0-b]|[tier-1]|[tier-2]" {
+		t.Fatalf("candidate order groups = %s", got)
 	}
 }
 
@@ -1074,6 +1265,73 @@ func TestProxyManualRefreshReloadsProviderConfig(t *testing.T) {
 	}
 }
 
+func TestProxyManualRefreshAppliesProviderTierChanges(t *testing.T) {
+	first := newMockProvider(t, []string{"m"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"first"}`))
+	})
+	defer first.Close()
+	second := newMockProvider(t, []string{"m"}, "key-2", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"second"}`))
+	})
+	defer second.Close()
+
+	firstCfg := first.providerConfig()
+	firstCfg.ID = "first"
+	secondCfg := second.providerConfig()
+	secondCfg.ID = "second"
+	secondCfg.Tier = 1
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeProviderConfigFile(t, configPath, firstCfg, secondCfg)
+
+	proxy, err := newProxy(proxyConfig{
+		ProviderConfigPath:   configPath,
+		Client:               http.DefaultClient,
+		Logger:               newTestLogger(),
+		APIKey:               testProxyAPIKey,
+		Attempts:             1,
+		ModelRefreshInterval: 0,
+		ModelRefreshTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+	proxy.pool.candidateOrder = stableCandidateOrder
+
+	rec := serveChat(proxy, `{"model":"m","stream":false}`)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"id":"first"}` {
+		t.Fatalf("initial request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	firstCfg.Tier = 2
+	writeProviderConfigFile(t, configPath, firstCfg, secondCfg)
+	refresh := serveRefresh(proxy, true)
+	if refresh.Code != http.StatusOK {
+		t.Fatalf("refresh status = %d body = %s", refresh.Code, refresh.Body.String())
+	}
+	var refreshResp providerRefreshResponse
+	if err := json.Unmarshal(refresh.Body.Bytes(), &refreshResp); err != nil {
+		t.Fatalf("unmarshal refresh response: %v", err)
+	}
+	if strings.Join(refreshResp.Summary.Updated, ",") != "first" || strings.Join(refreshResp.Summary.Unchanged, ",") != "second" {
+		t.Fatalf("refresh response = %#v", refreshResp)
+	}
+
+	status := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if len(status.Data) != 2 || status.Data[0].Tier != 2 || status.Data[1].Tier != 1 {
+		t.Fatalf("provider status = %#v", status.Data)
+	}
+	rec = serveChat(proxy, `{"model":"m","stream":false}`)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"id":"second"}` {
+		t.Fatalf("post-refresh request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := first.chatCount(); got != 1 {
+		t.Fatalf("first chat count = %d", got)
+	}
+	if got := second.chatCount(); got != 1 {
+		t.Fatalf("second chat count = %d", got)
+	}
+}
+
 func TestProxyBackgroundRefreshReloadsProviderConfig(t *testing.T) {
 	first := newMockProvider(t, []string{"a"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("first provider should be removed before model b request")
@@ -1163,6 +1421,7 @@ providers:
   - id: p2
     url: https://two.test/v1
     key: key-two
+    tier: 3
 `)
 	cfgs, err := loadProviderConfigFile(path)
 	if err != nil {
@@ -1174,7 +1433,10 @@ providers:
 	if cfgs[0].ID != "p1" || cfgs[0].ProviderURL != "https://one.test/v1" || cfgs[0].APIKey != "key-one" {
 		t.Fatalf("first provider = %#v", cfgs[0])
 	}
-	if cfgs[1].ID != "p2" || cfgs[1].ProviderURL != "https://two.test/v1" || cfgs[1].APIKey != "key-two" {
+	if cfgs[0].Tier != 0 {
+		t.Fatalf("first provider tier = %d", cfgs[0].Tier)
+	}
+	if cfgs[1].ID != "p2" || cfgs[1].ProviderURL != "https://two.test/v1" || cfgs[1].APIKey != "key-two" || cfgs[1].Tier != 3 {
 		t.Fatalf("second provider = %#v", cfgs[1])
 	}
 }
@@ -1681,6 +1943,11 @@ func writeProviderConfigFile(t *testing.T, path string, providers ...providerCon
 		b.WriteString("\n    key: ")
 		b.WriteString(provider.APIKey)
 		b.WriteByte('\n')
+		if provider.Tier != 0 {
+			b.WriteString("    tier: ")
+			b.WriteString(fmt.Sprint(provider.Tier))
+			b.WriteByte('\n')
+		}
 	}
 	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
 		t.Fatalf("write provider config: %v", err)

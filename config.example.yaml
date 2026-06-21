@@ -2,6 +2,8 @@ providers:
   - id: p1
     url: https://provider-one.example.com/v1
     key: sk-provider-one
+    tier: 0
   - id: p2
     url: https://provider-two.example.com/v1
     key: sk-provider-two
+    tier: 1

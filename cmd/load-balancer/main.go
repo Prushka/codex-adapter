@@ -284,6 +284,7 @@ type providerConfig struct {
 	ID          string `yaml:"id"`
 	ProviderURL string `yaml:"url"`
 	APIKey      string `yaml:"key"`
+	Tier        int    `yaml:"tier"`
 }
 
 type providerConfigFile struct {
@@ -328,6 +329,7 @@ func normalizeProviderConfigs(providers []providerConfig) ([]providerConfig, err
 			ID:          strings.TrimSpace(providers[i].ID),
 			ProviderURL: strings.TrimSpace(providers[i].ProviderURL),
 			APIKey:      strings.TrimSpace(providers[i].APIKey),
+			Tier:        providers[i].Tier,
 		}
 		switch {
 		case out[i].ID == "":
@@ -350,6 +352,7 @@ func normalizeProviderConfigs(providers []providerConfig) ([]providerConfig, err
 type provider struct {
 	generation              uint64
 	id                      string
+	tier                    int
 	chatURL                 string
 	responsesURL            string
 	modelsURL               string
@@ -380,6 +383,7 @@ type providerPool struct {
 type providerRef struct {
 	id         string
 	generation uint64
+	tier       int
 }
 
 func (r providerRef) String() string {
@@ -389,6 +393,7 @@ func (r providerRef) String() string {
 type acquiredProvider struct {
 	ref          providerRef
 	ID           string
+	Tier         int
 	ChatURL      string
 	ResponsesURL string
 	ModelsURL    string
@@ -421,6 +426,7 @@ type providersStatusResponse struct {
 
 type providerStatus struct {
 	ID                  string                     `json:"id"`
+	Tier                int                        `json:"tier"`
 	Models              []string                   `json:"models"`
 	BusyCount           int                        `json:"busy_count"`
 	RecentFailures      []providerFailureStatus    `json:"recent_failures"`
@@ -619,6 +625,7 @@ func buildProviderShells(cfgs []providerConfig) ([]provider, error) {
 		}
 		providers = append(providers, provider{
 			id:           cfg.ID,
+			tier:         cfg.Tier,
 			chatURL:      chatURL,
 			responsesURL: responsesURL,
 			modelsURL:    modelsURL,
@@ -631,6 +638,7 @@ func buildProviderShells(cfgs []providerConfig) ([]provider, error) {
 
 func sameProviderConnection(a, b provider) bool {
 	return a.id == b.id &&
+		a.tier == b.tier &&
 		a.chatURL == b.chatURL &&
 		a.responsesURL == b.responsesURL &&
 		a.modelsURL == b.modelsURL &&
@@ -743,6 +751,7 @@ func (p *providerPool) providerStatuses(now time.Time) []providerStatus {
 
 		out = append(out, providerStatus{
 			ID:                  provider.id,
+			Tier:                provider.tier,
 			Models:              sortedModelIDs(provider.models),
 			BusyCount:           provider.busy,
 			RecentFailures:      failures,
@@ -993,32 +1002,41 @@ func (p *providerPool) acquire(orderedCandidates []providerRef, tried map[provid
 	now := time.Now()
 	p.clearExpiredCooldownsLocked(now)
 
-	for _, ref := range orderedCandidates {
-		if _, ok := tried[ref]; ok {
-			continue
+	for start := 0; start < len(orderedCandidates); {
+		end := start + 1
+		for end < len(orderedCandidates) && orderedCandidates[end].tier == orderedCandidates[start].tier {
+			end++
 		}
-		providerIndex, ok := p.indexForRefLocked(ref)
-		if !ok || p.providerCoolingDownLocked(providerIndex, now) {
-			continue
+
+		for _, ref := range orderedCandidates[start:end] {
+			if _, ok := tried[ref]; ok {
+				continue
+			}
+			providerIndex, ok := p.indexForRefLocked(ref)
+			if !ok || p.providerCoolingDownLocked(providerIndex, now) {
+				continue
+			}
+			if p.providers[providerIndex].busy == 0 {
+				p.providers[providerIndex].busy++
+				provider := p.providers[providerIndex]
+				return provider.acquired(), false, p.releaseFunc(provider.ref()), nil
+			}
 		}
-		if p.providers[providerIndex].busy == 0 {
+
+		for _, ref := range orderedCandidates[start:end] {
+			if _, ok := tried[ref]; ok {
+				continue
+			}
+			providerIndex, ok := p.indexForRefLocked(ref)
+			if !ok || p.providerCoolingDownLocked(providerIndex, now) {
+				continue
+			}
 			p.providers[providerIndex].busy++
 			provider := p.providers[providerIndex]
-			return provider.acquired(), false, p.releaseFunc(provider.ref()), nil
+			return provider.acquired(), true, p.releaseFunc(provider.ref()), nil
 		}
-	}
 
-	for _, ref := range orderedCandidates {
-		if _, ok := tried[ref]; ok {
-			continue
-		}
-		providerIndex, ok := p.indexForRefLocked(ref)
-		if !ok || p.providerCoolingDownLocked(providerIndex, now) {
-			continue
-		}
-		p.providers[providerIndex].busy++
-		provider := p.providers[providerIndex]
-		return provider.acquired(), true, p.releaseFunc(provider.ref()), nil
+		start = end
 	}
 
 	return acquiredProvider{}, false, nil, errors.New("no untried provider candidates outside cooldown")
@@ -1028,6 +1046,7 @@ func (p provider) acquired() acquiredProvider {
 	return acquiredProvider{
 		ref:          p.ref(),
 		ID:           p.id,
+		Tier:         p.tier,
 		ChatURL:      p.chatURL,
 		ResponsesURL: p.responsesURL,
 		ModelsURL:    p.modelsURL,
@@ -1036,7 +1055,7 @@ func (p provider) acquired() acquiredProvider {
 }
 
 func (p provider) ref() providerRef {
-	return providerRef{id: p.id, generation: p.generation}
+	return providerRef{id: p.id, generation: p.generation, tier: p.tier}
 }
 
 func (p *providerPool) indexForRefLocked(ref providerRef) (int, bool) {
@@ -1067,10 +1086,30 @@ func (p *providerPool) providerCoolingDownLocked(index int, now time.Time) bool 
 }
 
 func (p *providerPool) orderedCandidates(candidates []providerRef) []providerRef {
-	if p.candidateOrder == nil {
+	if len(candidates) == 0 {
 		return append([]providerRef(nil), candidates...)
 	}
-	return p.candidateOrder(candidates)
+	candidatesByTier := make(map[int][]providerRef)
+	tiers := make([]int, 0)
+	for _, candidate := range candidates {
+		if _, ok := candidatesByTier[candidate.tier]; !ok {
+			tiers = append(tiers, candidate.tier)
+		}
+		candidatesByTier[candidate.tier] = append(candidatesByTier[candidate.tier], candidate)
+	}
+	sort.Ints(tiers)
+
+	ordered := make([]providerRef, 0, len(candidates))
+	for _, tier := range tiers {
+		tierCandidates := candidatesByTier[tier]
+		if p.candidateOrder != nil {
+			tierCandidates = p.candidateOrder(tierCandidates)
+		} else {
+			tierCandidates = append([]providerRef(nil), tierCandidates...)
+		}
+		ordered = append(ordered, tierCandidates...)
+	}
+	return ordered
 }
 
 func randomCandidateOrder(candidates []providerRef) []providerRef {
@@ -1340,6 +1379,7 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 	if attemptPasses < 1 {
 		attemptPasses = defaultAttempts
 	}
+	orderedCandidates := p.pool.orderedCandidates(candidates)
 	for pass := 0; pass < attemptPasses; pass++ {
 		if pass > 0 && p.delay > 0 {
 			if err := sleepWithContext(r.Context(), p.delay); err != nil {
@@ -1353,7 +1393,6 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 				return
 			}
 		}
-		orderedCandidates := p.pool.orderedCandidates(candidates)
 		tried := make(map[providerRef]struct{}, len(orderedCandidates))
 		for passAttempt := 0; passAttempt < len(orderedCandidates); passAttempt++ {
 			provider, busyFallback, release, err := p.pool.acquire(orderedCandidates, tried)
