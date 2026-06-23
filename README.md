@@ -110,6 +110,8 @@ go run ./cmd/load-balancer \
   -config ./config.yaml
 ```
 
+The Docker image includes timezone data and defaults to `TZ=UTC`. Set `TZ` when running the container, for example `TZ=Asia/Shanghai docker compose up -d`, to emit load-balancer log timestamps in that local timezone.
+
 The load balancer requires `-api-key`. Downstream clients must send it as `Authorization: Bearer <key>`. This key is checked only by the load balancer and is never sent upstream; upstream requests always use the per-provider key from the selected provider config entry.
 
 The provider config is YAML:

@@ -34,11 +34,13 @@ LABEL org.opencontainers.image.title="meinya/llm-lb" \
     org.opencontainers.image.revision=$GIT_COMMIT \
     org.opencontainers.image.version=$GIT_VERSION
 
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S codex \
     && adduser -S -G codex -u 10001 codex
 
 COPY --from=build /out/load-balancer /usr/local/bin/load-balancer
+
+ENV TZ=UTC
 
 USER codex:codex
 EXPOSE 18081

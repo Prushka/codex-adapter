@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1900,6 +1901,9 @@ func closeBody(logger *zap.Logger, body io.Closer) {
 func newLogger() (*zap.Logger, error) {
 	cfg := zap.NewProductionConfig()
 	cfg.DisableStacktrace = true
+	cfg.EncoderConfig.EncodeTime = func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
+		enc.AppendString(t.Local().Format(time.RFC3339Nano))
+	}
 	return cfg.Build()
 }
 

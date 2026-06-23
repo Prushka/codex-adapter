@@ -4,6 +4,8 @@ services:
     restart: unless-stopped
     ports:
       - "18081:18081"
+    environment:
+      TZ: ${TZ:-UTC}
     volumes:
       - ./config.yaml:/etc/load-balancer/config.yaml:ro
     command:
