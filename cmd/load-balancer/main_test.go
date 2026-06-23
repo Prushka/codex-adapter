@@ -768,6 +768,99 @@ func TestProxySkipsProviderInCooldown(t *testing.T) {
 	}
 }
 
+func TestProxyProviderStatusTimestampsUseLocalTimezone(t *testing.T) {
+	oldLocal := time.Local
+	local := time.FixedZone("UTC+08", 8*60*60)
+	time.Local = local
+	t.Cleanup(func() {
+		time.Local = oldLocal
+	})
+
+	provider := newMockProvider(t, []string{"m"}, "key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	})
+	defer provider.Close()
+
+	proxy, err := newProxy(proxyConfig{
+		Providers:            []providerConfig{provider.providerConfig()},
+		Client:               http.DefaultClient,
+		Logger:               newTestLogger(),
+		APIKey:               testProxyAPIKey,
+		Attempts:             1,
+		ProviderCooldown:     time.Minute,
+		CooldownFailures:     1,
+		ModelRefreshInterval: 0,
+	})
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+
+	base := time.Now().UTC().Add(-10 * time.Minute)
+	proxy.pool.mu.Lock()
+	proxy.pool.providers[0].lastSuccess = base
+	proxy.pool.providers[0].lastFailure = base.Add(time.Minute)
+	proxy.pool.providers[0].cooldownUntil = time.Now().UTC().Add(2 * time.Minute)
+	proxy.pool.providers[0].lastModelRefresh = base.Add(3 * time.Minute)
+	proxy.pool.providers[0].lastModelRefreshFailure = base.Add(4 * time.Minute)
+	proxy.pool.providers[0].lastModelRefreshError = "refresh failed"
+	proxy.pool.providers[0].recentFailures = []providerFailure{{
+		at:         base.Add(5 * time.Minute),
+		endpoint:   string(endpointChatCompletions),
+		statusCode: http.StatusTooManyRequests,
+		err:        "rate limited",
+	}}
+	proxy.pool.mu.Unlock()
+
+	statusRec := serveProviderStatus(proxy, "/v1/providers/status", true)
+	if statusRec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", statusRec.Code, statusRec.Body.String())
+	}
+
+	var status struct {
+		Data []struct {
+			LastSuccessAt  string `json:"last_success_at"`
+			LastFailureAt  string `json:"last_failure_at"`
+			RecentFailures []struct {
+				At string `json:"at"`
+			} `json:"recent_failures"`
+			Cooldown struct {
+				Until string `json:"until"`
+			} `json:"cooldown"`
+			ModelRefresh struct {
+				LastSuccessAt string `json:"last_success_at"`
+				LastFailureAt string `json:"last_failure_at"`
+			} `json:"model_refresh"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("unmarshal status: %v body = %s", err, statusRec.Body.String())
+	}
+	if len(status.Data) != 1 || len(status.Data[0].RecentFailures) != 1 {
+		t.Fatalf("status = %#v", status)
+	}
+
+	timestamps := map[string]string{
+		"last_success_at":               status.Data[0].LastSuccessAt,
+		"last_failure_at":               status.Data[0].LastFailureAt,
+		"recent_failures[0].at":         status.Data[0].RecentFailures[0].At,
+		"cooldown.until":                status.Data[0].Cooldown.Until,
+		"model_refresh.last_success_at": status.Data[0].ModelRefresh.LastSuccessAt,
+		"model_refresh.last_failure_at": status.Data[0].ModelRefresh.LastFailureAt,
+	}
+	for name, value := range timestamps {
+		if !strings.HasSuffix(value, "+08:00") {
+			t.Fatalf("%s = %q, want +08:00 offset; body = %s", name, value, statusRec.Body.String())
+		}
+		parsed, err := time.Parse(time.RFC3339Nano, value)
+		if err != nil {
+			t.Fatalf("parse %s = %q: %v", name, value, err)
+		}
+		if _, offset := parsed.Zone(); offset != 8*60*60 {
+			t.Fatalf("%s offset = %d, want %d", name, offset, 8*60*60)
+		}
+	}
+}
+
 func TestProxyRejectsUnauthorizedProviderStatus(t *testing.T) {
 	provider := newMockProvider(t, []string{"m"}, "provider-key", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("unauthorized provider status should not be forwarded")

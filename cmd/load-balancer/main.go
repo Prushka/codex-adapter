@@ -742,7 +742,7 @@ func (p *providerPool) providerStatuses(now time.Time) []providerStatus {
 		failures := make([]providerFailureStatus, 0, len(provider.recentFailures))
 		for _, failure := range provider.recentFailures {
 			failures = append(failures, providerFailureStatus{
-				At:         failure.at.UTC(),
+				At:         failure.at.In(time.Local),
 				Endpoint:   failure.endpoint,
 				StatusCode: failure.statusCode,
 				Error:      failure.err,
@@ -786,8 +786,8 @@ func timePtr(t time.Time) *time.Time {
 	if t.IsZero() {
 		return nil
 	}
-	utc := t.UTC()
-	return &utc
+	local := t.In(time.Local)
+	return &local
 }
 
 func (p *providerPool) refreshModels(ctx context.Context, client *http.Client, logger *zap.Logger, timeout time.Duration) {
