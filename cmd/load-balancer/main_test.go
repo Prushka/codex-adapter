@@ -768,6 +768,92 @@ func TestProxySkipsProviderInCooldown(t *testing.T) {
 	}
 }
 
+func TestProxyPruneClearsProviderFailureStatus(t *testing.T) {
+	provider := newMockProvider(t, []string{"m", "z"}, "key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	})
+	defer provider.Close()
+
+	proxy, err := newProxy(proxyConfig{
+		Providers:            []providerConfig{provider.providerConfig()},
+		Client:               http.DefaultClient,
+		Logger:               newTestLogger(),
+		APIKey:               testProxyAPIKey,
+		Attempts:             1,
+		ProviderCooldown:     time.Minute,
+		CooldownFailures:     1,
+		ModelRefreshInterval: 0,
+	})
+	if err != nil {
+		t.Fatalf("newProxy: %v", err)
+	}
+
+	base := time.Now().UTC().Add(-10 * time.Minute)
+	proxy.pool.mu.Lock()
+	providerState := &proxy.pool.providers[0]
+	providerState.recentFailures = []providerFailure{{
+		at:         base,
+		endpoint:   string(endpointChatCompletions),
+		statusCode: http.StatusTooManyRequests,
+		err:        "rate limited",
+	}}
+	providerState.consecutiveFailures = 3
+	providerState.lastSuccess = base.Add(time.Minute)
+	providerState.lastFailure = base.Add(2 * time.Minute)
+	providerState.cooldownUntil = time.Now().UTC().Add(time.Minute)
+	providerState.lastModelRefreshFailure = base.Add(3 * time.Minute)
+	providerState.lastModelRefreshError = "model refresh failed"
+	proxy.pool.mu.Unlock()
+
+	before := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if len(before.Data) != 1 || before.Data[0].RecentFailureCount != 1 || !before.Data[0].Cooldown.Active || before.Data[0].ModelRefresh.LastFailureAt == nil {
+		t.Fatalf("pre-prune status = %#v", before.Data)
+	}
+
+	prune := servePrune(proxy, "/v1/prune", true)
+	if prune.Code != http.StatusOK {
+		t.Fatalf("prune status = %d body = %s", prune.Code, prune.Body.String())
+	}
+	var pruneResp providerPruneResponse
+	if err := json.Unmarshal(prune.Body.Bytes(), &pruneResp); err != nil {
+		t.Fatalf("unmarshal prune response: %v", err)
+	}
+	if pruneResp.Object != "provider_prune" || !pruneResp.Pruned || pruneResp.Summary.Providers != 1 {
+		t.Fatalf("prune response = %#v", pruneResp)
+	}
+
+	after := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if len(after.Data) != 1 {
+		t.Fatalf("post-prune status = %#v", after.Data)
+	}
+	got := after.Data[0]
+	if got.RecentFailureCount != 0 || len(got.RecentFailures) != 0 || got.ConsecutiveFailures != 0 || got.LastFailureAt != nil {
+		t.Fatalf("failure fields after prune = %#v", got)
+	}
+	if got.Cooldown.Active || got.Cooldown.Until != nil || got.Cooldown.RemainingMillis != 0 {
+		t.Fatalf("cooldown after prune = %#v", got.Cooldown)
+	}
+	if got.ModelRefresh.LastFailureAt != nil || got.ModelRefresh.LastError != "" {
+		t.Fatalf("model refresh after prune = %#v", got.ModelRefresh)
+	}
+	if got.LastSuccessAt == nil || strings.Join(got.Models, ",") != "m,z" {
+		t.Fatalf("non-failure state after prune = %#v", got)
+	}
+}
+
+func TestProxyRejectsUnauthorizedPrune(t *testing.T) {
+	provider := newMockProvider(t, []string{"m"}, "provider-key", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unauthorized prune should not be forwarded")
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := servePrune(proxy, "/prune", false)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestProxyProviderStatusTimestampsUseLocalTimezone(t *testing.T) {
 	oldLocal := time.Local
 	local := time.FixedZone("UTC+08", 8*60*60)
@@ -2068,6 +2154,16 @@ func serveProviderStatus(p *proxy, path string, authorized bool) *httptest.Respo
 
 func serveRefresh(p *proxy, authorized bool) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/refresh", nil)
+	if authorized {
+		req.Header.Set("Authorization", authorizationHeader(testProxyAPIKey))
+	}
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	return rec
+}
+
+func servePrune(p *proxy, path string, authorized bool) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, nil)
 	if authorized {
 		req.Header.Set("Authorization", authorizationHeader(testProxyAPIKey))
 	}

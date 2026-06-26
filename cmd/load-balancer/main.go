@@ -471,6 +471,12 @@ type providerRefreshResponse struct {
 	Summary   providerRefreshSummary `json:"summary"`
 }
 
+type providerPruneResponse struct {
+	Object  string               `json:"object"`
+	Pruned  bool                 `json:"pruned"`
+	Summary providerPruneSummary `json:"summary"`
+}
+
 type providerRefreshSummary struct {
 	Providers int      `json:"providers"`
 	Models    int      `json:"models"`
@@ -478,6 +484,10 @@ type providerRefreshSummary struct {
 	Removed   []string `json:"removed,omitempty"`
 	Updated   []string `json:"updated,omitempty"`
 	Unchanged []string `json:"unchanged,omitempty"`
+}
+
+type providerPruneSummary struct {
+	Providers int `json:"providers"`
 }
 
 type modelListItem struct {
@@ -780,6 +790,23 @@ func (p *providerPool) providerStatuses(now time.Time) []providerStatus {
 		})
 	}
 	return out
+}
+
+func (p *providerPool) pruneProviderFailures() providerPruneSummary {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.providers {
+		provider := &p.providers[i]
+		provider.recentFailures = nil
+		provider.consecutiveFailures = 0
+		provider.lastFailure = time.Time{}
+		provider.cooldownUntil = time.Time{}
+		provider.lastModelRefreshFailure = time.Time{}
+		provider.lastModelRefreshError = ""
+	}
+	return providerPruneSummary{
+		Providers: len(p.providers),
+	}
 }
 
 func timePtr(t time.Time) *time.Time {
@@ -1219,6 +1246,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleProviderStatus(w, r)
 	case "/refresh", "/v1/refresh":
 		p.handleRefresh(w, r)
+	case "/prune", "/v1/prune":
+		p.handlePrune(w, r)
 	case "/chat/completions", "/v1/chat/completions":
 		p.handleAPIRequest(w, r, endpointChatCompletions)
 	case "/responses", "/v1/responses":
@@ -1246,6 +1275,22 @@ func (p *proxy) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		Object:    "provider_refresh",
 		Refreshed: true,
 		Summary:   summary,
+	})
+}
+
+func (p *proxy) handlePrune(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !p.authorizeDownstream(w, r, "prune") {
+		return
+	}
+	summary := p.pool.pruneProviderFailures()
+	writeJSON(w, providerPruneResponse{
+		Object:  "provider_prune",
+		Pruned:  true,
+		Summary: summary,
 	})
 }
 
