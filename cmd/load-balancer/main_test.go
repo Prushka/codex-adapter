@@ -569,7 +569,7 @@ func TestProxyRejectsWrongAPIKey(t *testing.T) {
 }
 
 func TestProxyListsAllModels(t *testing.T) {
-	first := newMockProvider(t, []string{"z-model", "a-model"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
+	first := newMockProvider(t, []string{"models/z-model", "a-model"}, "key-1", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("models request should not be forwarded as chat")
 	})
 	defer first.Close()
@@ -1887,7 +1887,7 @@ func TestFetchProviderModelsParsesResponse(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": []map[string]any{{"id": "one"}, {"id": "two"}},
+			"data": []map[string]any{{"id": "one"}, {"id": "models/two"}, {"id": " models/two "}},
 		})
 	}))
 	defer upstream.Close()
@@ -1898,6 +1898,15 @@ func TestFetchProviderModelsParsesResponse(t *testing.T) {
 	}
 	if len(models) != 2 {
 		t.Fatalf("models = %#v", models)
+	}
+	if _, ok := models["one"]; !ok {
+		t.Fatalf("models = %#v", models)
+	}
+	if _, ok := models["two"]; !ok {
+		t.Fatalf("models = %#v", models)
+	}
+	if _, ok := models["models/two"]; ok {
+		t.Fatalf("models should not include resource-prefixed ID: %#v", models)
 	}
 }
 

@@ -1188,6 +1188,11 @@ func requestedModel(body []byte) (string, error) {
 	return model, nil
 }
 
+func normalizeProviderModelID(id string) string {
+	id = strings.TrimSpace(id)
+	return strings.TrimPrefix(id, "models/")
+}
+
 type modelsResponse struct {
 	Data []struct {
 		ID string `json:"id"`
@@ -1221,7 +1226,7 @@ func fetchProviderModels(ctx context.Context, client *http.Client, modelsURL, ap
 	}
 	models := map[string]struct{}{}
 	for _, model := range payload.Data {
-		id := strings.TrimSpace(model.ID)
+		id := normalizeProviderModelID(model.ID)
 		if id != "" {
 			models[id] = struct{}{}
 		}
