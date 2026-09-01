@@ -33,7 +33,10 @@ const (
 	defaultProviderCooldown     = time.Minute
 	defaultCooldownFailures     = 5
 	maxRecentProviderFailures   = 10
+	providerThinkingMarker      = "<thinking>"
 )
+
+var errProviderThinkingMarker = errors.New("provider response contained <thinking>")
 
 type cliConfig struct {
 	listenAddr       string
@@ -375,6 +378,7 @@ type provider struct {
 	lastModelRefresh        time.Time
 	lastModelRefreshFailure time.Time
 	lastModelRefreshError   string
+	blocked                 bool
 }
 
 type providerPool struct {
@@ -386,6 +390,7 @@ type providerPool struct {
 	nextProviderGeneration uint64
 	cooldownFailures       int
 	cooldown               time.Duration
+	blockedProviderIDs     map[string]struct{}
 }
 
 type providerRef struct {
@@ -435,6 +440,7 @@ type providersStatusResponse struct {
 type providerStatus struct {
 	ID                  string                     `json:"id"`
 	Tier                int                        `json:"tier"`
+	Blocked             bool                       `json:"blocked"`
 	Models              []string                   `json:"models"`
 	BusyCount           int                        `json:"busy_count"`
 	RecentFailures      []providerFailureStatus    `json:"recent_failures"`
@@ -513,6 +519,7 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 	}
 	providerByID := map[string]int{}
 	modelProviders := map[string][]providerRef{}
+	blockedProviderIDs := map[string]struct{}{}
 	var nextGeneration uint64 = 1
 	for i := range providers {
 		fetchCtx := ctx
@@ -540,6 +547,11 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 				endpoint: "models",
 				err:      err.Error(),
 			}}
+			if errors.Is(err, errProviderThinkingMarker) {
+				providers[i].blocked = true
+				blockedProviderIDs[providers[i].id] = struct{}{}
+				logProviderThinkingMarker(logger, providers[i].id, "models", err)
+			}
 			logger.Warn("failed to load provider models; provider will be skipped until refresh succeeds",
 				zap.Int("provider_index", i),
 				zap.String("provider_id", providers[i].id),
@@ -568,6 +580,7 @@ func newProviderPool(ctx context.Context, cfgs []providerConfig, client *http.Cl
 		modelProviders:         modelProviders,
 		candidateOrder:         randomCandidateOrder,
 		nextProviderGeneration: nextGeneration,
+		blockedProviderIDs:     blockedProviderIDs,
 	}, nil
 }
 
@@ -579,6 +592,9 @@ func (p *providerPool) reconcileProviders(cfgs []providerConfig) (providerRefres
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.blockedProviderIDs == nil {
+		p.blockedProviderIDs = make(map[string]struct{})
+	}
 
 	summary := providerRefreshSummary{}
 	oldByID := make(map[string]provider, len(p.providers))
@@ -589,9 +605,17 @@ func (p *providerPool) reconcileProviders(cfgs []providerConfig) (providerRefres
 
 	nextProviders := make([]provider, 0, len(providers))
 	for _, next := range providers {
+		if _, blocked := p.blockedProviderIDs[next.id]; blocked {
+			next.blocked = true
+		}
 		old, ok := oldByID[next.id]
 		oldSeen[next.id] = true
+		if ok && old.blocked {
+			next.blocked = true
+			p.blockedProviderIDs[next.id] = struct{}{}
+		}
 		if ok && sameProviderConnection(old, next) {
+			old.blocked = old.blocked || next.blocked
 			nextProviders = append(nextProviders, old)
 			summary.Unchanged = append(summary.Unchanged, next.id)
 			continue
@@ -770,6 +794,7 @@ func (p *providerPool) providerStatuses(now time.Time) []providerStatus {
 		out = append(out, providerStatus{
 			ID:                  provider.id,
 			Tier:                provider.tier,
+			Blocked:             provider.blocked || p.providerBlockedLocked(provider.id),
 			Models:              sortedModelIDs(provider.models),
 			BusyCount:           provider.busy,
 			RecentFailures:      failures,
@@ -838,6 +863,9 @@ func (p *providerPool) refreshModels(ctx context.Context, client *http.Client, l
 		cancel()
 		now := time.Now()
 		if err != nil {
+			if errors.Is(err, errProviderThinkingMarker) && p.blockProvider(target.ref) {
+				logProviderThinkingMarker(logger, target.id, "models", err)
+			}
 			oldModels, changed, ok := p.markProviderModelsUnavailable(target.ref, err, now)
 			logger.Warn("failed to refresh provider models",
 				zap.String("provider_id", target.id),
@@ -903,6 +931,9 @@ func (p *providerPool) modelRefreshTargets() []providerModelRefreshTarget {
 	defer p.mu.Unlock()
 	targets := make([]providerModelRefreshTarget, 0, len(p.providers))
 	for _, provider := range p.providers {
+		if provider.blocked || p.providerBlockedLocked(provider.id) {
+			continue
+		}
 		targets = append(targets, providerModelRefreshTarget{
 			ref:       provider.ref(),
 			id:        provider.id,
@@ -933,7 +964,17 @@ func (p *providerPool) replaceProviderModels(ref providerRef, models map[string]
 func (p *providerPool) rebuildModelProvidersLocked() {
 	providerByID := map[string]int{}
 	modelProviders := map[string][]providerRef{}
-	for i, provider := range p.providers {
+	for i := range p.providers {
+		provider := &p.providers[i]
+		if _, blocked := p.blockedProviderIDs[provider.id]; blocked {
+			provider.blocked = true
+		}
+		if provider.blocked {
+			if p.blockedProviderIDs == nil {
+				p.blockedProviderIDs = make(map[string]struct{})
+			}
+			p.blockedProviderIDs[provider.id] = struct{}{}
+		}
 		providerByID[provider.id] = i
 		ref := provider.ref()
 		for model := range provider.models {
@@ -975,6 +1016,33 @@ func (p *providerPool) recordProviderSuccess(ref providerRef) {
 	provider.lastSuccess = time.Now()
 	provider.consecutiveFailures = 0
 	provider.cooldownUntil = time.Time{}
+}
+
+func (p *providerPool) blockProvider(ref providerRef) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.blockedProviderIDs == nil {
+		p.blockedProviderIDs = make(map[string]struct{})
+	}
+	_, alreadyBlocked := p.blockedProviderIDs[ref.id]
+	p.blockedProviderIDs[ref.id] = struct{}{}
+
+	index, ok := p.providerByID[ref.id]
+	if !ok || index < 0 || index >= len(p.providers) {
+		for i := range p.providers {
+			if p.providers[i].id == ref.id {
+				index = i
+				ok = true
+				break
+			}
+		}
+	}
+	if ok && index >= 0 && index < len(p.providers) {
+		p.providers[index].blocked = true
+		p.providers[index].cooldownUntil = time.Time{}
+	}
+	return !alreadyBlocked
 }
 
 func (p *providerPool) recordProviderFailure(ref providerRef, endpoint string, statusCode int, err error) {
@@ -1048,7 +1116,7 @@ func (p *providerPool) acquire(orderedCandidates []providerRef, tried map[provid
 				continue
 			}
 			providerIndex, ok := p.indexForRefLocked(ref)
-			if !ok || p.providerCoolingDownLocked(providerIndex, now) {
+			if !ok || p.providers[providerIndex].blocked || p.providerBlockedLocked(ref.id) || p.providerCoolingDownLocked(providerIndex, now) {
 				continue
 			}
 			if p.providers[providerIndex].busy == 0 {
@@ -1063,7 +1131,7 @@ func (p *providerPool) acquire(orderedCandidates []providerRef, tried map[provid
 				continue
 			}
 			providerIndex, ok := p.indexForRefLocked(ref)
-			if !ok || p.providerCoolingDownLocked(providerIndex, now) {
+			if !ok || p.providers[providerIndex].blocked || p.providerBlockedLocked(ref.id) || p.providerCoolingDownLocked(providerIndex, now) {
 				continue
 			}
 			p.providers[providerIndex].busy++
@@ -1118,6 +1186,24 @@ func (p *providerPool) providerCoolingDownLocked(index int, now time.Time) bool 
 	}
 	cooldownUntil := p.providers[index].cooldownUntil
 	return !cooldownUntil.IsZero() && now.Before(cooldownUntil)
+}
+
+func (p *providerPool) providerBlockedLocked(id string) bool {
+	_, blocked := p.blockedProviderIDs[id]
+	return blocked
+}
+
+func (p *providerPool) hasUnblockedCandidate(candidates []providerRef) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ref := range candidates {
+		index, ok := p.indexForRefLocked(ref)
+		if !ok || p.providers[index].blocked || p.providerBlockedLocked(ref.id) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (p *providerPool) orderedCandidates(candidates []providerRef) []providerRef {
@@ -1188,6 +1274,21 @@ func requestedModel(body []byte) (string, error) {
 	return model, nil
 }
 
+func requestWantsStreaming(body []byte) bool {
+	var request struct {
+		Stream bool `json:"stream"`
+	}
+	return json.Unmarshal(body, &request) == nil && request.Stream
+}
+
+func shouldStreamResponse(requestStreaming bool, resp *http.Response) bool {
+	if requestStreaming {
+		return true
+	}
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	return strings.HasPrefix(contentType, "text/event-stream")
+}
+
 func normalizeProviderModelID(id string) string {
 	id = strings.TrimSpace(id)
 	return strings.TrimPrefix(id, "models/")
@@ -1210,18 +1311,28 @@ func fetchProviderModels(ctx context.Context, client *http.Client, modelsURL, ap
 	if err != nil {
 		return nil, err
 	}
+	if responseHeadersContainThinkingMarker(resp.Header) {
+		closeBody(zap.NewNop(), resp.Body)
+		return nil, errProviderThinkingMarker
+	}
 	defer closeBody(zap.NewNop(), resp.Body)
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodyBytes))
+	var body bytes.Buffer
+	_, markerFound, err := copyResponseBodyWithMarker(io.LimitReader(resp.Body, maxRequestBodyBytes), func(data []byte) (int, error) {
+		return body.Write(data)
+	})
+	if markerFound {
+		return nil, errProviderThinkingMarker
+	}
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("models endpoint returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("models endpoint returned status %d: %s", resp.StatusCode, strings.TrimSpace(body.String()))
 	}
 
 	var payload modelsResponse
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := json.Unmarshal(body.Bytes(), &payload); err != nil {
 		return nil, err
 	}
 	models := map[string]struct{}{}
@@ -1232,6 +1343,29 @@ func fetchProviderModels(ctx context.Context, client *http.Client, modelsURL, ap
 		}
 	}
 	return models, nil
+}
+
+func responseHeadersContainThinkingMarker(header http.Header) bool {
+	for _, values := range header {
+		for _, value := range values {
+			if strings.Contains(value, providerThinkingMarker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func logProviderThinkingMarker(logger *zap.Logger, providerID, endpoint string, err error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	logger.Error("provider returned <thinking>; permanently blocking provider",
+		zap.String("provider_id", providerID),
+		zap.String("endpoint", endpoint),
+		zap.String("marker", providerThinkingMarker),
+		zap.Error(err),
+	)
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1441,6 +1575,7 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 		}
 		body = sanitizedBody
 	}
+	streamingRequest := requestWantsStreaming(body)
 	candidates, err := p.pool.candidatesForModel(model)
 	if err != nil {
 		p.logger.Warn("requested model is not available",
@@ -1525,16 +1660,31 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 				)
 				continue
 			}
+			if responseHeadersContainThinkingMarker(resp.Header) {
+				p.blockProviderForThinking(provider, endpoint)
+				closeBody(p.logger, resp.Body)
+				release()
+				lastErr = errProviderThinkingMarker
+				continue
+			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				defer release()
-				defer closeBody(p.logger, resp.Body)
-				copyResponseHeaders(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				responseBytes, err := copyResponseBody(w, resp.Body)
-				if err != nil {
+				streamingResponse := shouldStreamResponse(streamingRequest, resp)
+				responseBytes, markerFound, responseCommitted, copyErr := copySuccessfulUpstreamResponse(p.logger, w, resp, streamingResponse)
+				if markerFound {
+					p.blockProviderForThinking(provider, endpoint)
+				}
+				release()
+				if markerFound {
+					lastErr = errProviderThinkingMarker
+					if responseCommitted {
+						return
+					}
+					continue
+				}
+				if copyErr != nil {
 					if r.Context().Err() == nil {
-						p.pool.recordProviderFailure(provider.ref, string(endpoint), resp.StatusCode, err)
+						p.pool.recordProviderFailure(provider.ref, string(endpoint), resp.StatusCode, copyErr)
 					}
 					p.logger.Warn("failed to copy upstream response",
 						appendRequestFields(requestFields,
@@ -1546,7 +1696,7 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 							zap.Int64("response_bytes", responseBytes),
 							zap.Duration("attempt_elapsed", time.Since(attemptStarted)),
 							zap.Duration("elapsed", time.Since(requestStarted)),
-							zap.Error(err),
+							zap.Error(copyErr),
 						)...,
 					)
 					return
@@ -1568,6 +1718,12 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 			}
 
 			failure, readErr := bufferResponse(resp)
+			if errors.Is(readErr, errProviderThinkingMarker) {
+				p.blockProviderForThinking(provider, endpoint)
+				lastErr = errProviderThinkingMarker
+				release()
+				continue
+			}
 			if readErr != nil {
 				p.pool.recordProviderFailure(provider.ref, string(endpoint), resp.StatusCode, readErr)
 			} else {
@@ -1602,6 +1758,9 @@ func (p *proxy) handleAPIRequest(w http.ResponseWriter, r *http.Request, endpoin
 					)...,
 				)
 			}
+		}
+		if !p.pool.hasUnblockedCandidate(orderedCandidates) {
+			break
 		}
 	}
 
@@ -1638,6 +1797,12 @@ func appendRequestFields(base []zap.Field, fields ...zap.Field) []zap.Field {
 	out = append(out, base...)
 	out = append(out, fields...)
 	return out
+}
+
+func (p *proxy) blockProviderForThinking(provider acquiredProvider, endpoint upstreamEndpoint) {
+	if p.pool.blockProvider(provider.ref) {
+		logProviderThinkingMarker(p.logger, provider.ID, string(endpoint), errProviderThinkingMarker)
+	}
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {
@@ -1743,15 +1908,149 @@ type bufferedResponse struct {
 
 func bufferResponse(resp *http.Response) (*bufferedResponse, error) {
 	defer closeBody(zap.NewNop(), resp.Body)
-	body, err := io.ReadAll(resp.Body)
+	var body bytes.Buffer
+	_, markerFound, err := copyResponseBodyWithMarker(resp.Body, func(data []byte) (int, error) {
+		return body.Write(data)
+	})
+	if markerFound {
+		return nil, errProviderThinkingMarker
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &bufferedResponse{
 		statusCode: resp.StatusCode,
 		header:     resp.Header.Clone(),
-		body:       body,
+		body:       body.Bytes(),
 	}, nil
+}
+
+func copySuccessfulUpstreamResponse(logger *zap.Logger, w http.ResponseWriter, resp *http.Response, streaming bool) (int64, bool, bool, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	defer closeBody(logger, resp.Body)
+
+	if !streaming {
+		var body bytes.Buffer
+		responseBytes, markerFound, err := copyResponseBodyWithMarker(resp.Body, func(data []byte) (int, error) {
+			return body.Write(data)
+		})
+		if markerFound {
+			return responseBytes, markerFound, false, err
+		}
+		if err != nil {
+			copyResponseHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			written, writeErr := w.Write(body.Bytes())
+			if writeErr == nil && written != body.Len() {
+				writeErr = io.ErrShortWrite
+			}
+			if writeErr != nil {
+				err = writeErr
+			}
+			return int64(written), false, true, err
+		}
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		written, err := w.Write(body.Bytes())
+		if err == nil && written != body.Len() {
+			err = io.ErrShortWrite
+		}
+		return int64(written), false, true, err
+	}
+
+	return copyUpstreamResponse(w, resp)
+}
+
+func copyUpstreamResponse(w http.ResponseWriter, resp *http.Response) (int64, bool, bool, error) {
+	committed := false
+	commit := func() {
+		if committed {
+			return
+		}
+		copyResponseHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		committed = true
+	}
+
+	write := func(data []byte) (int, error) {
+		if len(data) == 0 {
+			return 0, nil
+		}
+		commit()
+		written, err := w.Write(data)
+		if err == nil && written == len(data) {
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		return written, err
+	}
+
+	responseBytes, markerFound, err := copyResponseBodyWithMarker(resp.Body, write)
+	if markerFound {
+		return responseBytes, true, committed, err
+	}
+	if !committed {
+		commit()
+	}
+	return responseBytes, false, committed, err
+}
+
+func copyResponseBodyWithMarker(body io.Reader, write func([]byte) (int, error)) (int64, bool, error) {
+	marker := []byte(providerThinkingMarker)
+	keep := len(marker) - 1
+	pending := make([]byte, 0, keep)
+	buf := make([]byte, 32<<10)
+	var copied int64
+
+	writeChunk := func(chunk []byte) error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		written, err := write(chunk)
+		copied += int64(written)
+		if err != nil {
+			return err
+		}
+		if written != len(chunk) {
+			return io.ErrShortWrite
+		}
+		return nil
+	}
+
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			pending = append(pending, buf[:n]...)
+			if index := bytes.Index(pending, marker); index >= 0 {
+				if err := writeChunk(pending[:index]); err != nil {
+					return copied, true, err
+				}
+				return copied, true, errProviderThinkingMarker
+			}
+			if safe := len(pending) - keep; safe > 0 {
+				if err := writeChunk(pending[:safe]); err != nil {
+					return copied, false, err
+				}
+				pending = append(pending[:0], pending[safe:]...)
+			}
+		}
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				if err := writeChunk(pending); err != nil {
+					return copied, false, err
+				}
+				return copied, false, nil
+			}
+			if err := writeChunk(pending); err != nil {
+				return copied, false, err
+			}
+			return copied, false, readErr
+		}
+	}
 }
 
 func readRequestBody(r *http.Request, limit int64) ([]byte, error) {
@@ -1915,28 +2214,16 @@ func isHopByHopHeader(lower string) bool {
 }
 
 func copyResponseBody(w http.ResponseWriter, body io.Reader) (int64, error) {
-	if flusher, ok := w.(http.Flusher); ok {
-		buf := make([]byte, 32<<10)
-		var copied int64
-		for {
-			n, readErr := body.Read(buf)
-			if n > 0 {
-				written, writeErr := w.Write(buf[:n])
-				copied += int64(written)
-				if writeErr != nil {
-					return copied, writeErr
-				}
+	copied, _, err := copyResponseBodyWithMarker(body, func(data []byte) (int, error) {
+		written, writeErr := w.Write(data)
+		if writeErr == nil && written == len(data) {
+			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
 			}
-			if readErr != nil {
-				if errors.Is(readErr, io.EOF) {
-					return copied, nil
-				}
-				return copied, readErr
-			}
 		}
-	}
-	return io.Copy(w, body)
+		return written, writeErr
+	})
+	return copied, err
 }
 
 func closeBody(logger *zap.Logger, body io.Closer) {

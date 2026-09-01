@@ -529,6 +529,230 @@ func TestProxyLogsSuccessfulRequestWithoutBodies(t *testing.T) {
 	assertLogFieldsDoNotContain(t, fields, "secret-input", "secret-output")
 }
 
+func TestProxyBlocksProviderThatReturnsThinkingAndFallsBack(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	bad := newMockProvider(t, []string{"m"}, "bad-key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"bad <thinking> response"}`))
+	})
+	defer bad.Close()
+	good := newMockProvider(t, []string{"m"}, "good-key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"good"}`))
+	})
+	defer good.Close()
+
+	core, logs := observer.New(zap.ErrorLevel)
+	proxy := newTestProxyWithLogger(t, zap.New(core), bad.providerConfig(), good.providerConfig())
+	proxy.pool.candidateOrder = stableCandidateOrder
+
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"id":"good"}` {
+		t.Fatalf("first request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := bad.chatCount(); got != 1 {
+		t.Fatalf("bad provider chat count = %d", got)
+	}
+	if got := good.chatCount(); got != 1 {
+		t.Fatalf("good provider chat count = %d", got)
+	}
+
+	entries := logs.FilterMessage("provider returned <thinking>; permanently blocking provider").All()
+	if len(entries) != 1 {
+		t.Fatalf("thinking block log entries = %d", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["provider_id"] != "bad-key" || fields["endpoint"] != string(endpointChatCompletions) {
+		t.Fatalf("thinking block log fields = %#v", fields)
+	}
+
+	status := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if len(status.Data) != 2 || !status.Data[0].Blocked || status.Data[1].Blocked {
+		t.Fatalf("provider blocked status = %#v", status.Data)
+	}
+
+	rec = serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"id":"good"}` {
+		t.Fatalf("second request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := bad.chatCount(); got != 1 {
+		t.Fatalf("blocked provider was retried, chat count = %d", got)
+	}
+	if got := good.chatCount(); got != 2 {
+		t.Fatalf("good provider chat count = %d", got)
+	}
+}
+
+func TestProxyBlocksThinkingInHTTPFailureResponse(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	bad := newMockProvider(t, []string{"m"}, "bad-key", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"<thinking>"}`))
+	})
+	defer bad.Close()
+	good := newMockProvider(t, []string{"m"}, "good-key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"good"}`))
+	})
+	defer good.Close()
+
+	proxy := newTestProxy(t, bad.providerConfig(), good.providerConfig())
+	proxy.pool.candidateOrder = stableCandidateOrder
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"id":"good"}` {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := bad.chatCount(); got != 1 {
+		t.Fatalf("bad provider chat count = %d", got)
+	}
+	status := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if !status.Data[0].Blocked {
+		t.Fatalf("provider status = %#v", status.Data[0])
+	}
+}
+
+func TestProxyStopsRetryingAfterProviderIsPermanentlyBlocked(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	provider := newMockProvider(t, []string{"m"}, "blocked-key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"<thinking>"}`))
+	})
+	defer provider.Close()
+
+	proxy := newTestProxyWithRetryConfig(t, 2, time.Hour, provider.providerConfig())
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- serveChat(proxy, requestBody)
+	}()
+
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "provider response contained <thinking>") {
+			t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request did not finish after provider was permanently blocked")
+	}
+	if got := provider.chatCount(); got != 1 {
+		t.Fatalf("blocked provider chat count = %d", got)
+	}
+}
+
+func TestProxyBlocksThinkingInStreamingResponse(t *testing.T) {
+	const requestBody = `{"model":"m","stream":true}`
+
+	provider := newMockProvider(t, []string{"m"}, "stream-key", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("response writer does not support flushing")
+		}
+		_, _ = w.Write([]byte("data: prefix\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("<thinking>"))
+		flusher.Flush()
+	})
+	defer provider.Close()
+
+	proxy := newTestProxy(t, provider.providerConfig())
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), providerThinkingMarker) {
+		t.Fatalf("response leaked thinking marker: %s", rec.Body.String())
+	}
+	status := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if !status.Data[0].Blocked {
+		t.Fatalf("provider status = %#v", status.Data[0])
+	}
+}
+
+func TestProviderThinkingBlockPersistsThroughPruneAndRefresh(t *testing.T) {
+	const requestBody = `{"model":"m","stream":false}`
+
+	bad := newMockProvider(t, []string{"m"}, "bad-key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"bad <thinking> response"}`))
+	})
+	defer bad.Close()
+	good := newMockProvider(t, []string{"m"}, "good-key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"good"}`))
+	})
+	defer good.Close()
+
+	proxy := newTestProxy(t, bad.providerConfig(), good.providerConfig())
+	proxy.pool.candidateOrder = stableCandidateOrder
+	if rec := serveChat(proxy, requestBody); rec.Code != http.StatusOK {
+		t.Fatalf("initial request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := servePrune(proxy, "/v1/prune", true); rec.Code != http.StatusOK {
+		t.Fatalf("prune status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if rec := serveRefresh(proxy, true); rec.Code != http.StatusOK {
+		t.Fatalf("refresh status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	status := decodeProviderStatus(t, serveProviderStatus(proxy, "/v1/providers/status", true))
+	if !status.Data[0].Blocked {
+		t.Fatalf("provider was unblocked by maintenance endpoints: %#v", status.Data[0])
+	}
+	rec := serveChat(proxy, requestBody)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"id":"good"}` {
+		t.Fatalf("post-maintenance request status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got := bad.chatCount(); got != 1 {
+		t.Fatalf("blocked provider chat count = %d", got)
+	}
+}
+
+func TestProviderThinkingBlockSurvivesProviderReconciliation(t *testing.T) {
+	provider := newMockProvider(t, []string{"m"}, "key", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"ok"}`))
+	})
+	defer provider.Close()
+
+	pool := newTestPool(t, provider.providerConfig())
+	if !pool.blockProvider(pool.providers[0].ref()) {
+		t.Fatal("expected provider to be newly blocked")
+	}
+	updated := provider.providerConfig()
+	updated.APIKey = "rotated-key"
+	if _, err := pool.reconcileProviders([]providerConfig{updated}); err != nil {
+		t.Fatalf("reconcileProviders: %v", err)
+	}
+
+	pool.mu.Lock()
+	blocked := pool.providers[0].blocked
+	ref := pool.providers[0].ref()
+	pool.mu.Unlock()
+	if !blocked {
+		t.Fatal("provider was unblocked during reconciliation")
+	}
+	_, _, release, err := pool.acquire([]providerRef{ref}, map[providerRef]struct{}{})
+	if release != nil {
+		release()
+	}
+	if err == nil {
+		t.Fatal("blocked provider was acquired after reconciliation")
+	}
+}
+
+func TestCopyResponseBodyWithMarkerDetectsSplitThinkingMarker(t *testing.T) {
+	reader := &chunkedResponseReader{chunks: [][]byte{
+		[]byte("prefix<thi"),
+		[]byte("nking>suffix"),
+	}}
+	var output strings.Builder
+	copied, found, err := copyResponseBodyWithMarker(reader, func(data []byte) (int, error) {
+		return output.Write(data)
+	})
+	if !found || err != errProviderThinkingMarker {
+		t.Fatalf("marker result: copied=%d found=%v err=%v", copied, found, err)
+	}
+	if output.String() != "prefix" || copied != int64(len("prefix")) {
+		t.Fatalf("copied output = %q (%d bytes)", output.String(), copied)
+	}
+}
+
 func TestProxyRejectsMissingAPIKey(t *testing.T) {
 	provider := newMockProvider(t, []string{"m"}, "provider-key", func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("unauthorized request should not be forwarded")
@@ -1910,6 +2134,33 @@ func TestFetchProviderModelsParsesResponse(t *testing.T) {
 	}
 }
 
+func TestProviderPoolBlocksProviderWhenModelsResponseContainsThinking(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path = %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":"<thinking>"}`))
+	}))
+	defer upstream.Close()
+
+	core, logs := observer.New(zap.ErrorLevel)
+	pool, err := newProviderPool(context.Background(), []providerConfig{{
+		ID:          "models-bad",
+		ProviderURL: upstream.URL + "/v1",
+		APIKey:      "key",
+	}}, upstream.Client(), zap.New(core), time.Second)
+	if err != nil {
+		t.Fatalf("newProviderPool: %v", err)
+	}
+	if len(pool.providers) != 1 || !pool.providers[0].blocked {
+		t.Fatalf("provider state = %#v", pool.providers)
+	}
+	entries := logs.FilterMessage("provider returned <thinking>; permanently blocking provider").All()
+	if len(entries) != 1 || entries[0].ContextMap()["provider_id"] != "models-bad" {
+		t.Fatalf("thinking block logs = %#v", entries)
+	}
+}
+
 type mockProvider struct {
 	*httptest.Server
 	t      *testing.T
@@ -2057,6 +2308,20 @@ func (p *mockProvider) responsesBodies() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string(nil), p.responseBodies...)
+}
+
+type chunkedResponseReader struct {
+	chunks [][]byte
+	index  int
+}
+
+func (r *chunkedResponseReader) Read(p []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	chunk := r.chunks[r.index]
+	r.index++
+	return copy(p, chunk), nil
 }
 
 func newTestProxy(t *testing.T, providers ...providerConfig) *proxy {
